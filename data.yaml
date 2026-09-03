@@ -1,0 +1,11 @@
+# dataset path
+path: C:/Users/ASUS/Desktop/base_0_0
+train: images/train
+val: images/val
+test: images/test
+
+# number of classes
+nc: 1
+
+# class names
+names: ['human']
