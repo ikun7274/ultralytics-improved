@@ -33,6 +33,7 @@ rect: False # (bool) rectangular batches for train; rectangular batching for val
 cos_lr: False # (bool) cosine learning rate scheduler
 close_mosaic: 10 # (int) disable mosaic augmentation for final N epochs (0 to keep enabled)
 resume: False # (bool) resume training from last checkpoint in the run dir
+resume_extend_epochs: 0 # (int, 0=关闭) resume 续训自动延长: 设为 >0 时, 若 checkpoint 已完成轮数 < 该值, 自动修补 ckpt 元数据(epochs/patience)并从旧停点续训到该轮数, 无需离线跑 fix_checkpoint 脚本; 若该值 <= 已完成轮数则报错
 amp: True # (bool | str) train precision: True/'fp16' (AMP check), 'bf16', or False/'fp32'; AMP uses FP16 train validation
 fraction: 1.0 # (float | int | list) train ratio/count or split values; 1 = all, integer >1 = count, test 0 = none
 profile: False # (bool) profile ONNX/TensorRT speeds during training for loggers

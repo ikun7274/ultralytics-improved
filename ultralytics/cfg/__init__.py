@@ -264,6 +264,7 @@ CFG_INT_KEYS = frozenset(
     {  # integer-only arguments
         "epochs",
         "patience",
+        "resume_extend_epochs",
         "workers",
         "seed",
         "close_mosaic",

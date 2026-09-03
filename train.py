@@ -16,21 +16,23 @@ from ultralytics import YOLO
 
 if __name__ == '__main__':
     model = YOLO('ultralytics/cfg/models/26/yolo26n.yaml')
-    model.load(r'C:\Users\ASUS\Desktop\ultralytics-main\runs\exp-2\weights\best.pt')
+    model.load('yolo26n.pt') 
     model.train(
         #---------训练参数---------------
         data='data.yaml',              
         cache=False,
         imgsz=1280,                   
-        epochs=1,                      
+        epochs=10,                      
         batch=4,                       
         close_mosaic=20,              
         workers=0,                     
         optimizer='MuSGD',
         device='0',
+        resume='runs/exp-2-2/weights/last.pt',  # 断点续训
+        resume_extend_epochs=15,  # (int, 0=关闭) 续训自动延长: 自动修补ckpt元数据(epochs/patience), 从旧停点续训到该轮数; 需>ckpt已完成轮数
         patience=50,
         amp=True,
-        project='ultralytics-improved/runs',
+        project=r'C:\Users\ASUS\Desktop\ultralytics-improved/runs',
         name='exp',
         exist_ok=False,
 

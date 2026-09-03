@@ -994,6 +994,7 @@ class BaseTrainer:
                     "channels_last",
                     "distill_model",
                     "save_dir",
+                    "resume_extend_epochs",  # 集成: 用户传入的续训延长目标需穿透 ckpt 存档配置的覆盖
                 ):  # allow arg updates to reduce memory or update device on resume
                     if k in overrides:
                         setattr(self.args, k, overrides[k])
@@ -1062,6 +1063,52 @@ class BaseTrainer:
         if ckpt is None or not self.resume:
             return
         start_epoch = ckpt.get("epoch", -1) + 1
+
+        # ---- 集成: resume 自动续训延长 (resume_extend_epochs) ----
+        # 复用 pytools/fix_checkpoint_for_extension.py 的核心逻辑: resume 时若用户想续训到超过
+        # checkpoint 已完成轮数的目标, 自动修补 ckpt 元数据(train_args/args 里的 epochs/patience),
+        # 使 resume 真正延长训练(否则会因"训练已完成"被拒, 或 LR schedule 用旧总轮数)。
+        extend_epochs = int(getattr(self.args, "resume_extend_epochs", 0) or 0)
+        if extend_epochs > 0:
+            finished_epoch = start_epoch if ckpt.get("epoch", -1) >= 0 else None
+            if finished_epoch is None:
+                for key in ("train_args", "args"):  # 从 ckpt 存档配置读取原总轮数作为已完成轮数
+                    args = ckpt.get(key)
+                    if args is not None:
+                        finished_epoch = args.get("epochs") if isinstance(args, dict) else getattr(args, "epochs", None)
+                        break
+            if finished_epoch is None:
+                raise ValueError("无法从 Checkpoint 中检测已完成的 Epoch 数, 无法续训延长。")
+            if extend_epochs <= finished_epoch:
+                raise ValueError(
+                    f"resume_extend_epochs={extend_epochs} 必须大于 checkpoint 已完成轮数 {finished_epoch}, "
+                    "否则续训无法继续/会倒退。"
+                )
+            # 若 ckpt 标记为"已完成"(epoch<0, 如正常跑完/被 strip), 把 epoch 索引改回最后一轮索引 finished-1,
+            # 使 resume 能从 finished+1 继续(与 fix_checkpoint_for_extension.py 行为一致)
+            if ckpt.get("epoch", -1) < 0:
+                ckpt["epoch"] = finished_epoch - 1
+            # 修补 ckpt 元数据: 更新 train_args/args 的 epochs 与 patience, 保持 epoch 索引
+            for key in ("train_args", "args"):
+                args = ckpt.get(key)
+                if args is None:
+                    continue
+                if isinstance(args, dict):
+                    args["epochs"] = extend_epochs
+                    args["patience"] = self.args.patience
+                else:
+                    setattr(args, "epochs", extend_epochs)
+                    setattr(args, "patience", self.args.patience)
+            # 更新训练目标轮数并重建 LR schedule(用新总轮数)
+            self.epochs = self.args.epochs = extend_epochs
+            self._setup_scheduler()
+            start_epoch = ckpt["epoch"] + 1  # 修补后重算(已完成场景 epoch 索引已改回 finished-1)
+            LOGGER.info(
+                f"[resume_extend] 自动修补 checkpoint 元数据: 已完成 {finished_epoch} 轮 -> "
+                f"续训至 {extend_epochs} 轮 (patience={self.args.patience})"
+            )
+        # ---- 集成结束 ----
+
         assert 0 < start_epoch < self.epochs, (
             f"{self.args.model} training to {self.epochs} epochs is finished, nothing to resume.\n"
             f"Start a new training without resuming, i.e. 'yolo train model={self.args.model}'"
