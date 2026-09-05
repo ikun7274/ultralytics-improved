@@ -1,0 +1,11 @@
+# dataset path
+path: C:/Users/ASUS/Desktop/Datasets/Dataset of field personnel search and rescue/base_0_0
+train: images/train
+val: images/val
+# test: images/test    # 留空: 该数据集无独立 test 目录; YOLO 默认走 val; 启用 test 需先 split-val 为 test 或新建目录
+
+# number of classes
+nc: 1
+
+# class names
+names: ['human']
