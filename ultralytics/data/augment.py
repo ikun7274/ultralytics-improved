@@ -3272,13 +3272,14 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         dataset.slice_all_tiles = bool(getattr(hyp, "slice_all_tiles", False))
         dataset.slice_mix_ratio = float(getattr(hyp, "slice_mix_ratio", 1.0))
         dataset.slice_use_cache = bool(getattr(hyp, "slice_use_cache", False))
-        dataset.slice_keep_origin = bool(getattr(hyp, "slice_keep_origin", False))
     else:
         dataset.slice_transform = None
         dataset.slice_all_tiles = False
         dataset.slice_mix_ratio = 1.0
-        dataset.slice_keep_origin = False
 
+    # ---- 独立增强开关 (slice_keep_origin / compose_keep / ratio_pad_keep / blur_keep 互不影响,
+    # 不受 slice_prob 控制; keep_origin 无切片时由 _keep_origin_on() 自动抑制) ----
+    dataset.slice_keep_origin = online_aug_on and bool(getattr(hyp, "slice_keep_origin", False))
     # ---- 独立增强开关 (compose_keep / ratio_pad_keep / blur_keep 互不影响, 不受 slice_prob 控制) ----
     # compose/ratio/blur 不需要切片或 keep_origin, 单独开启即生效(见 _segment_bases 区段布局)。
     dataset.compose_keep = online_aug_on and bool(getattr(hyp, "compose_keep", False))

@@ -155,7 +155,7 @@ slice_save_max_blur: # (int, optional) 模糊图保存上限; 0=不限; 未设=�
 slice_save_max_ratio: # (int, optional) 比例填充图保存上限; 0=不限; 未设=回退 slice_save_max
 slice_save_max_compose: # (int, optional) 合成图保存上限; 0=不限; 未设=回退 slice_save_max
 # ---- 样本池: 每张原图额外保留 1 张未切片原图 (提供全图上下文) ----
-slice_keep_origin: False # (bool, 需 slice_all_tiles=True) 每张原图额外保留 1 张未切片原图进样本池 -> 数据集 x5 (4切片+1原图), 共同进入 mosaic
+slice_keep_origin: False # (bool, 独立开关, 需 slice_all_tiles=True) 每张原图额外保留 1 张未切片原图进样本池 (独立区段 +N, 不受 slice_prob 影响) -> 样本池 +N, 共同进入 mosaic
 
 # ---------- 在线合成 (compose_*): 每 4 张原图拼 1 张 2x2 大图, 提供更大范围多目标上下文 ----------
 compose_keep: False # (bool, 独立开关, 不依赖切片/keep_origin) 每 4 张原图额外合成 1 张 2x2 拼接大图进样本池 -> 样本池 +ceil(N/4)
