@@ -3271,7 +3271,6 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         )
         dataset.slice_all_tiles = bool(getattr(hyp, "slice_all_tiles", False))
         dataset.slice_mix_ratio = float(getattr(hyp, "slice_mix_ratio", 1.0))
-        dataset.slice_use_cache = bool(getattr(hyp, "slice_use_cache", False))
     else:
         dataset.slice_transform = None
         dataset.slice_all_tiles = False

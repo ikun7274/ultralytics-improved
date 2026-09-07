@@ -275,7 +275,6 @@ def build_yolo_dataset(
         hyp=copy(cfg),
         rect=rect,
         cache=cfg.cache or None,
-        cache_dir=cfg.cache_dir or "",
         single_cls=cfg.single_cls or False,
         stride=stride,
         pad=pad,
@@ -308,7 +307,6 @@ def build_grounding(
         hyp=copy(cfg),
         rect=cfg.rect or rect,  # rectangular batches
         cache=cfg.cache or None,
-        cache_dir=cfg.cache_dir or "",
         single_cls=cfg.single_cls or False,
         stride=stride,
         pad=0.0 if mode == "train" else 0.5,

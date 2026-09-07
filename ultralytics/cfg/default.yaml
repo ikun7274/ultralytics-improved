@@ -17,7 +17,6 @@ imgsz: 640 # (int | list) train/val use int (square); predict/export may use [h,
 save: True # (bool) save train checkpoints and predict results
 save_period: -1 # (int) save checkpoint every N epochs; disabled if < 1
 cache: False # (bool | str) cache images in RAM (True/'ram') or on 'disk' to speed dataloading; False disables
-cache_dir: "" # (str, 可选, 需 cache='disk') .npy 磁盘缓存目录; 空=与图片同目录(原行为); 设置独立目录便于训练后按需整体清理
 device: # (int | str | list) device: 0/[0,1] CUDA, 'npu:0' Ascend, 'xpu:0' Intel, 'cpu'/'mps', -1/[-1,-1] auto GPUs
 workers: 8 # (int) dataloader workers (per RANK if DDP)
 project: # (str, optional) project name for results root
@@ -132,7 +131,6 @@ mosaic: 1.0 # (float) mosaic augmentation probability
 # ---------- SAHI 在线切片 (slice_*): 把大图在线切成 2x2 重叠子图 ----------
 slice_prob: 0.0 # (float) 在线切片概率 [0,1]; 0=关闭切片; 纯放大时建议配合 mosaic=0
 slice_mix_ratio: 1.0 # (float) 每 batch 中走切片的样本占比 [0,1]; 1.0=纯切片, <1.0 混入未切片整图以缓解小数据集对切片分布过拟合
-slice_use_cache: False # (bool, 默认关闭) 切片分支是否优先读 .npy 磁盘缓存(需配合 cache='disk' 先生成 npy, 顺序读大文件, 规避机械盘随机读 jpg 的 IO 瓶颈); True 时 npy 不存在自动回退直接读 jpg
 slice_transform: # (str, 可选) 切片后接的额外变换名 (如 "hsv_h", "blur"); 与 pytools/sahi_*.py 中的同名变换一一对应, 便于复用离线调好的参数; 空=不附加
 slice_raw_cache_size: 2 # (int) 在线增强 worker 内原图 LRU 缓存大小 (以原图数计); 0=关闭; 切片+原图+比例+模糊+合成会让同一张原图被 imread 多达 8~9 次, LRU 把解码降到 ~1 次/原图
 slice_overlap_ratio: 0.2 # (float) 相邻切片重叠比例 [0,1); 例: 原图4000x3000、重叠0.2 -> 切片2400x1800

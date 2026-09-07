@@ -41,7 +41,6 @@ if __name__ == '__main__':
         #---------训练参数---------------
         data='data.yaml',
         cache=False,                
-        # cache_dir=r'<项目根>/data_npy_cache',  # (str, 空=与图同目录) .npy缓存独立目录, 需 cache='disk'; 训练后可整体删除该目录清理缓存
         imgsz=1280,
         epochs=2,
         batch=4,
@@ -71,7 +70,6 @@ if __name__ == '__main__':
         # slice_background_ratio=-1,  # 背景切片保留比例: 背景切片数=正切片数x该值; -1=全部背景保留; 0=不要背景; emit_all 模式下每个背景切片独立判断是否保留
         slice_all_tiles=True,         # 每张原图的 4 片子图全部参与训练
         slice_mix_ratio=1.0,          # 切片/整图混排概率 [0,1]: 每个"切片样本位"有多大概率真正切片; 1.0=纯切片, 0.5=约一半切片位变整图(缓解过拟合+降内存/CPU), 0=等效关闭在线切片(样本数不变)
-        slice_use_cache=False,        # 切片分支优先读 .npy 磁盘缓存(需配合 cache='disk'); 规避机械盘随机读 jpg 的 IO 瓶颈, 顺序读快10倍+; True 时 npy 不存在自动回退 jpg
 
         slice_keep_origin=True,       # 每张原图额外保留 1 张未切片原图, 独立区段 [4N,5N); 切片关闭时自动抑制(避免重复原图); 全开仍 33
 

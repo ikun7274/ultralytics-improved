@@ -228,7 +228,6 @@ class BaseDataset(Dataset):
         img_path: str | list[str],
         imgsz: int = 640,
         cache: bool | str = False,
-        cache_dir: str = "",
         augment: bool = True,
         hyp: dict[str, Any] = DEFAULT_CFG,
         prefix: str = "",
@@ -295,14 +294,8 @@ class BaseDataset(Dataset):
 
         # Cache images (options are cache = True, False, None, "ram", "disk")
         self.ims, self.im_hw0, self.im_hw = [None] * self.ni, [None] * self.ni, [None] * self.ni
-        # cache_dir: 非空时 .npy 缓存放到独立目录(便于训练后按需清理); 空=默认与 jpg 同目录(原行为)。
-        # 用 basename 命名, 受数据集"图片 basename 唯一"约束(YOLO 标注按同名 txt 对应, 天然满足)。
-        self.cache_dir = str(cache_dir or "")
-        if self.cache_dir:
-            Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
-            self.npy_files = [Path(self.cache_dir) / Path(f).with_suffix(".npy").name for f in self.im_files]
-        else:
-            self.npy_files = [Path(f).with_suffix(".npy") for f in self.im_files]
+        # .npy 磁盘缓存已移除(实测无收益): npy_files 仅保留原生 cache='disk' 的默认位置(与 jpg 同目录)
+        self.npy_files = [Path(f).with_suffix(".npy") for f in self.im_files]
         self.cache = cache.lower() if isinstance(cache, str) else "ram" if cache is True else None
         # P0-3: the online branches (slice / blur / ratio / compose) need the ORIGINAL-resolution image, but
         # cache='ram' stores the image ALREADY resized to imgsz, so it can never serve them. It would just
@@ -312,8 +305,8 @@ class BaseDataset(Dataset):
             LOGGER.warning(
                 f"{self.prefix}cache='ram' cannot accelerate online slicing: the online branches read images at "
                 f"their original resolution, while RAM cache stores imgsz-resized copies. Degrading to "
-                f"cache=False to avoid wasting memory. To speed up decoding use cache='disk' together with "
-                f"slice_use_cache=True, or raise slice_raw_cache_size."
+                f"cache=False to avoid wasting memory. To speed up decoding raise slice_raw_cache_size "
+                f"(per-worker memory LRU)."
             )
             self.cache = None
         if self.cache == "ram" and self.check_cache_ram():
@@ -539,7 +532,7 @@ class BaseDataset(Dataset):
                 LOGGER.warning(f"{self.prefix}Skipping caching images to disk, directory not writable")
                 return False
         disk_required = b * self.ni / n * (1 + safety_margin)  # bytes required to cache dataset to disk
-        _check_path = Path(self.cache_dir) if self.cache_dir else Path(self.im_files[0]).parent
+        _check_path = Path(self.im_files[0]).parent
         total, _used, free = shutil.disk_usage(_check_path)
         if disk_required > free:
             self.cache = None
@@ -696,13 +689,12 @@ class BaseDataset(Dataset):
         return bool(getattr(self, "compose_keep", False)) and len(self.labels) >= 4
 
     def _load_image_cached(self, img_index: int) -> np.ndarray:
-        """Load original-resolution image, optionally from ``.npy`` disk cache.
+        """Load original-resolution image, with a tiny per-worker memory LRU (no .npy disk cache).
 
-        Unified read path used by all four online-augmentation branches (slice / blur / ratio /
-        compose). When ``slice_use_cache=True`` and the ``.npy`` file exists, load via ``np.load``
-        (sequential large-file read, much faster than random jpg decode on HDD). On npy corruption,
-        delete the bad file and fall back to ``imread`` (consistent with ``load_image``). When
-        ``slice_use_cache=False`` or npy doesn't exist, read jpg directly via ``imread``.
+        Unified read path used by all online-augmentation branches (slice / blur / ratio /
+        compose). Reads the original JPEG directly via ``imread``; a small in-memory LRU
+        (``slice_raw_cache_size``) absorbs repeated decoding of the same image across its
+        sub-samples. The custom .npy disk cache was removed -- it measured no benefit.
 
         Returns the image as a contiguous uint8 array with at least 3 dims (H, W, C); grayscale
         is expanded to (H, W, 1).
@@ -723,16 +715,7 @@ class BaseDataset(Dataset):
                 return hit.copy()
 
         f = self.im_files[img_index]
-        npy_path = self.npy_files[img_index]
-        if bool(getattr(self, "slice_use_cache", False)) and npy_path.exists():
-            try:
-                im = np.load(npy_path)
-            except Exception as e:
-                LOGGER.warning(f"{self.prefix}Removing corrupt *.npy image file {npy_path} due to: {e}")
-                npy_path.unlink(missing_ok=True)
-                im = imread(f, flags=self.cv2_flag)
-        else:
-            im = imread(f, flags=self.cv2_flag)
+        im = imread(f, flags=self.cv2_flag)
         if im is None:
             raise FileNotFoundError(f"Image Not Found {f}")
         if im.ndim == 2:
@@ -1206,7 +1189,7 @@ class BaseDataset(Dataset):
             if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent unbounded buffer
                 self.buffer.pop(0)
         if slice_t is not None and self.augment and random.random() < slice_mix_ratio:
-            # _load_image_cached: 优先读 .npy 磁盘缓存(slice_use_cache=True), 损坏自动删除回退 jpg
+            # _load_image_cached: 直接读原图 jpg + worker 内存 LRU (.npy 磁盘缓存已移除)
             im = self._load_image_cached(img_index)
             im, label = (
                 slice_t.slice_at(im, label, k, src=(img_index, k), count=count_slice) if emit_all else slice_t(

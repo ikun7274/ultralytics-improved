@@ -327,7 +327,6 @@ CFG_BOOL_KEYS = frozenset(
         "cls_remap",
         "slice_save_annotated",
         "slice_save_exist_ok",
-        "slice_use_cache",
         "compose_save",
         "slice_all_tiles",
         "slice_keep_origin",
@@ -340,7 +339,7 @@ CFG_BOOL_KEYS = frozenset(
         "mosaic_save_exist_ok",
     }
 )
-CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment", "slice_save_dir", "cache_dir",
+CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment", "slice_save_dir",
                           "compose_save_dir", "ratio_pad_save_dir", "blur_save_dir",
                           "ratio_pad_target", "ratio_pad_color", "mosaic_save_dir"})
 
