@@ -2,24 +2,20 @@
 import os
 import warnings
 
-# ========== 环境开关 (必须在 import ultralytics 之前设置) ==========
-
 # 离线训练: True=跳过启动时 PyPI 版本检查(远程机网络不稳时避免卡住); False=恢复联网检查
-TRAIN_OFFLINE = True
+TRAIN_OFFLINE = False
 if TRAIN_OFFLINE:
     os.environ["YOLO_OFFLINE"] = "1"
 
 # 限制 DataLoader worker 内部线程数, 避免 workers×内部多线程导致 CPU 切换风暴
-# (远程机 32 核 + workers=8 时, 不限制会导致 64+ 线程抢核, sy% 飙到 78%, cs 23万/秒)
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-# P2-7: 收窄告警过滤 — 仅屏蔽上游升级路径上的 DeprecationWarning/FutureWarning 类噪音,
-# 不再一刀切 warnings.filterwarnings('ignore')。RuntimeWarning 等真错误必须保留冒泡,
-# 否则 P1-5 那类的 MotionBlur 核除零会被静默吞掉 (整图 NaN / loss 变 NaN)。
+# 仅屏蔽上游升级路径上的 DeprecationWarning/FutureWarning 类噪音,
+# 不再一刀切 warnings.filterwarnings('ignore')。RuntimeWarning 等真错误必须保留冒泡
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
@@ -37,10 +33,6 @@ from ultralytics import YOLO
 
 
 if __name__ == '__main__':
-    # P2-6: 用 __file__ 推导项目根下的 runs 目录, 不再硬编码 C:\Users\ASUS\...
-    # (原硬编码值的意图是绕过全局 settings.json 仍指向 YOLO-Master 的问题,
-    #  该动机现在以"绝对路径 -> 项目根"的形式保留; 换机器只需 cp 项目即可)。
-    _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
     model = YOLO('ultralytics/cfg/models/26/yolo26n.yaml')
     model.load('yolo26n.pt')
     model.train(
@@ -63,7 +55,7 @@ if __name__ == '__main__':
         # resume_extend_epochs=5,  # (int, 0=关闭) 续训自动延长: 自动修补ckpt元数据(epochs/patience), 从旧停点续训到该轮数; 需>ckpt已完成轮数
         patience=50,
         amp=True,
-        project=os.path.join(_PROJECT_ROOT, 'runs'),  # P2-6: 动态推导, 绕开 YOLO-Master 全局设置
+        project=r"",  
         name='exp',
         exist_ok=False,
 
@@ -75,7 +67,7 @@ if __name__ == '__main__':
         # ---------SAHI在线切片 (slice_*)-----------
         slice_prob=1.0,               # 在线切片概率 [0,1]; 0=关闭切片
         slice_overlap_ratio=0.2,      # 相邻切片重叠比例 [0,1); 例: 原图4000x3000+重叠0.2 -> 切片2400x1800
-        # slice_background_ratio=-1,    # 背景切片保留比例: 背景切片数=正切片数x该值; -1=全部背景保留; 0=不要背景; emit_all 模式下每个背景切片独立判断是否保留(非废弃)
+        # slice_background_ratio=-1,  # 背景切片保留比例: 背景切片数=正切片数x该值; -1=全部背景保留; 0=不要背景; emit_all 模式下每个背景切片独立判断是否保留
         slice_all_tiles=True,         # 每张原图的 4 片子图全部参与训练
         slice_keep_origin=True,       # 默认False, 仅slice_all_tiles下生效: 每张原图额外保留 1 张未切片原图样本, len = 5N（4 切片 + 1 原图）
         slice_mix_ratio=1.0,          # 切片/整图混排概率 [0,1]: 每个"切片样本位"有多大概率真正切片; 1.0=纯切片, 0.5=约一半切片位变整图(缓解过拟合+降内存/CPU), 0=等效关闭在线切片(样本数不变)

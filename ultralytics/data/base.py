@@ -329,29 +329,30 @@ class BaseDataset(Dataset):
         # Transforms
         self.transforms = self.build_transforms(hyp=hyp)
 
-        # Report the actual number of training samples after online-slicing expansion (train only),
-        # so the user sees e.g. 231 samples from 28 images (4 slices + 1 origin + 1 ratio + 2 blur +
-        # N/4 compose) before training starts.
-        if self.augment and getattr(self, "slice_transform", None) is not None:
+        # Report the actual number of training samples after online augmentation expansion (train only),
+        # so the user sees e.g. 140 samples from 28 images (4 slices + 1 origin + 1 ratio + 2 blur +
+        # N/4 compose) before training starts. Every branch is reported independently: slicing may be
+        # off while compose/ratio/blur are on, or vice versa.
+        if self.augment:
             _n_total = len(self)
             _n_origin = self.ni
-            _keep = bool(getattr(self, "slice_keep_origin", False))
             _parts = []
-            if _keep:
-                _parts.append("4 slices + 1 origin")
-                if bool(getattr(self, "ratio_pad_keep", False)):
-                    _parts.append("1 ratio")
-                if bool(getattr(self, "blur_keep", False)):
-                    _parts.append("2 blur")
-                if bool(getattr(self, "compose_keep", False)):
-                    _parts.append("N/4 compose")
-            else:
-                _parts.append("4 slices")
-            LOGGER.info(
-                f"{self.prefix}Online slicing: {_n_total} training samples from {_n_origin} images "
-                f"({_parts[0]} per image)"
-                + (f" + {' + '.join(_parts[1:])}" if len(_parts) > 1 else "")
-            )
+            if getattr(self, "slice_transform", None) is not None:
+                if bool(getattr(self, "slice_keep_origin", False)):
+                    _parts.append("4 slices + 1 origin")
+                else:
+                    _parts.append("4 slices" if bool(getattr(self, "slice_all_tiles", False)) else "random 1 slice")
+            if bool(getattr(self, "ratio_pad_keep", False)):
+                _parts.append("1 ratio")
+            if bool(getattr(self, "blur_keep", False)):
+                _parts.append("2 blur")
+            if self._compose_on():
+                _parts.append("N/4 compose")
+            if _parts:
+                LOGGER.info(
+                    f"{self.prefix}Online augment: {_n_total} training samples from {_n_origin} images "
+                    f"({' + '.join(_parts)} per image)"
+                )
 
     def get_img_files(self, img_path: str | list[str]) -> list[str]:
         """Read image files from the specified path.
@@ -606,24 +607,25 @@ class BaseDataset(Dataset):
         return self.transforms(self.get_image_and_label(index))
 
     def _n_per(self) -> int:
-        """Single source of truth: how many sub-samples each ORIGINAL image expands to.
+        """Single source of truth: how many samples each ORIGINAL image expands to in the BASE segment.
 
-        Layout (only meaningful while online slicing is active):
-            slicing off                     -> 1  (no expansion at all)
+        The base segment only depends on the slicing pipeline (slice_prob / slice_all_tiles /
+        slice_keep_origin); the independent branches (ratio / blur / compose) are laid out AFTER it
+        as their own contiguous segments (see _segment_bases):
+            slicing off                     -> 1  (no expansion, plain originals)
             slice_all_tiles, !keep_origin   -> 4  (the 4 sliced tiles)
-            keep_origin                     -> 5 + ratio_pad_keep + 2 * blur_keep
-                                               (4 tiles + 1 origin [+ 1 ratio] [+ 2 blur])
+            keep_origin                     -> 5  (4 tiles + 1 un-sliced origin)
 
-        EVERY site that needs this number (``_origin_index`` / ``_compose_at`` / ``get_image_and_label`` /
-        ``__len__`` / the grouped sampler) must call this instead of re-deriving it inline. The formula used
-        to be copy-pasted in 4 places; adding a new online branch and missing one of them desynchronises
-        ``__len__`` from the decodable index range and drops samples with no error at all.
+        EVERY site that needs this number (_segment_bases / get_image_and_label / __len__)
+        must call this instead of re-deriving it inline. The formula used to be copy-pasted in 4
+        places; adding a new online branch and missing one of them desynchronises __len__ from the
+        decodable index range and drops samples with no error at all.
         """
         if not (bool(getattr(self, "slice_all_tiles", False)) and getattr(self, "slice_transform", None) is not None):
             return 1
         if not bool(getattr(self, "slice_keep_origin", False)):
             return 4
-        return 5 + int(bool(getattr(self, "ratio_pad_keep", False))) + 2 * int(bool(getattr(self, "blur_keep", False)))
+        return 5
 
     def _compose_count(self) -> int:
         """Number of trailing 2x2 compose samples (0 when disabled).
@@ -638,16 +640,33 @@ class BaseDataset(Dataset):
         n = len(self.labels)
         return (n + 3) // 4 if n >= 4 else 0
 
-    def _origin_index(self, expanded_index: int) -> int:
-        """Map an expanded (mixed-pool) sample index back to the original image index.
+    def _segment_bases(self) -> tuple[int, int, int, int]:
+        """Return the four segment boundaries of the mixed sample pool.
 
-        The mixed pool lays out ``n_per`` samples per original image (4 slices + 1 origin +
-        optional 1 ratio + 2 blur), followed by N/4 composed images. For any index inside the
-        per-image block, ``index // n_per`` gives the original image index. Used by ``_ratio_at``
-        / ``_blur_at`` so they can accept the expanded index (for correct Mosaic buffer bookkeeping)
-        while still loading the right original image.
+        Layout (each optional branch is an independent, contiguous segment gated ONLY by its own
+        switch; slicing lives entirely inside the base segment):
+            [0, base_len)                base:    _n_per samples per original
+            [base_len, +N)               ratio:   1 aspect-ratio-padded image per original
+            [base_len+N, +2N)            blur:    short + long motion-blurred images per original
+            [base_len+N+2N, +ceil(N/4))  compose: one 2x2 stitched image per group of 4 originals
+
+        Returns (base_len, ratio_base, blur_base, compose_base).
         """
-        return expanded_index // self._n_per()
+        n = len(self.labels)
+        base_len = n * self._n_per()
+        r_base = base_len
+        b_base = base_len + (n if bool(getattr(self, "ratio_pad_keep", False)) else 0)
+        c_base = b_base + (2 * n if bool(getattr(self, "blur_keep", False)) else 0)
+        return base_len, r_base, b_base, c_base
+
+    def _compose_on(self) -> bool:
+        """True when the compose branch allocates samples (switch on AND >= 4 originals).
+
+        With fewer than 4 originals a group would have to reuse the same image in 2+ quadrants,
+        duplicating its targets and skewing the label distribution, so compose is switched off
+        entirely in that case.
+        """
+        return bool(getattr(self, "compose_keep", False)) and len(self.labels) >= 4
 
     def _load_image_cached(self, img_index: int) -> np.ndarray:
         """Load original-resolution image, optionally from ``.npy`` disk cache.
@@ -701,7 +720,7 @@ class BaseDataset(Dataset):
             return im.copy()
         return im
 
-    def _blur_at(self, index: int, long: bool = False) -> dict[str, Any]:
+    def _blur_at(self, index: int, img_index: int, long: bool = False) -> dict[str, Any]:
         """Build one in-memory motion-blurred image from a single original image (online port of the offline
         motion_blur tool).
 
@@ -712,10 +731,9 @@ class BaseDataset(Dataset):
         targets). The blurred image is resized to the training size like the other branches and enters the
         Mosaic mix pool (dataset.buffer). Nothing is written to disk (save via blur_save_dir).
 
-        ``index`` is the EXPANDED mixed-pool index (for correct Mosaic buffer bookkeeping); the original
-        image index is recovered via ``_origin_index``.
+        ``index`` is the EXPANDED mixed-pool index (for correct Mosaic buffer bookkeeping);
+        ``img_index`` is the ORIGINAL image index this blurred sample derives from.
         """
-        img_index = self._origin_index(index)
         f = self.im_files[img_index]
         im = self._load_image_cached(img_index)
         h, w = im.shape[:2]
@@ -796,7 +814,7 @@ class BaseDataset(Dataset):
         )
         return self.update_labels_info(label)
 
-    def _ratio_at(self, index: int) -> dict[str, Any]:
+    def _ratio_at(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one in-memory aspect-ratio-padded image from a single original image (online port of the
         offline change_image_resolution tool).
 
@@ -808,10 +826,9 @@ class BaseDataset(Dataset):
         invalid boxes dropped (identical to the offline tool). The padded image is resized to the training size
         like the other branches and enters the Mosaic mix pool (dataset.buffer). Nothing is written to disk.
 
-        ``index`` is the EXPANDED mixed-pool index (for correct Mosaic buffer bookkeeping); the original
-        image index is recovered via ``_origin_index``.
+        ``index`` is the EXPANDED mixed-pool index (for correct Mosaic buffer bookkeeping);
+        ``img_index`` is the ORIGINAL image index this padded sample derives from.
         """
-        img_index = self._origin_index(index)
         f = self.im_files[img_index]
         im = self._load_image_cached(img_index)
         h, w = im.shape[:2]
@@ -953,14 +970,13 @@ class BaseDataset(Dataset):
         (dataset.buffer) so it participates in mosaic stitching. Nothing is written to disk.
         """
         n_origin = len(self.labels)
-        # n_per now comes from the single source of truth (_n_per) -- it mirrors get_image_and_label
-        # (5 = 4 slices + 1 origin, plus 1 ratio / 2 blur each if enabled), so the compose block
-        # (index >= n_origin*n_per) maps back to the correct group of 4 originals.
-        n_per = self._n_per()
-        group = index - n_origin * n_per
+        # The compose segment starts right after the base + ratio + blur segments (_segment_bases);
+        # group = index - compose_base selects the group of 4 originals.
+        _base_len, _r_base, _b_base, c_base = self._segment_bases()
+        group = index - c_base
         base = group * 4
         # P1-2: with fewer than 4 originals the modulo wrap would put the SAME image in 2+ quadrants,
-        # duplicating its targets and skewing the label distribution. _compose_count() never allocates
+        # duplicating its targets and skewing the label distribution. _compose_on() never allocates
         # compose indices in that case, so this is a defensive guard for direct calls only.
         if n_origin < 4:
             raise IndexError(
@@ -1117,49 +1133,35 @@ class BaseDataset(Dataset):
                 Auxiliary "mix" samples requested by Mosaic/CutMix/MixUp pass ``False`` so they slice normally
                 but do not inflate the ``neg_ratio`` quota or duplicate saved slices.
         """
-        # In emit_all mode each original image expands to 4 samples (one per tile): index//4 picks the
-        # original image and index%4 the tile, so all 4 slices participate in every epoch.
+        # Mixed-pool layout (see _segment_bases): a base segment holding the slicing pipeline's samples
+        # (4 tiles and optionally 1 un-sliced origin per image), followed by three INDEPENDENT segments
+        # gated only by their own switches -- ratio (1 per image), blur (2 per image), compose (1 per 4
+        # images). ratio/blur/compose no longer require slicing or keep_origin.
         emit_all = getattr(self, "slice_all_tiles", False)
-        keep_origin = emit_all and bool(getattr(self, "slice_keep_origin", False))
-        keep_compose = keep_origin and bool(getattr(self, "compose_keep", False))
-        keep_ratio = keep_origin and bool(getattr(self, "ratio_pad_keep", False))
-        keep_blur = keep_origin and bool(getattr(self, "blur_keep", False))
-        n_origin = len(self.labels)
-        if keep_origin:
-            # Online mixed pool: 4 sliced tiles + 1 un-sliced original per original, plus optionally
-            # +1 aspect-ratio-padded image (keep_ratio) and/or +2 motion-blurred images short+long
-            # (keep_blur) -> len = n_per*N, with n_per sourced from the single helper to keep
-            # __len__ / _origin_index / _compose_at consistent. The original samples (sub == 4)
-            # provide full-image context; ratio/blur samples (sub beyond 4, order-dependent) are the
-            # in-memory padded / blurred variants. All of them are part of the Mosaic mix pool.
-            n_per = self._n_per()
-            if keep_compose and index >= n_origin * n_per:
-                return self._compose_at(index)  # composed 2x2 sample from 4 original images (index >= n_per*N)
+        ratio_on = bool(getattr(self, "ratio_pad_keep", False))
+        blur_on = bool(getattr(self, "blur_keep", False))
+        compose_on = self._compose_on()
+        base_len, r_base, b_base, c_base = self._segment_bases()
+
+        if compose_on and index >= c_base:
+            return self._compose_at(index)  # composed 2x2 sample from 4 original images
+        if blur_on and index >= b_base:
+            j = index - b_base  # 0..2N-1: even -> short tier, odd -> long tier
+            return self._blur_at(index, j // 2, long=(j % 2 == 1))
+        if ratio_on and index >= r_base:
+            return self._ratio_at(index, index - r_base)  # origin index = offset inside the ratio segment
+
+        # ---- base segment (slicing pipeline) ----
+        n_per = self._n_per()
+        if n_per > 1:  # slicing is active and expands each original image
             img_index = index // n_per
             sub = index % n_per
-            k = sub if sub < 4 else None
-            is_origin = sub == 4
-            cursor = 5
-            is_ratio = False
-            is_blur_short = is_blur_long = False
-            if keep_ratio:
-                is_ratio = sub == cursor
-                cursor += 1
-            if keep_blur:
-                is_blur_short = sub == cursor
-                is_blur_long = sub == cursor + 1
-        else:
-            img_index = index // 4 if emit_all else index
-            k = index % 4 if emit_all else None
+            k = sub if sub < 4 else None  # tile index for emit_all mode
+            is_origin = sub == 4  # only when keep_origin (n_per == 5): the un-sliced original
+        else:  # no expansion: sample index == original image index
+            img_index = index
+            sub = k = None
             is_origin = False
-            is_ratio = False
-            is_blur_short = is_blur_long = False
-        if is_ratio:
-            return self._ratio_at(index)  # expanded index; internally maps to origin image via _origin_index
-        if is_blur_short:
-            return self._blur_at(index, long=False)  # expanded index
-        if is_blur_long:
-            return self._blur_at(index, long=True)  # expanded index
         label = deepcopy(self.labels[img_index])  # requires deepcopy() https://github.com/ultralytics/ultralytics/pull/1948
         label.pop("shape", None)  # shape is for rect, remove it
         # Online slicing runs on the ORIGINAL-resolution image (before any training resize) so small
@@ -1211,24 +1213,22 @@ class BaseDataset(Dataset):
         return self.update_labels_info(label)
 
     def __len__(self) -> int:
-        """Return the length of the labels list for the dataset.
+        """Return the number of samples in the mixed pool.
 
-        When ``slice_all_tiles`` is on and ``slice_transform`` is set, the dataset emits one sample
-        per original image per tile (and optionally keeps the original + aspect-ratio-padded +
-        motion-blurred variants). The per-image multiplier is centralized in ``self._n_per()`` so
-        ``get_image_and_label`` / ``_origin_index`` / ``_compose_at`` cannot drift apart. The tail
-        ``ceil(N/4)`` compose block is only appended when ``compose_keep`` is enabled.
+        Base segment (``_n_per`` samples per original) plus three independent segments: +N ratio,
+        +2N blur, +ceil(N/4) compose -- each present only when its own switch is on. Boundaries are
+        centralized in ``_segment_bases`` so ``get_image_and_label`` / ``_compose_at`` cannot drift
+        apart; a mismatch would silently drop samples with no error.
         """
-        if getattr(self, "slice_all_tiles", False) and getattr(self, "slice_transform", None) is not None:
-            n = len(self.labels)
-            if bool(getattr(self, "slice_keep_origin", False)):
-                n_per = self._n_per()  # 5 / 6 / 7 / 8 (slices + origin + ratio + blur)
-                n = n * n_per
-                if bool(getattr(self, "compose_keep", False)):
-                    n += (len(self.labels) + 3) // 4  # + 1 composed 2x2 image per group of 4 originals
-                return n
-            return len(self.labels) * 4  # every original image expands to 4 sliced samples
-        return len(self.labels)
+        n = len(self.labels)
+        total = n * self._n_per()
+        if bool(getattr(self, "ratio_pad_keep", False)):
+            total += n
+        if bool(getattr(self, "blur_keep", False)):
+            total += 2 * n
+        if self._compose_on():
+            total += (n + 3) // 4
+        return total
 
     def update_labels_info(self, label: dict[str, Any]) -> dict[str, Any]:
         """Customize your label format here."""

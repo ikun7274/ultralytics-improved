@@ -158,19 +158,19 @@ slice_save_max_compose: # (int, optional) 合成图保存上限; 0=不限; 未�
 slice_keep_origin: False # (bool, 需 slice_all_tiles=True) 每张原图额外保留 1 张未切片原图进样本池 -> 数据集 x5 (4切片+1原图), 共同进入 mosaic
 
 # ---------- 在线合成 (compose_*): 每 4 张原图拼 1 张 2x2 大图, 提供更大范围多目标上下文 ----------
-compose_keep: False # (bool, 需 slice_all_tiles + slice_keep_origin) 每 4 张原图额外合成 1 张 2x2 拼接大图进样本池 -> 数据集 x5 + N/4
+compose_keep: False # (bool, 独立开关, 不依赖切片/keep_origin) 每 4 张原图额外合成 1 张 2x2 拼接大图进样本池 -> 样本池 +ceil(N/4)
 compose_save: False # (bool, 默认关闭=不保存中间图) 需 compose_keep + 指定目录(compose_save_dir, 或回退 slice_save_dir/compose/): 保存合成大图供人工检查 (按 slice_save_annotated 画框, slice_save_max 限数量)
 compose_save_dir: "" # (str, 可选, 需 compose_keep + compose_save) 合成大图自定义保存目录 (独立于 slice_save_dir); 空=默认 slice_save_dir/compose/
 compose_max_side: 0 # (int, 0=自动=2×imgsz, 默认开启) 合成2x2大图拼后降采样的最长边上限(像素); 降低内存与后续处理开销, 标签为归一化坐标不受缩放影响; >0=手动指定上限(如 2560)
 
 # ---------- 在线比例调整 (ratio_pad_*): 在线加边框统一宽高比 (change_image_resolution 工具在线版) ----------
-ratio_pad_keep: False # (bool, 需 slice_all_tiles + slice_keep_origin) 每张原图额外生成 1 张"加边框对齐宽高比"的图进样本池 -> 数据集 x6 + N/4
+ratio_pad_keep: False # (bool, 独立开关, 不依赖切片/keep_origin) 每张原图额外生成 1 张"加边框对齐宽高比"的图进样本池 -> 样本池 +N
 ratio_pad_target: auto # (str: auto/4:3/16:9, 需 ratio_pad_keep) auto=4:3与16:9双向对齐, 其他比例转到最近的4:3或16:9; 4:3或16:9=把所有图统一到该比例
 ratio_pad_color: black # (str: black/gray/white, 需 ratio_pad_keep) 加边框的颜色; gray=114,114,114 (与 YOLO letterbox 一致)
 ratio_pad_save_dir: "" # (str, 可选, 需 ratio_pad_keep) 比例调整图保存目录 (画框/限数量/跨 epoch 去重); 空=不保存 (默认)
 
 # ---------- 在线运动模糊 (blur_*): 每张原图生成 2 张模糊副本(短+长), 模拟无人机运动失焦, 标签不变 ----------
-blur_keep: False # (bool, 需 slice_all_tiles + slice_keep_origin) 每张原图额外生成 2 张运动模糊图(短+长)进样本池 -> 数据集 x8 + N/4
+blur_keep: False # (bool, 独立开关, 不依赖切片/keep_origin) 每张原图额外生成 2 张运动模糊图(短+长)进样本池 -> 样本池 +2N
 blur_short_len_min: 5 # (int|float) 短模糊(轻度, 无失焦) 的运动模糊长度下限(像素)
 blur_short_len_max: 12 # (int|float) 短模糊(轻度, 无失焦) 的运动模糊长度上限(像素)
 blur_long_len_min: 20 # (int|float) 长模糊(重度) 的运动模糊长度下限(像素)

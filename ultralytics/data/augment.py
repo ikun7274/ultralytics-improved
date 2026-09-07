@@ -3238,15 +3238,15 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     )
 
     pre_transform = Compose([mosaic, affine])
-    # Online SAHI-style 2x2 overlap slicing (opt-in, default off). The slicer runs in the dataset
-    # loading step on the ORIGINAL-resolution image (see BaseDataset.get_image_and_label), so small
-    # objects are genuinely enlarged when the sliced sub-image is resized to imgsz. Disabled in rect
-    # and obb modes (same constraint as mosaic).
-    slice_enabled = (
-        getattr(hyp, "slice_prob", 0.0) > 0.0
-        and not getattr(dataset, "rect", False)
-        and not getattr(dataset, "use_obb", False)
-    )
+    # Online augmentation master switch: every online branch (slice / compose / ratio / blur) is
+    # disabled in rect and obb modes (same constraint as mosaic). After this shared gate, each
+    # branch is controlled by ITS OWN independent switch -- compose_keep / ratio_pad_keep /
+    # blur_keep no longer require slicing or keep_origin (slice_prob only gates the slicing
+    # pipeline itself; see BaseDataset._segment_bases for the mixed-pool layout).
+    online_aug_on = not getattr(dataset, "rect", False) and not getattr(dataset, "use_obb", False)
+
+    # ---- 在线切片 (slice_prob 独立开关) ----
+    slice_enabled = online_aug_on and getattr(hyp, "slice_prob", 0.0) > 0.0
     if slice_enabled:
         # P2-3: tile cap honours slice_save_max_tile override (falls back to slice_save_max when None).
         # tile is the ONLY branch whose cap lives on the OnlineSlice instance itself (see _save in
@@ -3273,53 +3273,37 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         dataset.slice_mix_ratio = float(getattr(hyp, "slice_mix_ratio", 1.0))
         dataset.slice_use_cache = bool(getattr(hyp, "slice_use_cache", False))
         dataset.slice_keep_origin = bool(getattr(hyp, "slice_keep_origin", False))
-        dataset.compose_keep = bool(getattr(hyp, "compose_keep", False))
-        dataset.compose_save = bool(getattr(hyp, "compose_save", False))
-        dataset.compose_save_dir = str(getattr(hyp, "compose_save_dir", "") or "")
-        dataset.compose_max_side = int(getattr(hyp, "compose_max_side", 0) or 0)
-        dataset.ratio_pad_keep = bool(getattr(hyp, "ratio_pad_keep", False))
-        dataset.ratio_pad_target = str(getattr(hyp, "ratio_pad_target", "auto") or "auto")
-        dataset.ratio_pad_color = str(getattr(hyp, "ratio_pad_color", "black") or "black")
-        dataset.ratio_pad_save_dir = str(getattr(hyp, "ratio_pad_save_dir", "") or "")
-        dataset.blur_keep = bool(getattr(hyp, "blur_keep", False))
-        dataset.blur_short_len_min = float(getattr(hyp, "blur_short_len_min", 5))
-        dataset.blur_short_len_max = float(getattr(hyp, "blur_short_len_max", 12))
-        dataset.blur_long_len_min = float(getattr(hyp, "blur_long_len_min", 20))
-        dataset.blur_long_len_max = float(getattr(hyp, "blur_long_len_max", 35))
-        dataset.blur_long_defocus_sigma = float(getattr(hyp, "blur_long_defocus_sigma", 1.0))
-        dataset.blur_save_dir = str(getattr(hyp, "blur_save_dir", "") or "")
-        # P2-3: per-branch save cap overrides (slice_save_max_{tile,blur,ratio,compose}).
-        # base.py's _save_cap() reads these from `self`; if not set here it falls back to slice_save_max.
-        # Keep these in sync with the legacy `save_max` passed to OnlineSlice above.
-        dataset.slice_save_max_tile = getattr(hyp, "slice_save_max_tile", None)
-        dataset.slice_save_max_blur = getattr(hyp, "slice_save_max_blur", None)
-        dataset.slice_save_max_ratio = getattr(hyp, "slice_save_max_ratio", None)
-        dataset.slice_save_max_compose = getattr(hyp, "slice_save_max_compose", None)
     else:
         dataset.slice_transform = None
         dataset.slice_all_tiles = False
         dataset.slice_mix_ratio = 1.0
         dataset.slice_keep_origin = False
-        dataset.compose_keep = False
-        dataset.compose_save = False
-        dataset.compose_save_dir = ""
-        dataset.ratio_pad_keep = False
-        dataset.ratio_pad_target = "auto"
-        dataset.ratio_pad_color = "black"
-        dataset.ratio_pad_save_dir = ""
-        dataset.blur_keep = False
-        dataset.blur_short_len_min = 5.0
-        dataset.blur_short_len_max = 12.0
-        dataset.blur_long_len_min = 20.0
-        dataset.blur_long_len_max = 35.0
-        dataset.blur_long_defocus_sigma = 1.0
-        dataset.blur_save_dir = ""
-        # P2-3: mirror the per-branch save cap attributes on `self` even when slice is disabled, so
-        # downstream code that introspects dataset.slice_save_max_* never raises AttributeError.
-        dataset.slice_save_max_tile = None
-        dataset.slice_save_max_blur = None
-        dataset.slice_save_max_ratio = None
-        dataset.slice_save_max_compose = None
+
+    # ---- 独立增强开关 (compose_keep / ratio_pad_keep / blur_keep 互不影响, 不受 slice_prob 控制) ----
+    # compose/ratio/blur 不需要切片或 keep_origin, 单独开启即生效(见 _segment_bases 区段布局)。
+    dataset.compose_keep = online_aug_on and bool(getattr(hyp, "compose_keep", False))
+    dataset.compose_save = online_aug_on and bool(getattr(hyp, "compose_save", False))
+    dataset.compose_save_dir = str(getattr(hyp, "compose_save_dir", "") or "")
+    dataset.compose_max_side = int(getattr(hyp, "compose_max_side", 0) or 0)
+    dataset.ratio_pad_keep = online_aug_on and bool(getattr(hyp, "ratio_pad_keep", False))
+    dataset.ratio_pad_target = str(getattr(hyp, "ratio_pad_target", "auto") or "auto")
+    dataset.ratio_pad_color = str(getattr(hyp, "ratio_pad_color", "black") or "black")
+    dataset.ratio_pad_save_dir = str(getattr(hyp, "ratio_pad_save_dir", "") or "")
+    dataset.blur_keep = online_aug_on and bool(getattr(hyp, "blur_keep", False))
+    dataset.blur_short_len_min = float(getattr(hyp, "blur_short_len_min", 5))
+    dataset.blur_short_len_max = float(getattr(hyp, "blur_short_len_max", 12))
+    dataset.blur_long_len_min = float(getattr(hyp, "blur_long_len_min", 20))
+    dataset.blur_long_len_max = float(getattr(hyp, "blur_long_len_max", 35))
+    dataset.blur_long_defocus_sigma = float(getattr(hyp, "blur_long_defocus_sigma", 1.0))
+    dataset.blur_save_dir = str(getattr(hyp, "blur_save_dir", "") or "")
+    # P2-3: per-branch save cap overrides (slice_save_max_{tile,blur,ratio,compose}).
+    # base.py's _save_cap() reads these from `self`; if not set here it falls back to slice_save_max.
+    # Keep tile in sync with the legacy `save_max` passed to OnlineSlice above.
+    dataset.slice_save_max_tile = getattr(hyp, "slice_save_max_tile", None)
+    dataset.slice_save_max_blur = getattr(hyp, "slice_save_max_blur", None)
+    dataset.slice_save_max_ratio = getattr(hyp, "slice_save_max_ratio", None)
+    dataset.slice_save_max_compose = getattr(hyp, "slice_save_max_compose", None)
+
     if hyp.copy_paste_mode == "flip":
         pre_transform.insert(1, CopyPaste(dataset, p=hyp.copy_paste, mode=hyp.copy_paste_mode))
     else:
