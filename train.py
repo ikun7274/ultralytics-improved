@@ -38,17 +38,16 @@ if __name__ == '__main__':
     model.train(
         #---------训练参数---------------
         data='data.yaml',
-        cache=False,                   # 图片缓存: False=不缓存; 'disk'=磁盘.npy缓存(配合 slice_use_cache=True 规避机械盘随机读)
+        cache=False,                
         # cache_dir=r'<项目根>/data_npy_cache',  # (str, 空=与图同目录) .npy缓存独立目录, 需 cache='disk'; 训练后可整体删除该目录清理缓存
         imgsz=1280,
         epochs=2,
         batch=4,
         close_mosaic=20,
-        workers=0,                     # 本地调试用0; 远程Linux多GPU推荐: workers=8(32核), batch=16, prefetch_factor=2(build.py已设); 勿用workers=16(切换风暴sy=78%)
+        workers=0,                   
         # 远程机性能调优参考(A100 80GB + HDD + 62GB内存):
         #   - 必开: OMP_NUM_THREADS=1(已在顶部设置), cache=False(HDD大图npy更慢)
         #   - 推荐: batch=16, workers=8, prefetch=2; slice_mix_ratio=0.7(降内存+缓解过拟合)
-        #   - 避免: batch=32+prefetch=8(内存爆炸GPU 2%), workers=16(切换风暴), cache='disk'(HDD更慢)
         optimizer='MuSGD',
         device='0',
         # resume=r'<项目根>/runs/<exp>/weights/last.pt',  # 断点续训: 改成你本机 last.pt 路径
