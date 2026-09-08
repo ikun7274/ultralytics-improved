@@ -152,8 +152,11 @@ def fix_checkpoint_for_extension(
             continue
         check_epochs = args.get("epochs") if isinstance(args, dict) else getattr(args, "epochs", None)
         break
-    assert ckpt_check.get("epoch") == finished_epoch - 1, "epoch 索引修补失败"
-    assert check_epochs == new_total_epochs, "epochs 元数据修补失败"
+    # 用显式 raise 而非 assert: assert 在 Python -O 优化模式下会被整体剥离, 导致回读校验失效。
+    if ckpt_check.get("epoch") != finished_epoch - 1:
+        raise RuntimeError(f"epoch 索引修补失败: 期望 {finished_epoch - 1}, 实际 {ckpt_check.get('epoch')}")
+    if check_epochs != new_total_epochs:
+        raise RuntimeError(f"epochs 元数据修补失败: 期望 {new_total_epochs}, 实际 {check_epochs}")
     print(f"回读验证通过: epoch 索引={ckpt_check.get('epoch')}, epochs={check_epochs}")
 
     # 8) 原子替换 (Windows ReplaceFile fallback 走 os.replace 单调用)

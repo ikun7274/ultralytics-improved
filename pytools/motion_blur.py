@@ -80,10 +80,13 @@ def process_folder(input_dir, output_dir,
     files = [f for f in input_path.iterdir() if f.suffix.lower() in exts]
 
     total = 0
+    read_failed = 0
+    write_failed = 0
     for file in files:
         img = cv2.imread(str(file))
         if img is None:
             print(f"无法读取 {file}，跳过")
+            read_failed += 1
             continue
 
         stem, ext = file.stem, file.suffix
@@ -94,7 +97,10 @@ def process_folder(input_dir, output_dir,
         s_sig = np.random.uniform(0.0, short_sigma_max)
         res_short = apply_motion_blur(img, length=s_len, angle=s_ang, defocus_sigma=s_sig)
         out_s = output_path / f"{stem}_blurred_short{ext}"
-        _safe_imwrite(out_s, res_short)
+        # M3: 检查写盘返回值, 失败计入失败数而非静默吞掉
+        if not _safe_imwrite(out_s, res_short):
+            write_failed += 1
+            print(f"  ⚠ 写入失败: {out_s}")
 
         # ---- 副本2: 长模糊(重度) ----
         l_len = np.random.uniform(*long_len_range)
@@ -102,7 +108,9 @@ def process_folder(input_dir, output_dir,
         l_sig = np.random.uniform(0.0, long_sigma_max)
         res_long = apply_motion_blur(img, length=l_len, angle=l_ang, defocus_sigma=l_sig)
         out_l = output_path / f"{stem}_blurred_long{ext}"
-        _safe_imwrite(out_l, res_long)
+        if not _safe_imwrite(out_l, res_long):
+            write_failed += 1
+            print(f"  ⚠ 写入失败: {out_l}")
 
         total += 2
         print(f"{file.name} -> "
@@ -110,6 +118,11 @@ def process_folder(input_dir, output_dir,
               f"{out_l.name} (len={l_len:.1f}, ang={l_ang:.1f}, σ={l_sig:.2f})")
 
     print(f"\n完成: {len(files)} 张原图 -> {total} 张模糊副本 (每图 2 张) 保存于 {output_path}")
+    # M3: 失败汇总, 让用户明确知道数据集是否完整
+    if read_failed:
+        print(f"⚠ 警告: {read_failed} 张图片读取失败被跳过")
+    if write_failed:
+        print(f"⚠ 警告: {write_failed} 张模糊副本写入失败 (输出数据集可能不完整)")
 
 
 if __name__ == "__main__":

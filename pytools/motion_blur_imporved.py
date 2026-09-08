@@ -143,6 +143,8 @@ def process_folder(
     total_blur_label = 0
     total_origin_img = 0
     total_origin_label = 0
+    read_failed = 0
+    write_failed = 0
 
     print(f"扫描图片总数：{len(image_files)}")
     print(f"实际选取数量：{len(selected_files)}")
@@ -151,6 +153,7 @@ def process_folder(
         img = cv2.imread(str(file))
         if img is None:
             print(f"无法读取，已跳过：{file.name}")
+            read_failed += 1
             continue
 
         stem = file.stem
@@ -176,7 +179,10 @@ def process_folder(
         short_image = apply_motion_blur(img, length=short_length, angle=short_angle, defocus_sigma=short_sigma)
         short_image_path = output_path / f"{stem}_blurred_short{suffix}"
         # P1-10: cv2.imwrite 在中文路径上静默失败, 改用 unicode-safe imwrite
-        _safe_imwrite(short_image_path, short_image)
+        # M3: 检查返回值, 失败计入失败数而非静默吞掉
+        if not _safe_imwrite(short_image_path, short_image):
+            write_failed += 1
+            print(f"  ⚠ 写入失败: {short_image_path}")
 
         # 长模糊：重度拖影或失焦。
         long_length = rng.uniform(*long_len_range)
@@ -184,7 +190,9 @@ def process_folder(
         long_sigma = rng.uniform(0.0, long_sigma_max)
         long_image = apply_motion_blur(img, length=long_length, angle=long_angle, defocus_sigma=long_sigma)
         long_image_path = output_path / f"{stem}_blurred_long{suffix}"
-        _safe_imwrite(long_image_path, long_image)
+        if not _safe_imwrite(long_image_path, long_image):
+            write_failed += 1
+            print(f"  ⚠ 写入失败: {long_image_path}")
 
         total_blur_img += 2
 
@@ -212,6 +220,11 @@ def process_folder(
     if copy_yolo_labels:
         print(f"复制原图标签：{total_origin_label}")
         print(f"复制模糊图标签：{total_blur_label}")
+    # M3: 失败汇总, 让用户明确知道输出数据集是否完整
+    if read_failed:
+        print(f"⚠ 警告: {read_failed} 张图片读取失败被跳过")
+    if write_failed:
+        print(f"⚠ 警告: {write_failed} 张图片写入失败 (输出数据集可能不完整)")
 
 
 if __name__ == "__main__":

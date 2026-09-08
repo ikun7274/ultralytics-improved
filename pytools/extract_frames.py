@@ -43,6 +43,7 @@ def main():
     print(f"共发现 {len(video_files)} 个视频文件，开始处理...\n")
 
     counter = START_NUM  # 全局计数器（所有视频的图片按顺序连续编号）
+    failed_count = 0     # M3: 累计写盘失败的张数, 结尾汇总告警
 
     # 3. 遍历每个视频
     for video_path in video_files:
@@ -73,20 +74,26 @@ def main():
                 ok = cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                 if not ok:
                     print(f"  ⚠ 保存失败 (路径含中文 / 权限不足?): {filepath}")
+                    failed_count += 1
                 else:
                     extracted_count += 1
 
-                # 打印进度（每10张打印一次，避免刷屏）
-                if extracted_count % 10 == 0:
-                    print(f"  进度: {frame_count}/{total_frames} 帧, 已提取 {extracted_count} 张")
-
+                # M3: 无论成功失败都推进全局编号, 保证编号与实际写入的文件一一对应
+                # (避免 counter 与 extracted_count 解耦导致"提取了 X 张"与"编号到 X-1"不一致)
                 counter += 1  # 全局编号+1
+
+                # 打印进度（每10张打印一次，避免刷屏）
+                if extracted_count % 10 == 0 and extracted_count > 0:
+                    print(f"  进度: {frame_count}/{total_frames} 帧, 已提取 {extracted_count} 张")
 
             frame_count += 1
         cap.release()
         print(f"  ✅ 完成，从该视频提取了 {extracted_count} 张图片\n")
 
     print(f"🎉 全部处理完成！共提取 {counter - START_NUM} 张图片，保存在 '{OUTPUT_DIR}' 目录下")
+    # M3: 失败汇总, 让用户明确知道是否有文件缺失
+    if failed_count:
+        print(f"⚠ 警告: {failed_count} 张图片写入失败 (输出目录可能缺文件)")
 
 if __name__ == "__main__":
     main()
