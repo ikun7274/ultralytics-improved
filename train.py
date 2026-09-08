@@ -48,7 +48,7 @@ if __name__ == '__main__':
         workers=0,                   
         # 远程机性能调优参考(A100 80GB + HDD + 62GB内存):
         #   - 必开: OMP_NUM_THREADS=1(已在顶部设置), cache=False(HDD大图npy更慢)
-        #   - 推荐: batch=16, workers=8, prefetch=2; slice_mix_ratio=0.7(降内存+缓解过拟合)
+        #   - 推荐: batch=16, workers=8, prefetch=2; slice_ratio=0.7(降内存+缓解过拟合)
         optimizer='MuSGD',
         device='0',
         # resume=r'<项目根>/runs/<exp>/weights/last.pt',  # 断点续训: 改成你本机 last.pt 路径
@@ -67,11 +67,16 @@ if __name__ == '__main__':
         # ---------SAHI在线切片 (slice_*)-----------
         slice_prob=1.0,               # 在线切片概率 [0,1]; 0=关闭切片
         slice_overlap_ratio=0.2,      # 相邻切片重叠比例 [0,1); 例: 原图4000x3000+重叠0.2 -> 切片2400x1800
-        # slice_background_ratio=-1,  # 背景切片保留比例: 背景切片数=正切片数x该值; -1=全部背景保留; 0=不要背景; emit_all 模式下每个背景切片独立判断是否保留
-        slice_all_tiles=True,         # 每张原图的 4 片子图全部参与训练
-        slice_mix_ratio=1.0,          # 切片/整图混排概率 [0,1]: 每个"切片样本位"有多大概率真正切片; 1.0=纯切片, 0.5=约一半切片位变整图(缓解过拟合+降内存/CPU), 0=等效关闭在线切片(样本数不变)
+        slice_all_tiles=True,         # True：每张原图的 4 片子图全部参与训练；False：每张原图随机取 1 片子图参与训练
+        slice_background_ratio=-1,    # 背景切片保留比例: 背景切片数=正切片数x该值; -1=全部背景保留; 0=不要背景；
+                                      # 注意: slice_all_tiles=True下被拒的背景切片会退回原图。
+                                      # 原因：DataLoader 每个 epoch 必须产出固定数量（4N）的样本。空片占的位置不能消失，只能有两种处理：
+                                      # 1. 位置消失（真・丢弃）→ `__len__` 从 4N 变成不确定值 → "预计算 + len 不恒定" ：mosaic buffer 记账错乱、epoch 内 batch 数漂移、
+                                      # 进度条和训练循环不同步。要修得改 sampler + buffer + 训练循环，工程量大且容易出隐蔽 bug。
+                                      # 2. 位置保留、内容替换（丢弃空片，用别的样本补位）→ len 恒定为 4N，无副作用。
 
-        slice_keep_origin=True,       # 每张原图额外保留 1 张未切片原图, 独立区段 [4N,5N); 切片关闭时自动抑制(避免重复原图); 全开仍 33
+        slice_ratio=0.5,              # 每个epoch随机选 N*0.5 张原图走切片, 其余整图进池; 1.0=纯切片, 0.5=一半原图切片, 0=全整图(等效关闭切片); 每epoch重新随机.
+        slice_keep_origin=False,      # 每张原图额外保留 1 张未切片原图, 独立区段 [4N,5N); 切片关闭时自动抑制(避免重复原图); 设置slice_ratio>0时, 推荐关闭。
 
         # ---- 被切目标的保留判定 ----
         # slice_min_tile_area_ratio 与 slice_min_box_retain_ratio 是双重面积过滤阈值, 决定"被切片边界切到的目标, 露多少才值得保留"; AND 同时满足才丢弃

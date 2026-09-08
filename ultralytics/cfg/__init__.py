@@ -245,7 +245,7 @@ CFG_FRACTION_KEYS = frozenset(
         "bgr",
         "mosaic",
         "slice_prob",
-        "slice_mix_ratio",
+        "slice_ratio",
         "slice_overlap_ratio",
         "slice_min_tile_area_ratio",
         "slice_min_box_retain_ratio",

@@ -460,6 +460,9 @@ class BaseTrainer:
             self._model_train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
+            # 自定义: 每个 epoch 重建数据集切片掩码(原图级精确比例 slice_ratio), 单机/多机均生效
+            if hasattr(self.train_loader.dataset, "set_epoch"):
+                self.train_loader.dataset.set_epoch(epoch)
             pbar = enumerate(self.train_loader)
             # Update dataloader attributes (optional)
             if epoch == (self.epochs - self.args.close_mosaic):

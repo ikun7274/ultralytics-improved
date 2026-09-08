@@ -1158,6 +1158,9 @@ class OnlineSlice(BaseTransform):
                  src: Any = None, count: bool = True) -> tuple[np.ndarray, dict[str, Any]]:
         """Return the ``k``-th (0..3) tile so all 4 tiles participate in training (mode B / emit_all).
 
+        Background-quota-exceeded tiles fall back to the ORIGINAL image (Plan A), never to an empty
+        tile, so every sample in the 4N pool carries either a sliced tile or the full original.
+
         Args:
             src (Any): Optional unique key (e.g. ``(img_index, k)`` or ``img_index``) used to save each
                 tile only once across epochs / mosaic mix visits.
@@ -1170,13 +1173,12 @@ class OnlineSlice(BaseTransform):
         tile_results = self._geometry(img, label)
         x0, y0, x1, y1, idx, local = tile_results[k]
         sub, out_label = self._emit(img, label, x0, y0, x1, y1, idx, local, src, count)
-        # emit_all contract: every index must yield a sample whose bbox coords match the returned image.
-        # When the tile was filtered empty AND the background quota is reached, _emit falls back to the
-        # original image (mode A contract); here we crop that tile and return it with empty boxes instead,
-        # so the original-image bbox coords never leak into a cropped tile.
-        if sub is img:
-            sub = np.ascontiguousarray(img[y0:y1, x0:x1])
-            out_label = self._empty_label(sub, out_label)
+        # Plan A fallback: when this tile is empty AND the background quota is reached, _emit returns
+        # the ORIGINAL image unchanged (mode A contract). We keep that original image as-is -- bbox
+        # coords match the returned image, len stays constant (4N), and the pure-negative empty tile
+        # (up to ~67% of the pool in sparse small-object scenes) is replaced by a positive original.
+        # Un-sliced originals enter the mosaic mix pool like every other sample (implicit oversampling
+        # of the few positives, each copy independently augmented).
         return sub, out_label
 
 
@@ -3270,11 +3272,11 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
             full_box_only=bool(getattr(hyp, "slice_full_box_only", False)),
         )
         dataset.slice_all_tiles = bool(getattr(hyp, "slice_all_tiles", False))
-        dataset.slice_mix_ratio = float(getattr(hyp, "slice_mix_ratio", 1.0))
+        dataset.slice_ratio = float(getattr(hyp, "slice_ratio", 1.0))
     else:
         dataset.slice_transform = None
         dataset.slice_all_tiles = False
-        dataset.slice_mix_ratio = 1.0
+        dataset.slice_ratio = 1.0
 
     # ---- 独立增强开关 (slice_keep_origin / compose_keep / ratio_pad_keep / blur_keep 互不影响,
     # 不受 slice_prob 控制; keep_origin 无切片时由 _keep_origin_on() 自动抑制) ----

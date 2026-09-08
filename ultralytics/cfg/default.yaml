@@ -130,13 +130,15 @@ mosaic: 1.0 # (float) mosaic augmentation probability
 
 # ---------- SAHI 在线切片 (slice_*): 把大图在线切成 2x2 重叠子图 ----------
 slice_prob: 0.0 # (float) 在线切片概率 [0,1]; 0=关闭切片; 纯放大时建议配合 mosaic=0
-slice_mix_ratio: 1.0 # (float) 每 batch 中走切片的样本占比 [0,1]; 1.0=纯切片, <1.0 混入未切片整图以缓解小数据集对切片分布过拟合
+slice_ratio: 1.0 # (float) 每个 epoch 随机选 round(x*N) 张原图走在线切片(原图级: 同一原图 4 片同生共死), 其余整图进池;
+                 # 1.0=纯切片(默认), <1.0 精确混入整图(缓解过拟合+降内存), 0=全整图(等效关闭切片); 每 epoch 重新随机
 slice_transform: # (str, 可选) 切片后接的额外变换名 (如 "hsv_h", "blur"); 与 pytools/sahi_*.py 中的同名变换一一对应, 便于复用离线调好的参数; 空=不附加
 slice_raw_cache_size: 2 # (int) 在线增强 worker 内原图 LRU 缓存大小 (以原图数计); 0=关闭; 切片+原图+比例+模糊+合成会让同一张原图被 imread 多达 8~9 次, LRU 把解码降到 ~1 次/原图
 slice_overlap_ratio: 0.2 # (float) 相邻切片重叠比例 [0,1); 例: 原图4000x3000、重叠0.2 -> 切片2400x1800
 slice_min_tile_area_ratio: 0.005 # (float) 切片块面积下界 [0,1]: 切片面积 < 原图x该值 的切片丢弃 (过小切片信息量低)
 slice_min_box_retain_ratio: 0.4 # (float) 目标框保留下界 [0,1]: 被边界切到的目标, 其在切片内可见面积占原框比例 < 该值则丢弃
 slice_background_ratio: -1 # (float) 背景切片数量 = 正样本切片数 x 该值; 负值(如-1)=全部背景都保留; 0=不要背景
+                            # 注意: slice_all_tiles=True下被拒的背景切片会退回原图(不再裁空片)
 slice_all_tiles: False # (bool) 每张原图的 4 片子图全部参与训练 (数据集 x4, 每 epoch 全部子图都训练); False=每图随机取 1 片
 slice_center_constraint: False # (bool) 目标唯一归属: 每个目标只分配给"中心所在"切片 (防同一目标被切两半重复出现在多个切片)
 slice_min_center_retain_ratio: 0.6 # (float) 配合 center_constraint: 目标中心不在本片时, 若本片内可见面积占比 >= 该值仍保留; 1.0=严格只留中心片

@@ -291,6 +291,9 @@ class BaseDataset(Dataset):
         # adjacent (see GroupedRandomSampler in data/build.py). Keyed by original image index.
         self._raw_cache = {}
         self._raw_cache_size = int(getattr(self, "slice_raw_cache_size", 2) or 0)
+        # Per-epoch slice mask (slice_ratio exact ratio, original-level). None = pure slicing or
+        # slicing off. Rebuilt by set_epoch(epoch) at every epoch start; see get_image_and_label.
+        self._slice_mask = None
 
         # Cache images (options are cache = True, False, None, "ram", "disk")
         self.ims, self.im_hw0, self.im_hw = [None] * self.ni, [None] * self.ni, [None] * self.ni
@@ -597,6 +600,28 @@ class BaseDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Return transformed label information for given index."""
         return self.transforms(self.get_image_and_label(index))
+
+    def set_epoch(self, epoch: int = 0) -> None:
+        """Rebuild the per-epoch slice mask for exact-ratio ORIGINAL-level slicing.
+
+        Exactly ``round(slice_ratio * len(self.labels))`` ORIGINAL images are randomly chosen to go
+        through online slicing this epoch; every other original is fed as an un-sliced full image.
+        The mask is at ORIGINAL-image granularity, so with ``slice_all_tiles=True`` all 4 tiles of a
+        chosen original slice together (same fate). Resampled every epoch by the trainer
+        (``trainer.py`` calls ``dataset.set_epoch(epoch)`` at each epoch start). ``len`` stays 4N.
+
+        No-op (mask = None, i.e. pure slicing) when slicing is off or ``slice_ratio >= 1``.
+        """
+        x = float(getattr(self, "slice_ratio", 1.0))
+        if not (self.augment and getattr(self, "slice_transform", None) is not None and 0.0 <= x < 1.0):
+            self._slice_mask = None
+            return
+        n = len(self.labels)
+        n_slice = int(round(x * n))
+        mask = np.zeros(n, dtype=bool)
+        if n_slice > 0:
+            mask[random.sample(range(n), n_slice)] = True
+        self._slice_mask = mask
 
     def _n_per(self) -> int:
         """Single source of truth: how many samples each ORIGINAL image expands to in the BASE segment.
@@ -1176,19 +1201,23 @@ class BaseDataset(Dataset):
         label.pop("shape", None)  # shape is for rect, remove it
         # Online slicing runs on the ORIGINAL-resolution image (before any training resize) so small
         # objects are genuinely enlarged when the sliced sub-image is resized to the training size.
-        # slice_mix_ratio: fraction of samples that go through online slicing (1.0 = pure slicing, the
-        # previous behaviour; <1.0 mixes in un-sliced full images per sample to reduce overfitting to the
-        # sliced distribution). Applied per sample; with emit_all the decision is also per sample (index).
+        # slice_ratio: each epoch set_epoch() rebuilds a mask that picks exactly round(slice_ratio*N)
+        # ORIGINAL images to slice (original-level decision: with emit_all all 4 tiles share one fate);
+        # the rest are fed as un-sliced full images. Mask None = pure slicing (default) or slicing off.
         # The un-sliced originals live in their own independent segment (_origin_at) and never slice.
         slice_t = getattr(self, "slice_transform", None)
-        slice_mix_ratio = float(getattr(self, "slice_mix_ratio", 1.0))
+        # Lazy init: if the trainer never called set_epoch (direct sampling / validation path),
+        # build the mask once on first access so 0 < slice_ratio < 1 still works.
+        if self._slice_mask is None and 0.0 <= float(getattr(self, "slice_ratio", 1.0)) < 1.0:
+            self.set_epoch(getattr(self, "epoch", 0))
+        slice_ok = self._slice_mask is None or bool(self._slice_mask[img_index])
         # With slicing enabled the mosaic buffer is maintained centrally here using DATASET (expanded) indices
         # (load_image's indices would be original-image indices and mixing them would corrupt the buffer).
         if slice_t is not None and self.augment and self.cache != "ram":
             self.buffer.append(index)
             if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent unbounded buffer
                 self.buffer.pop(0)
-        if slice_t is not None and self.augment and random.random() < slice_mix_ratio:
+        if slice_t is not None and self.augment and slice_ok:
             # _load_image_cached: 直接读原图 jpg + worker 内存 LRU (.npy 磁盘缓存已移除)
             im = self._load_image_cached(img_index)
             im, label = (
