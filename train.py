@@ -14,8 +14,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-# 仅屏蔽上游升级路径上的 DeprecationWarning/FutureWarning 类噪音,
-# 不再一刀切 warnings.filterwarnings('ignore')。RuntimeWarning 等真错误必须保留冒泡
+# 仅屏蔽上游升级路径上的 DeprecationWarning/FutureWarning 类噪音, 不再一刀切 warnings.filterwarnings('ignore')。RuntimeWarning 等真错误必须保留冒泡
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
@@ -23,7 +22,7 @@ from ultralytics import YOLO
 
 '''
 
-样本池 = 区段式布局, 每个区段只受自己的独立开关控制 (互不影响, 不再被 slice_prob=0 强制关闭):
+样本池 = 区段式布局, 每个区段只受自己的独立开关控制 (互不影响):
     [0, 4N)        切片    slice_prob / slice_all_tiles
     [4N, 5N)       原图    slice_keep_origin (独立开关)
     [5N, 6N)       比例    ratio_pad_keep    (独立开关)
@@ -41,8 +40,8 @@ if __name__ == '__main__':
         #---------训练参数---------------
         data='data.yaml',
         cache=False,                
-        imgsz=1280,
-        epochs=2,
+        imgsz=640,
+        epochs=10,
         batch=4,
         close_mosaic=20,
         workers=0,                   
@@ -55,7 +54,7 @@ if __name__ == '__main__':
         # resume_extend_epochs=5,  # (int, 0=关闭) 续训自动延长: 自动修补ckpt元数据(epochs/patience), 从旧停点续训到该轮数; 需>ckpt已完成轮数
         patience=50,
         amp=True,
-        project=r"",  
+        project=r"C:\Users\Administrator\Desktop\ultralytics-improved\runs",  
         name='exp',
         exist_ok=False,
 
@@ -85,7 +84,7 @@ if __name__ == '__main__':
         slice_full_box_only=False,        # 目标必须完整落在切片内才保留, 被边界切开即过滤; 开启时优先于 slice_center_constraint
 
 
-        # ---------在线合成 (compose_*): 每 4 张原图拼 1 张 2x2 大图, 提供更大范围多目标上下文--------- (独立开关)
+        # ---------在线合成 (compose_*): 每 4 张原图拼 1 张 2x2 大图, 提供更大范围多目标上下文--------- 
         compose_keep=True, # 独立开关; 每 4 张原图额外合成 1 张 2×2 大图进样本池 (区段 +ceil(N/4))
         compose_max_side=0, # 合成2x2大图拼后降采样最长边上限(像素): 0=自动=2×imgsz(默认开启, 降内存), >0=手动指定(如2560); 不想要此优化可设 compose_max_side 为一个很大的值关闭。
 
