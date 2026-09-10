@@ -294,6 +294,11 @@ class BaseDataset(Dataset):
         # Per-epoch slice mask (slice_ratio exact ratio, original-level). None = pure slicing or
         # slicing off. Rebuilt by set_epoch(epoch) at every epoch start; see get_image_and_label.
         self._slice_mask = None
+        # ratio_pad_ratio / blur_ratio / compose_ratio: per-epoch exact-ratio masks (rebuilt in
+        # set_epoch; None = all samples augmented / branch off). See set_epoch for semantics.
+        self._ratio_mask = None
+        self._blur_mask = None
+        self._compose_mask = None
 
         # Cache images (options are cache = True, False, None, "ram", "disk")
         self.ims, self.im_hw0, self.im_hw = [None] * self.ni, [None] * self.ni, [None] * self.ni
@@ -602,15 +607,16 @@ class BaseDataset(Dataset):
         return self.transforms(self.get_image_and_label(index))
 
     def set_epoch(self, epoch: int = 0) -> None:
-        """Rebuild the per-epoch slice mask for exact-ratio ORIGINAL-level slicing.
+        """Rebuild per-epoch masks for exact-ratio ORIGINAL-level augmentation selection.
 
-        Exactly ``round(slice_ratio * len(self.labels))`` ORIGINAL images are randomly chosen to go
-        through online slicing this epoch; every other original is fed as an un-sliced full image.
-        The mask is at ORIGINAL-image granularity, so with ``slice_all_tiles=True`` all 4 tiles of a
-        chosen original slice together (same fate). Resampled every epoch by the trainer
-        (``trainer.py`` calls ``dataset.set_epoch(epoch)`` at each epoch start). ``len`` stays 4N.
+        Exactly ``round(x * N)`` ORIGINAL images are randomly chosen this epoch for each
+        image-level branch (slice_ratio / ratio_pad_ratio / blur_ratio; blur 短+长 同命运),
+        and ``round(x * ceil(N/4))`` 4-image GROUPS for compose_ratio. Un-selected positions keep
+        their segment slot but fall back to the ORIGINAL full image (len stays constant; same
+        principle as the mode-A background fallback). Resampled every epoch by the trainer
+        (``trainer.py`` calls ``dataset.set_epoch(epoch)`` at each epoch start).
 
-        No-op (mask = None, i.e. pure slicing) when slicing is off or ``slice_ratio >= 1``.
+        Mask = None (all augmented / branch off) when the branch is off or its ratio >= 1.
         """
         # P3 fix: reset OnlineSlice's positive/background counters every epoch so the neg_ratio
         # background quota restarts per epoch instead of accumulating monotonically across epochs
@@ -620,16 +626,45 @@ class BaseDataset(Dataset):
         st = getattr(self, "slice_transform", None)
         if st is not None and hasattr(st, "reset_counters"):
             st.reset_counters()
-        x = float(getattr(self, "slice_ratio", 1.0))
-        if not (self.augment and getattr(self, "slice_transform", None) is not None and 0.0 <= x < 1.0):
-            self._slice_mask = None
-            return
         n = len(self.labels)
-        n_slice = int(round(x * n))
-        mask = np.zeros(n, dtype=bool)
-        if n_slice > 0:
-            mask[random.sample(range(n), n_slice)] = True
-        self._slice_mask = mask
+        aug_on = bool(self.augment)
+        # --- slice (original-level) ---
+        x = float(getattr(self, "slice_ratio", 1.0))
+        if aug_on and getattr(self, "slice_transform", None) is not None and 0.0 <= x < 1.0:
+            mask = np.zeros(n, dtype=bool)
+            if x > 0:
+                mask[random.sample(range(n), int(round(x * n)))] = True
+            self._slice_mask = mask
+        else:
+            self._slice_mask = None
+        # --- ratio_pad (original-level) ---
+        x = float(getattr(self, "ratio_pad_ratio", 1.0))
+        if aug_on and bool(getattr(self, "ratio_pad_keep", False)) and 0.0 <= x < 1.0:
+            mask = np.zeros(n, dtype=bool)
+            if x > 0:
+                mask[random.sample(range(n), int(round(x * n)))] = True
+            self._ratio_mask = mask
+        else:
+            self._ratio_mask = None
+        # --- blur (original-level, short+long same fate) ---
+        x = float(getattr(self, "blur_ratio", 1.0))
+        if aug_on and bool(getattr(self, "blur_keep", False)) and 0.0 <= x < 1.0:
+            mask = np.zeros(n, dtype=bool)
+            if x > 0:
+                mask[random.sample(range(n), int(round(x * n)))] = True
+            self._blur_mask = mask
+        else:
+            self._blur_mask = None
+        # --- compose (group-level) ---
+        x = float(getattr(self, "compose_ratio", 1.0))
+        if aug_on and self._compose_on() and 0.0 <= x < 1.0:
+            n_groups = (n + 3) // 4
+            mask = np.zeros(n_groups, dtype=bool)
+            if x > 0:
+                mask[random.sample(range(n_groups), int(round(x * n_groups)))] = True
+            self._compose_mask = mask
+        else:
+            self._compose_mask = None
 
     def _n_per(self) -> int:
         """Single source of truth: how many samples each ORIGINAL image expands to in the BASE segment.
@@ -794,9 +829,13 @@ class BaseDataset(Dataset):
             hi = float(getattr(self, "blur_short_len_max", 12))
             sigma = 0.0
             tier = "short"
-        length = random.uniform(lo, hi)
-        angle = random.uniform(0.0, 180.0)
-        blur = _apply_motion_blur(im, length=length, angle=angle, defocus_sigma=sigma)
+        # blur_ratio: 未选中原图跳过模糊, 整图直通 (位保留, len 恒定); 短+长同命运
+        if self._blur_mask is not None and not self._blur_mask[img_index]:
+            blur = im
+        else:
+            length = random.uniform(lo, hi)
+            angle = random.uniform(0.0, 180.0)
+            blur = _apply_motion_blur(im, length=length, angle=angle, defocus_sigma=sigma)
 
         label = deepcopy(self.labels[img_index])
         label.pop("shape", None)
@@ -879,6 +918,8 @@ class BaseDataset(Dataset):
         f = self.im_files[img_index]
         im = self._load_image_cached(img_index)
         h, w = im.shape[:2]
+        # ratio_pad_ratio: 未选中原图跳过加框, 整图直通 (位保留, len 恒定)
+        skip_pad = self._ratio_mask is not None and not self._ratio_mask[img_index]
         target = str(getattr(self, "ratio_pad_target", "auto") or "auto")
         color_key = str(getattr(self, "ratio_pad_color", "black") or "black")
         # P1-7: validate up front. Previously an unknown color raised a bare KeyError halfway through
@@ -887,7 +928,7 @@ class BaseDataset(Dataset):
             raise ValueError(f"ratio_pad_color must be one of {sorted(_RATIO_PAD_COLORS)}, got '{color_key}'.")
         if target not in ("auto", "4:3", "16:9"):
             raise ValueError(f"ratio_pad_target must be one of 'auto', '4:3', '16:9', got '{target}'.")
-        pad = _ratio_pad_params(w, h, target, auto=(target == "auto"))
+        pad = None if skip_pad else _ratio_pad_params(w, h, target, auto=(target == "auto"))
         if pad is None:
             # Already at the target ratio: no padding needed (use the original as-is)
             big = im
@@ -1031,6 +1072,9 @@ class BaseDataset(Dataset):
                 f"outside the valid range."
             )
         idxs = [(base + j) % n_origin for j in range(4)]  # wrap the tail group to always have 4 images
+        # compose_ratio: 未选中组退回组内第 1 张原图整图 (位保留, len 恒定)
+        if self._compose_mask is not None and not self._compose_mask[group]:
+            return self._origin_at(index, base)
         imgs = []
         for i in idxs:
             im = self._load_image_cached(i)

@@ -88,14 +88,17 @@ if __name__ == '__main__':
         # ---------在线合成 (compose_*): 每 4 张原图拼 1 张 2x2 大图, 提供更大范围多目标上下文--------- 
         compose_keep=True, # 独立开关; 每 4 张原图额外合成 1 张 2×2 大图进样本池 (区段 +ceil(N/4))
         compose_max_side=0, # 合成2x2大图拼后降采样最长边上限(像素): 0=自动=2×imgsz(默认开启, 降内存), >0=手动指定(如2560); 不想要此优化可设 compose_max_side 为一个很大的值关闭。
+        compose_ratio=1.0,  # 每epoch随机选 round(x*ceil(N/4)) 组合成(组级), 未选中组退回组内第1张原图(整图直通, len恒定); 1.0=全量合成
 
         # ---------在线比例调整 (ratio_pad_*): 在线加边框统一宽高比---------
         ratio_pad_keep=False,          # 独立开关, 开启在线比例调整 (每图+1张比例对齐图, 区段 +N)
+        ratio_pad_ratio=1.0,          # 每epoch随机选 round(x*N) 张原图做比例调整(原图级), 未选中直接整图; 1.0=全量
         ratio_pad_target="auto",      # auto: 4:3↔16:9 双向 + 其他比例转最近（默认）
         ratio_pad_color="gray",       # 边框颜色 black/gray/white
 
         # ---------在线运动模糊 (blur_*): 模拟无人机运动失焦, 每张原图生成 2 张模糊副本(短+长), 标签不变---------
         blur_keep=False,               # 独立开关, 开启在线运动模糊 (每图+2张模糊图, 区段 +2N)
+        blur_ratio=1.0,                # 每epoch随机选 round(x*N) 张原图做运动模糊(原图级, 短+长同命运), 未选中整图x2; 1.0=全量
         blur_short_len_min=5,         # 短模糊(轻度, 无失焦) 长度下限(像素)
         blur_short_len_max=12,        # 短模糊(轻度, 无失焦) 长度上限(像素)
         blur_long_len_min=20,         # 长模糊(重度) 长度下限(像素)
