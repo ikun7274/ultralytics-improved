@@ -55,7 +55,7 @@ if __name__ == '__main__':
         patience=50,
         amp=True,
         fraction=0.01,
-        project=r"C:\Users\Administrator\Desktop\ultralytics-improved\runs",  
+        project=r"ultralytics-improved\runs",  
         name='exp',
         exist_ok=False,
 
