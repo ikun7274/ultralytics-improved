@@ -476,11 +476,19 @@ class BaseDataset(Dataset):
                 if getattr(self, "slice_transform", None) is None:
                     # Without slicing, load_image's index is the dataset index, so buffer + ims cache are managed here.
                     self.ims[i], self.im_hw0[i], self.im_hw[i] = im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
-                    self.buffer.append(i)
-                    if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent empty buffer
-                        j = self.buffer.pop(0)
-                        if self.cache != "ram":
-                            self.ims[j], self.im_hw0[j], self.im_hw[j] = None, None, None
+                    if not self._extended_pool_on():
+                        # Pure-ultralytics mode (no slicing, no project extension): the buffer can only
+                        # contain original-image indices, so self-managed append/pop/clear is safe.
+                        self.buffer.append(i)
+                        if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent empty buffer
+                            j = self.buffer.pop(0)
+                            if self.cache != "ram":
+                                self.ims[j], self.im_hw0[j], self.im_hw[j] = None, None, None
+                    # Extended pool on: the buffer is bookkept centrally by get_image_and_label with
+                    # EXPANDED indices; load_image must not pop/clear ims with them (j >= n would
+                    # overflow ims) -- e.g. slicing off + compose/blur/ratio/keep_origin on. The ims
+                    # cache above stays safe (i is an original index) and avoids re-reading disk on
+                    # the full-image path.
                 # With slicing: do NOT cache in self.ims here. get_image_and_label centrally manages the buffer
                 # with expanded indices; caching origin-indexed images here would leak memory (never released).
 
@@ -755,6 +763,22 @@ class BaseDataset(Dataset):
         entirely in that case.
         """
         return bool(getattr(self, "compose_keep", False)) and len(self.labels) >= 4
+
+    def _extended_pool_on(self) -> bool:
+        """True when any project extension allocates samples beyond plain originals.
+
+        ``load_image``'s self-managed buffer (pure-ultralytics path) is only safe when the buffer
+        can only contain original-image indices. Once any extended segment (keep_origin / ratio /
+        blur / compose) writes EXPANDED indices into the same buffer, ``load_image`` must not
+        pop/clear ``ims`` with them; buffer bookkeeping is then entirely owned by
+        ``get_image_and_label`` (expanded indices).
+        """
+        return (
+            self._keep_origin_on()
+            or bool(getattr(self, "ratio_pad_keep", False))
+            or bool(getattr(self, "blur_keep", False))
+            or self._compose_on()
+        )
 
     def _load_image_cached(self, img_index: int) -> np.ndarray:
         """Load original-resolution image, with a tiny per-worker memory LRU (no .npy disk cache).
@@ -1267,9 +1291,15 @@ class BaseDataset(Dataset):
         if self._slice_mask is None and 0.0 <= float(getattr(self, "slice_ratio", 1.0)) < 1.0:
             self.set_epoch(getattr(self, "epoch", 0))
         slice_ok = self._slice_mask is None or bool(self._slice_mask[img_index])
-        # With slicing enabled the mosaic buffer is maintained centrally here using DATASET (expanded) indices
-        # (load_image's indices would be original-image indices and mixing them would corrupt the buffer).
-        if slice_t is not None and self.augment and self.cache != "ram":
+        # The mosaic buffer is maintained centrally here using DATASET (expanded) indices whenever
+        # load_image does NOT self-manage it: slicing on, or any project extension on (load_image's
+        # self-managed path is only active in pure-ultralytics mode; mixing original indices from
+        # load_image with expanded indices here would corrupt the buffer).
+        if (
+            self.augment
+            and self.cache != "ram"
+            and (slice_t is not None or self._extended_pool_on())
+        ):
             self.buffer.append(index)
             if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent unbounded buffer
                 self.buffer.pop(0)
