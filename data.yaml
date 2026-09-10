@@ -1,11 +1,6 @@
-# dataset path
-path: D:/ObjectDetect/RTDETR-main/dataset
+path: D:/Downloads/yolo_dataset
 train: images/train
 val: images/val
-test: images/test 
-
-# number of classes
-nc: 1
-
-# class names
-names: ['ship']
+test: images/test
+nc: 6
+names: ['Bus', 'Microbus', 'Minivan', 'Sedan', 'SUV', 'Truck']

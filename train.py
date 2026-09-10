@@ -35,13 +35,13 @@ N=4 全开 = 16 + 4 + 4 + 8 + 1 = 33 张混合样本池 → mosaic 取 4 张拼�
 
 if __name__ == '__main__':
     model = YOLO('ultralytics/cfg/models/26/yolo26n.yaml')
-    model.load('yolo26n.pt')
+    model.load('weights/yolo26n.pt')
     model.train(
         #---------训练参数---------------
         data='data.yaml',
         cache=False,                
         imgsz=640,
-        epochs=10,
+        epochs=1,
         batch=4,
         close_mosaic=20,
         workers=0,                   
@@ -50,10 +50,11 @@ if __name__ == '__main__':
         #   - 推荐: batch=16, workers=8, prefetch=2; slice_ratio=0.7(降内存+缓解过拟合)
         optimizer='MuSGD',
         device='0',
-        # resume=r'<项目根>/runs/<exp>/weights/last.pt',  # 断点续训: 改成你本机 last.pt 路径
-        # resume_extend_epochs=5,  # (int, 0=关闭) 续训自动延长: 自动修补ckpt元数据(epochs/patience), 从旧停点续训到该轮数; 需>ckpt已完成轮数
+        # resume=r'C:\Users\Administrator\Desktop\ultralytics-improved\runs\exp-3\weights\last.pt',  # 断点续训: 改成你本机 last.pt 路径
+        # resume_extend_epochs=15,  # (int, 0=关闭) 续训自动延长: 自动修补ckpt元数据(epochs/patience), 从旧停点续训到该轮数; 需>ckpt已完成轮数
         patience=50,
         amp=True,
+        fraction=0.1,
         project=r"C:\Users\Administrator\Desktop\ultralytics-improved\runs",  
         name='exp',
         exist_ok=False,
@@ -89,12 +90,12 @@ if __name__ == '__main__':
         compose_max_side=0, # 合成2x2大图拼后降采样最长边上限(像素): 0=自动=2×imgsz(默认开启, 降内存), >0=手动指定(如2560); 不想要此优化可设 compose_max_side 为一个很大的值关闭。
 
         # ---------在线比例调整 (ratio_pad_*): 在线加边框统一宽高比---------
-        ratio_pad_keep=True,          # 独立开关, 开启在线比例调整 (每图+1张比例对齐图, 区段 +N)
+        ratio_pad_keep=False,          # 独立开关, 开启在线比例调整 (每图+1张比例对齐图, 区段 +N)
         ratio_pad_target="auto",      # auto: 4:3↔16:9 双向 + 其他比例转最近（默认）
         ratio_pad_color="gray",       # 边框颜色 black/gray/white
 
         # ---------在线运动模糊 (blur_*): 模拟无人机运动失焦, 每张原图生成 2 张模糊副本(短+长), 标签不变---------
-        blur_keep=True,               # 独立开关, 开启在线运动模糊 (每图+2张模糊图, 区段 +2N)
+        blur_keep=False,               # 独立开关, 开启在线运动模糊 (每图+2张模糊图, 区段 +2N)
         blur_short_len_min=5,         # 短模糊(轻度, 无失焦) 长度下限(像素)
         blur_short_len_max=12,        # 短模糊(轻度, 无失焦) 长度上限(像素)
         blur_long_len_min=20,         # 长模糊(重度) 长度下限(像素)

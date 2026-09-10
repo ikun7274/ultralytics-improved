@@ -612,6 +612,14 @@ class BaseDataset(Dataset):
 
         No-op (mask = None, i.e. pure slicing) when slicing is off or ``slice_ratio >= 1``.
         """
+        # P3 fix: reset OnlineSlice's positive/background counters every epoch so the neg_ratio
+        # background quota restarts per epoch instead of accumulating monotonically across epochs
+        # (later epochs would otherwise keep ever fewer background tiles). Like the slice mask,
+        # the reset propagates to DataLoader workers via fork inheritance (same architectural
+        # assumption as the mask rebuild).
+        st = getattr(self, "slice_transform", None)
+        if st is not None and hasattr(st, "reset_counters"):
+            st.reset_counters()
         x = float(getattr(self, "slice_ratio", 1.0))
         if not (self.augment and getattr(self, "slice_transform", None) is not None and 0.0 <= x < 1.0):
             self._slice_mask = None
@@ -737,6 +745,10 @@ class BaseDataset(Dataset):
         if size > 0:
             hit = cache.get(img_index)
             if hit is not None:
+                # P4 fix: refresh the insertion order on hit (true LRU, not FIFO). The dict entry
+                # previously stayed in its original slot on a hit, so hot entries were evicted by
+                # the "drop oldest half" sweep purely by first-load time.
+                cache[img_index] = cache.pop(img_index)
                 return hit.copy()
 
         f = self.im_files[img_index]

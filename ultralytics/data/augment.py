@@ -929,6 +929,18 @@ class OnlineSlice(BaseTransform):
         # once across epochs / mosaic mix visits instead of accumulating one file per epoch.
         self._saved_keys = set()
 
+    def reset_counters(self) -> None:
+        """Reset the per-epoch positive/background tile counters (called from BaseDataset.set_epoch).
+
+        Without a reset the counters accumulate monotonically across epochs, so the ``neg_ratio``
+        background quota keeps tightening as training progresses and later epochs retain fewer
+        background tiles (behavior drift over time). Called once per epoch so the background
+        budget restarts every epoch. Multi-worker DataLoader processes keep independent counters
+        (the quota stays a per-worker approximation, by design).
+        """
+        self._pos_count = 0
+        self._bg_count = 0
+
     def _allow_background(self) -> bool:
         """Return whether a background (empty) tile may be emitted under the global ratio rule."""
         if self.neg_ratio < 0:
