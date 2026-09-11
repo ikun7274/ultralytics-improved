@@ -906,6 +906,13 @@ class BaseTrainer:
             # Sync EMA buffers from rank 0 to all ranks
             for buffer in self.ema.ema.buffers():
                 dist.broadcast(buffer, src=0)
+        # Main validation pass: when val_slice_enable is on, force the validator to REBUILD its
+        # dataloader -- the trainer's prebuilt test_loader is a whole-image loader and would bypass
+        # the val_slice wrap (which only exists in DetectionValidator.get_dataloader).
+        slice_on = bool(getattr(self.args, "val_slice_enable", False))
+        if slice_on:
+            self.validator.args.val_slice_enable = True
+            self.validator.dataloader = None  # force rebuild as sliced loader
         metrics = self.validator(self)
         if metrics is None:
             return None, None
@@ -915,7 +922,7 @@ class BaseTrainer:
         # Dual-metric pass: also evaluate on the WHOLE image (reference) when sliced validation is enabled,
         # so the sliced mAP (main fitness / best.pt / early-stop) is reported next to a comparable
         # whole-image mAP (whole_* keys, best_whole.pt / last_whole.pt). Cost: one extra validation pass.
-        if bool(getattr(self.args, "val_slice_dual_metric", False)) and bool(getattr(self.args, "val_slice_enable", False)):
+        if bool(getattr(self.args, "val_slice_dual_metric", False)) and slice_on:
             self.validator.dataloader = None  # force dataset rebuild in whole-image mode
             self.validator.args.val_slice_enable = False
             metrics_whole = self.validator(self)

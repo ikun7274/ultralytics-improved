@@ -3321,6 +3321,15 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     dataset.blur_long_len_max = float(getattr(hyp, "blur_long_len_max", 35))
     dataset.blur_long_defocus_sigma = float(getattr(hyp, "blur_long_defocus_sigma", 1.0))
     dataset.blur_save_dir = str(getattr(hyp, "blur_save_dir", "") or "")
+    # ---- 在线气象退化 (weather_*): 雨/雾/噪声, 标签不变, 独立开关 + epoch 级比例 (复用掩码机制) ----
+    dataset.weather_keep = online_aug_on and bool(getattr(hyp, "weather_keep", False))
+    dataset.weather_ratio = float(getattr(hyp, "weather_ratio", 0.5))
+    dataset.weather_types = str(getattr(hyp, "weather_types", "rain,haze,noise") or "rain,haze,noise")
+    dataset.weather_rain_density = float(getattr(hyp, "weather_rain_density", 0.15))
+    dataset.weather_rain_length = float(getattr(hyp, "weather_rain_length", 15.0))
+    dataset.weather_haze_beta = float(getattr(hyp, "weather_haze_beta", 0.4))
+    dataset.weather_noise_std = float(getattr(hyp, "weather_noise_std", 15.0))
+    dataset.weather_save_dir = str(getattr(hyp, "weather_save_dir", "") or "")
     # P2-3: per-branch save cap overrides (slice_save_max_{tile,blur,ratio,compose}).
     # base.py's _save_cap() reads these from `self`; if not set here it falls back to slice_save_max.
     # Keep tile in sync with the legacy `save_max` passed to OnlineSlice above.
@@ -3328,6 +3337,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     dataset.slice_save_max_blur = getattr(hyp, "slice_save_max_blur", None)
     dataset.slice_save_max_ratio = getattr(hyp, "slice_save_max_ratio", None)
     dataset.slice_save_max_compose = getattr(hyp, "slice_save_max_compose", None)
+    dataset.slice_save_max_weather = getattr(hyp, "slice_save_max_weather", None)
 
     if hyp.copy_paste_mode == "flip":
         pre_transform.insert(1, CopyPaste(dataset, p=hyp.copy_paste, mode=hyp.copy_paste_mode))

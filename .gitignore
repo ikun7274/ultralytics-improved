@@ -221,3 +221,6 @@ _regress_runs/
 _smoke_runs/
 _smoke_*.py
 _final_smoke.py
+
+# YOLO label cache
+*.cache

@@ -27,8 +27,9 @@ from ultralytics import YOLO
     [4N, 5N)       原图    slice_keep_origin (独立开关)
     [5N, 6N)       比例    ratio_pad_keep    (独立开关)
     [6N, 8N)       模糊    blur_keep         (独立开关, 短+长)
-    [8N, +N/4)     合成    compose_keep      (独立开关, 2×2 大图)
-N=4 全开 = 16 + 4 + 4 + 8 + 1 = 33 张混合样本池 → mosaic 取 4 张拼接 → 训练
+    [8N, 8N+N/4)   合成    compose_keep      (独立开关, 2×2 大图)
+    [8N+N/4, +N)   气象退化 weather_keep     (独立开关, 雨/雾/噪声)
+N=4 全开 = 16 + 4 + 4 + 8 + 1 + 4 = 37 张混合样本池 → mosaic 取 4 张拼接 → 训练
 
 '''
 
@@ -45,9 +46,6 @@ if __name__ == '__main__':
         batch=4,
         close_mosaic=20,
         workers=0,                   
-        # 远程机性能调优参考(A100 80GB + HDD + 62GB内存):
-        #   - 必开: OMP_NUM_THREADS=1(已在顶部设置), cache=False(HDD大图npy更慢)
-        #   - 推荐: batch=16, workers=8, prefetch=2; slice_ratio=0.7(降内存+缓解过拟合)
         optimizer='MuSGD',
         device='0',
         # resume=r'C:\Users\Administrator\Desktop\ultralytics-improved\runs\exp-3\weights\last.pt',  # 断点续训: 改成你本机 last.pt 路径
@@ -105,10 +103,18 @@ if __name__ == '__main__':
         blur_long_len_max=35,         # 长模糊(重度) 长度上限(像素)
         blur_long_defocus_sigma=1.0,  # 长模糊失焦高斯 σ 上限; 0=不加失焦
 
+        # ---------在线气象退化 (weather_*): 每张原图生成 1 张雨/雾/噪声退化图, 提升恶劣天气鲁棒性, 标签不变---------
+        weather_keep=False,           # 独立开关, 开启在线气象退化 (每图+1张退化图, 区段 +N)
+        weather_ratio=0.5,            # 每epoch随机选 round(x*N) 张原图做气象退化(原图级), 未选中整图直通; 0.3~0.6 推荐, 1.0=全量
+        weather_types="rain,haze,noise", # (str) 退化类型池, 逗号分隔; 每张图随机抽 1 种; 可子集如 "rain,haze"
+        weather_rain_density=0.15,    # 雨线密度 = 雨线数量 / max(h,w), 越大雨越密
+        weather_rain_length=15.0,     # 雨线长度上限(像素), 每根随机取 0.5~1.0 倍
+        weather_haze_beta=0.4,        # 雾浓度 [0,1), 越大雾越浓
+        weather_noise_std=15.0,       # 高斯噪声标准差(每通道独立), 模拟传感器/弱光噪点
+
         # ---------训练后期关闭在线增强 (close_aug_epoch): 与 close_mosaic 同构的时间维衰减---------
-        # 训练最后 N 个 epoch 把切片/合成/比例/模糊全部关闭, 各区段退回原图直通(len恒定), 让模型在真实分布上收敛;
-        # 0=关闭该调度(默认, 完全向后兼容)
-        close_aug_epoch=0,
+        # 训练最后 N 个 epoch 把切片/合成/比例/模糊/气象退化全部关闭, 各区段退回原图直通(len恒定), 让模型在真实分布上收敛;
+        close_aug_epoch=20, # 0=关闭该调度(默认, 完全向后兼容)
 
         # ---------验证侧在线切片评估 (val_slice_*): 验证集切片推理 + 坐标还原 + NMS 融合 (SAHI评估)---------
         # 训练侧已在线切片, 验证侧整图直推会因小目标被降采样而低估切片训练收益.
@@ -130,5 +136,6 @@ if __name__ == '__main__':
         # compose_save_dir=r"path/composed_save_dir",
         # ratio_pad_save_dir=r"path/change_proportion_save_dir",
         # blur_save_dir=r"path/motion_blur_save_dir",
+        # weather_save_dir=r"path/weather_save_dir",
         # mosaic_save_dir=r"path/mosaic_save_dir",
     )

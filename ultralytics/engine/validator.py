@@ -223,13 +223,20 @@ class BaseValidator:
                 self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading
             if not (pt or (getattr(model, "dynamic", False) and fmt != "imx")):
                 self.args.rect = False
-            self.stride = model.stride  # used in get_dataloader() for padding
-            self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
-
             model.eval()
             if self.args.compile:
                 model = attempt_compile(model, device=self.device, mode=self.args.compile)
             model.warmup(imgsz=(1 if pt else self.args.batch, self.data["channels"], imgsz, imgsz))  # warmup
+
+        # Dataloader (rebuilt whenever None). In the TRAINING pass the trainer normally hands over a
+        # prebuilt whole-image test_loader, which is reused as-is; setting dataloader=None forces a
+        # rebuild through get_dataloader() (e.g. the dual-metric whole-image pass, or val_slice
+        # wrapping that only happens in DetectionValidator.get_dataloader). This block used to live
+        # inside the non-training branch, so a training-pass validator with dataloader=None crashed
+        # with "NoneType has no len()".
+        if self.dataloader is None:
+            self.stride = model.stride  # used in get_dataloader() for padding
+            self.dataloader = self.get_dataloader(self.data.get(self.args.split), self.args.batch)
 
         self.run_callbacks("on_val_start")
         dt = (

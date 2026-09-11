@@ -62,18 +62,18 @@ class DetectionValidator(BaseValidator):
         self.niou = self.iouv.numel()
         self.metrics = DetMetrics()
         # --- validation-side online slicing (SAHI-style eval): sub-tile inference + remap + NMS fusion ---
-        self.val_slice_on = bool(args.get("val_slice_enable") if isinstance(args, dict) else getattr(args, "val_slice_enable", False))
+        self.val_slice_on = bool(args.get("val_slice_enable", False) if isinstance(args, dict) else getattr(args, "val_slice_enable", False))
         self.val_slice_overlap_ratio = float(
-            args.get("val_slice_overlap_ratio") if isinstance(args, dict) else getattr(args, "val_slice_overlap_ratio", 0.2)
+            args.get("val_slice_overlap_ratio", 0.2) if isinstance(args, dict) else getattr(args, "val_slice_overlap_ratio", 0.2)
         )
         self.val_slice_all_tiles = bool(
-            args.get("val_slice_all_tiles") if isinstance(args, dict) else getattr(args, "val_slice_all_tiles", True)
+            args.get("val_slice_all_tiles", True) if isinstance(args, dict) else getattr(args, "val_slice_all_tiles", True)
         )
         self.val_slice_ratio = float(
-            args.get("val_slice_ratio") if isinstance(args, dict) else getattr(args, "val_slice_ratio", 1.0)
+            args.get("val_slice_ratio", 1.0) if isinstance(args, dict) else getattr(args, "val_slice_ratio", 1.0)
         )
         self.val_slice_nms_iou = float(
-            args.get("val_slice_nms_iou") if isinstance(args, dict) else getattr(args, "val_slice_nms_iou", 0.5)
+            args.get("val_slice_nms_iou", 0.5) if isinstance(args, dict) else getattr(args, "val_slice_nms_iou", 0.5)
         )
         self._slice_acc: dict[int, dict] = {}  # per-original accumulation of sub-tile predictions
         self._slice_base_labels: list[dict] | None = None  # original (whole-image) val labels for GT
@@ -560,6 +560,11 @@ class DetectionValidator(BaseValidator):
         if self._val_slice_active() and self.args.task == "detect":
             # Validation-side online slicing: expand each val image into 2x2 (+overlap) sub-tiles.
             # Predictions are remapped to the original image and fused with NMS in update_metrics.
+            # NOTE: rect=True (model.val() default) builds labels without real per-image shapes, which
+            # breaks tile geometry -> force rect=False and rebuild when sliced validation is active.
+            if self.args.rect:
+                self.args.rect = False
+                dataset = self.build_dataset(dataset_path, batch=batch_size, mode="val")
             from ultralytics.data.base import SliceValDataset
 
             dataset = SliceValDataset(

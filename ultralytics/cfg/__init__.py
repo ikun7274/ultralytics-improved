@@ -223,6 +223,11 @@ CFG_FLOAT_KEYS = frozenset(
         "blur_long_len_min",
         "blur_long_len_max",
         "blur_long_defocus_sigma",
+        "weather_ratio",
+        "weather_rain_density",
+        "weather_rain_length",
+        "weather_haze_beta",
+        "weather_noise_std",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -272,6 +277,7 @@ CFG_INT_KEYS = frozenset(
         "patience",
         "resume_extend_epochs",
         "compose_max_side",
+        "slice_save_max_weather",
         "workers",
         "seed",
         "close_mosaic",
@@ -340,6 +346,7 @@ CFG_BOOL_KEYS = frozenset(
         "compose_keep",
         "ratio_pad_keep",
         "blur_keep",
+        "weather_keep",
         "slice_center_constraint",
         "slice_full_box_only",
         "val_slice_enable",
@@ -351,7 +358,8 @@ CFG_BOOL_KEYS = frozenset(
 )
 CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment", "slice_save_dir",
                           "compose_save_dir", "ratio_pad_save_dir", "blur_save_dir",
-                          "ratio_pad_target", "ratio_pad_color", "mosaic_save_dir"})
+                          "ratio_pad_target", "ratio_pad_color", "mosaic_save_dir",
+                          "weather_types", "weather_save_dir"})
 
 
 def cfg2dict(cfg: str | Path | dict | SimpleNamespace) -> dict:

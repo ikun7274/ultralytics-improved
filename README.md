@@ -3,15 +3,16 @@
 在原生 Ultralytics（YOLO26）训练流程上扩展**在线数据增强**与**修补续训**，不改动原生训练功能：
 
 - **在线 SAHI 切片**：把大尺寸航拍/遥感图在训练时动态切成 2×2 重叠子图，小目标经子图缩放真实放大；
-- **在线合成 / 比例调整 / 运动模糊**：与切片一起构成**混合样本池**（全程内存操作，默认不落盘）；
+- **在线合成 / 比例调整 / 运动模糊 / 气象退化**：与切片一起构成**混合样本池**（全程内存操作，默认不落盘）；
 - **修补续训**：训练提前结束（跑满 / 早停）后，对 strip 过的 `last.pt` 自动修补元数据并续训。
 
 ```text
 4 张原图 ── 在线切片 16 张 ── 保留原图 4 张 ── 在线合成 1 张(2×2)
-        ── 在线比例 4 张 ── 在线模糊 8 张(短+长) ──► 33 张混合样本池 ──► Mosaic ──► 训练
+        ── 在线比例 4 张 ── 在线模糊 8 张(短+长) ── 气象退化 4 张(雨/雾/噪声)
+        ──► 37 张混合样本池 ──► Mosaic ──► 训练
 ```
 
-每个增强模块是**独立开关**（`slice_prob` / `slice_keep_origin` / `compose_keep` / `ratio_pad_keep` / `blur_keep`），且支持**epoch 级精确比例控制**（`slice_ratio` / `compose_ratio` / `ratio_pad_ratio` / `blur_ratio`）与**训练后期统一关闭**（`close_aug_epoch`，类似 `close_mosaic`），可任意组合或全关（全关 = 原生 Ultralytics）。验证侧另支持**切片评估**（`val_slice_*`，SAHI 式切片推理 + NMS 融合 + 双口径 mAP 与两套权重）。
+每个增强模块是**独立开关**（`slice_prob` / `slice_keep_origin` / `compose_keep` / `ratio_pad_keep` / `blur_keep` / `weather_keep`），且支持**epoch 级精确比例控制**（`slice_ratio` / `compose_ratio` / `ratio_pad_ratio` / `blur_ratio` / `weather_ratio`）与**训练后期统一关闭**（`close_aug_epoch`，类似 `close_mosaic`），可任意组合或全关（全关 = 原生 Ultralytics）。验证侧另支持**切片评估**（`val_slice_*`，SAHI 式切片推理 + NMS 融合 + 双口径 mAP 与两套权重）。
 
 ---
 
@@ -33,6 +34,7 @@ model.train(
     compose_keep=True,        # 在线合成 2×2 大图（+ceil(N/4)）
     ratio_pad_keep=True,      # 在线比例调整（+N）
     blur_keep=True,           # 在线运动模糊，短+长（+2N）
+    weather_keep=True,        # 在线气象退化（雨/雾/噪声，+N，推荐 weather_ratio=0.3~0.6）
 )
 ```
 
@@ -54,9 +56,10 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 [5N, 6N)               比例     ratio_pad_keep
 [6N, 8N)               模糊     blur_keep（每图短/长各 1 张）
 [8N, 8N+ceil(N/4))     合成     compose_keep（每 4 张原图拼 1 张 2×2 大图）
+[8N+ceil(N/4), +N)     气象退化 weather_keep（每图 1 张雨/雾/噪声图）
 ```
 
-- 全开总数 = `8N + ceil(N/4)`（N=4 时 = 33）；
+- 全开总数 = `9N + ceil(N/4)`（N=4 时 = 37）；
 - `len` 恒定：所有"被拒/未选中"样本位**位置保留、内容替换**（如被拒背景片退回原图、未选中组退回组内第 1 张原图），避免预计算 + len 不恒定导致的 Mosaic buffer 记账错乱；
 - 训练开始时日志打印实际参与训练样本数，可确认各增强确实参与训练。
 
@@ -113,11 +116,26 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 | `blur_long_defocus_sigma` | `1.0` | 长模糊失焦高斯 σ 上限 [0,该值]，每张随机取；0=不加失焦 |
 | `blur_save_dir` | `""` | 保存目录；空=不保存 |
 
+### 在线气象退化 `weather_*`
+
+> 每张原图生成 1 张退化图（类型从 `weather_types` 随机抽 1 种），**标签不变**，用于提升航拍模型在恶劣天气（雨 / 雾 / 噪声）下的鲁棒性。权衡：增强分布过宽会拖累干净场景精度，建议 `weather_ratio` 控制在 0.3~0.6。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `weather_keep` | `False` | 独立开关：每图生成 1 张气象退化图（+N） |
+| `weather_ratio` | `0.5` | 原图级比例：每 epoch 选 `round(x×N)` 张做退化，未选中整图直通（len 恒定）；0.3~0.6 推荐 |
+| `weather_types` | `rain,haze,noise` | 退化类型池（逗号分隔），每张图随机抽 1 种；可子集如 `"rain,haze"` |
+| `weather_rain_density` | `0.15` | 雨线密度 = 雨线数量 / max(h,w)，越大雨越密 |
+| `weather_rain_length` | `15.0` | 雨线长度上限（像素），每根随机取 0.5~1.0 倍 |
+| `weather_haze_beta` | `0.4` | 雾浓度 [0,1)，越大雾越浓（大气散射 `I=J×(1-β)+A×β`） |
+| `weather_noise_std` | `15.0` | 高斯噪声标准差（每通道独立），模拟传感器/弱光噪点 |
+| `weather_save_dir` | `""` | 保存目录（画框/限数量/按图+类型跨 epoch 去重）；空=不保存 |
+
 ### 训练后期关闭在线增强 `close_aug_epoch`
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `close_aug_epoch` | `0` | 与 `close_mosaic` 同构的时间维调度：训练最后 N 个 epoch 把切片/合成/比例/模糊**全部关闭**（各区段退回原图直通，len 恒定），让模型在真实分布上收敛；`0`=不启用（完全向后兼容） |
+| `close_aug_epoch` | `0` | 与 `close_mosaic` 同构的时间维调度：训练最后 N 个 epoch 把切片/合成/比例/模糊/气象退化**全部关闭**（各区段退回原图直通，len 恒定），让模型在真实分布上收敛；`0`=不启用（完全向后兼容） |
 
 ### 验证侧在线切片评估 `val_slice_*`
 
@@ -137,7 +155,7 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `slice_save_dir` | `""` | 切片图保存目录；空=不保存 |
-| `slice_save_max` | `0` | 四类（切片/比例/模糊/合成）共用保存限额；0=不限；可用 `slice_save_max_{tile,ratio,blur,compose}` 单独覆盖 |
+| `slice_save_max` | `0` | 五类（切片/比例/模糊/合成/气象退化）共用保存限额；0=不限；可用 `slice_save_max_{tile,ratio,blur,compose,weather}` 单独覆盖 |
 | `slice_save_annotated` | `True` | 保存时画标注框+类别 |
 | `slice_save_exist_ok` | `True` | 目录已存在是否继续写入；False=抛错防覆盖 |
 | `mosaic_save_dir` | `""` | Mosaic 画布图保存目录（验证 mosaic 是否启用）；空=不保存 |
@@ -156,7 +174,7 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 
 ## 工作原理
 
-- **索引空间扩展**：`__getitem__` 索引从 N（原图）扩展为 `4N + N + N + 2N + ceil(N/4)`；`get_image_and_label` 按区段边界路由到切片 / 原图 / 比例 / 模糊 / 合成分支，每个子样本即时生成，`buffer.append(扩展索引)` 统一记账后供 Mosaic 采样；
+- **索引空间扩展**：`__getitem__` 索引从 N（原图）扩展为 `4N + N + N + 2N + ceil(N/4) + N`；`get_image_and_label` 按区段边界路由到切片 / 原图 / 比例 / 模糊 / 合成 / 气象退化分支，每个子样本即时生成，`buffer.append(扩展索引)` 统一记账后供 Mosaic 采样；
 - **在线切片在原分辨率上进行**（切片前不缩放到训练尺寸），小目标随子图缩放真实放大；
 - **epoch 级精确比例**：`set_epoch(epoch)` 主进程重建各比例掩码（`random.sample` 精确选 `round(x×N)`），worker 经 fork 继承，无 per-worker 漂移；
 - **标签始终与像素对齐**：切片/合成/比例都同步换算 bbox 坐标，模糊标签原样不变；

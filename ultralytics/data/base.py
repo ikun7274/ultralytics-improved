@@ -106,6 +106,41 @@ def _apply_motion_blur(img: np.ndarray, length: float = 15.0, angle: float = 30.
     return blurred
 
 
+def _apply_weather(img: np.ndarray, wtype: str, rain_density: float = 0.15, rain_length: float = 15.0,
+                   haze_beta: float = 0.4, noise_std: float = 15.0) -> np.ndarray:
+    """Apply one weather degradation (rain / haze / Gaussian noise) to a BGR image, in memory.
+
+    Labels are UNCHANGED (degradation never moves targets). Intensities are sampled randomly per
+    call so the model does not overfit to a single degradation level:
+      - rain:  ~density*max(h,w) semi-transparent streaks at a fixed 20-degree slant; alpha 0.2-0.6.
+      - haze:  atmospheric-scattering model I = J*t + A*(1-t), t = 1-beta, A = gray atmosphere (200).
+      - noise: additive Gaussian noise (RGB independent), sensor/low-light simulation.
+    `wtype` is one of "rain" / "haze" / "noise" (caller picks randomly from `weather_types`).
+    """
+    if wtype == "rain":
+        h, w = img.shape[:2]
+        n = max(1, int(rain_density * max(h, w)))
+        ang = math.radians(20.0)
+        dx, dy = math.sin(ang), math.cos(ang)
+        overlay = img.copy()
+        for _ in range(n):
+            x0 = random.uniform(0.0, float(w))
+            y0 = random.uniform(0.0, float(h))
+            length = rain_length * random.uniform(0.5, 1.0)
+            cv2.line(overlay, (int(round(x0)), int(round(y0))),
+                     (int(round(x0 - dx * length)), int(round(y0 - dy * length))),
+                     (205, 205, 225), thickness=random.choice((1, 2)), lineType=cv2.LINE_AA)
+        alpha = random.uniform(0.2, 0.6)
+        return cv2.addWeighted(img, 1.0 - alpha, overlay, alpha, 0)
+    if wtype == "haze":
+        t = max(0.0, min(1.0, 1.0 - haze_beta))
+        atm = np.full_like(img, 200, dtype=np.float32)
+        return np.clip(img.astype(np.float32) * t + atm * (1.0 - t), 0, 255).astype(np.uint8)
+    # noise
+    noise = np.random.normal(0.0, max(0.0, float(noise_std)), img.shape)
+    return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+
 # Directories already created in this process (see _ensure_dir).
 _MKDIR_DONE: set[str] = set()
 
@@ -294,10 +329,11 @@ class BaseDataset(Dataset):
         # Per-epoch slice mask (slice_ratio exact ratio, original-level). None = pure slicing or
         # slicing off. Rebuilt by set_epoch(epoch) at every epoch start; see get_image_and_label.
         self._slice_mask = None
-        # ratio_pad_ratio / blur_ratio / compose_ratio: per-epoch exact-ratio masks (rebuilt in
-        # set_epoch; None = all samples augmented / branch off). See set_epoch for semantics.
+        # ratio_pad_ratio / blur_ratio / weather_ratio / compose_ratio: per-epoch exact-ratio masks
+        # (rebuilt in set_epoch; None = all samples augmented / branch off). See set_epoch for semantics.
         self._ratio_mask = None
         self._blur_mask = None
+        self._weather_mask = None
         self._compose_mask = None
 
         # Cache images (options are cache = True, False, None, "ram", "disk")
@@ -627,10 +663,10 @@ class BaseDataset(Dataset):
         Mask = None (all augmented / branch off) when the branch is off or its ratio >= 1.
 
         ``close_aug_epoch`` (direction A, close_mosaic-style time schedule): during the final N
-        epochs, ALL online augmentations (slice / compose / ratio_pad / blur) are disabled --
-        every mask is an all-False array, so every segment falls back to its ORIGINAL full image
-        (slot kept, content replaced, ``len`` constant). ``epochs`` is passed by the trainer so the
-        dataset does not need to know the training schedule itself.
+        epochs, ALL online augmentations (slice / compose / ratio_pad / blur / weather) are
+        disabled -- every mask is an all-False array, so every segment falls back to its ORIGINAL
+        full image (slot kept, content replaced, ``len`` constant). ``epochs`` is passed by the
+        trainer so the dataset does not need to know the training schedule itself.
         """
         # P3 fix: reset OnlineSlice's positive/background counters every epoch so the neg_ratio
         # background quota restarts per epoch instead of accumulating monotonically across epochs
@@ -648,6 +684,7 @@ class BaseDataset(Dataset):
             self._slice_mask = np.zeros(n, dtype=bool)
             self._ratio_mask = np.zeros(n, dtype=bool)
             self._blur_mask = np.zeros(n, dtype=bool)
+            self._weather_mask = np.zeros(n, dtype=bool)
             self._compose_mask = np.zeros((n + 3) // 4, dtype=bool)
             return
         # --- slice (original-level) ---
@@ -687,6 +724,15 @@ class BaseDataset(Dataset):
             self._compose_mask = mask
         else:
             self._compose_mask = None
+        # --- weather (original-level) ---
+        x = float(getattr(self, "weather_ratio", 0.5))
+        if aug_on and self._weather_on() and 0.0 <= x < 1.0:
+            mask = np.zeros(n, dtype=bool)
+            if x > 0:
+                mask[random.sample(range(n), int(round(x * n)))] = True
+            self._weather_mask = mask
+        else:
+            self._weather_mask = None
 
     def _n_per(self) -> int:
         """Single source of truth: how many samples each ORIGINAL image expands to in the BASE segment.
@@ -721,8 +767,12 @@ class BaseDataset(Dataset):
             and getattr(self, "slice_transform", None) is not None
         )
 
-    def _segment_bases(self) -> tuple[int, int, int, int, int]:
-        """Return the five segment boundaries of the mixed sample pool.
+    def _weather_on(self) -> bool:
+        """True when the weather branch allocates samples (weather_keep independent switch)."""
+        return bool(getattr(self, "weather_keep", False))
+
+    def _segment_bases(self) -> tuple[int, int, int, int, int, int]:
+        """Return the six segment boundaries of the mixed sample pool.
 
         Layout (each optional branch is an independent, contiguous segment gated ONLY by its own
         switch; slicing lives entirely inside the base segment):
@@ -731,8 +781,9 @@ class BaseDataset(Dataset):
             [base_len+N, +2N)             ratio:    1 aspect-ratio-padded image per original
             [base_len+2N, +4N)            blur:     short + long motion-blurred images per original
             [base_len+4N, +ceil(N/4))     compose:  one 2x2 stitched image per group of 4 originals
+            [base_len+4N+ceil(N/4), +N)   weather:  1 rain/haze/noise-degraded image per original
 
-        Returns (base_len, origin_base, ratio_base, blur_base, compose_base).
+        Returns (base_len, origin_base, ratio_base, blur_base, compose_base, weather_base).
         """
         n = len(self.labels)
         base_len = n * self._n_per()
@@ -740,7 +791,8 @@ class BaseDataset(Dataset):
         r_base = o_base + (n if self._keep_origin_on() else 0)
         b_base = r_base + (n if bool(getattr(self, "ratio_pad_keep", False)) else 0)
         c_base = b_base + (2 * n if bool(getattr(self, "blur_keep", False)) else 0)
-        return base_len, o_base, r_base, b_base, c_base
+        w_base = c_base + ((n + 3) // 4 if self._compose_on() else 0)
+        return base_len, o_base, r_base, b_base, c_base, w_base
 
     def _origin_at(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one un-sliced ORIGINAL-resolution sample (slice_keep_origin independent segment).
@@ -791,6 +843,7 @@ class BaseDataset(Dataset):
             self._keep_origin_on()
             or bool(getattr(self, "ratio_pad_keep", False))
             or bool(getattr(self, "blur_keep", False))
+            or self._weather_on()
             or self._compose_on()
         )
 
@@ -932,6 +985,102 @@ class BaseDataset(Dataset):
         label["img"] = np.ascontiguousarray(blur)
         label["ori_shape"] = (h1, w1)
         label["resized_shape"] = blur.shape[:2]
+        label["ratio_pad"] = (
+            label["resized_shape"][0] / label["ori_shape"][0],
+            label["resized_shape"][1] / label["ori_shape"][1],
+        )
+        return self.update_labels_info(label)
+
+    def _weather_at(self, index: int, img_index: int) -> dict[str, Any]:
+        """Build one in-memory weather-degraded image (rain / haze / Gaussian noise) from an original.
+
+        Online port of the weather-degradation proposal: each sample picks ONE type randomly from
+        ``weather_types`` (comma-separated, e.g. "rain,haze,noise") and applies the degradation with
+        randomly sampled intensity (see ``_apply_weather``). Labels are UNCHANGED (degradation never
+        moves targets). ``weather_ratio``: un-selected originals pass through as the full image (slot
+        kept, content replaced, len constant -- same pattern as blur_ratio). The image is resized to
+        the training size like every other branch and enters the Mosaic mix pool. Nothing is written
+        to disk unless ``weather_save_dir`` is set (visual inspection).
+
+        ``index`` is the EXPANDED mixed-pool index (for correct Mosaic buffer bookkeeping);
+        ``img_index`` is the ORIGINAL image index this sample derives from.
+        """
+        f = self.im_files[img_index]
+        im = self._load_image_cached(img_index)
+        h, w = im.shape[:2]
+        # weather_ratio: 未选中原图整图直通 (位保留, len 恒定)
+        if self._weather_mask is not None and not self._weather_mask[img_index]:
+            out = im
+            wtype = "none"
+        else:
+            types = [t.strip() for t in str(getattr(self, "weather_types", "rain,haze,noise")).split(",") if t.strip()]
+            wtype = random.choice(types) if types else "haze"
+            out = _apply_weather(
+                im,
+                wtype,
+                rain_density=float(getattr(self, "weather_rain_density", 0.15)),
+                rain_length=float(getattr(self, "weather_rain_length", 15.0)),
+                haze_beta=float(getattr(self, "weather_haze_beta", 0.4)),
+                noise_std=float(getattr(self, "weather_noise_std", 15.0)),
+            )
+
+        label = deepcopy(self.labels[img_index])
+        label.pop("shape", None)
+        label["im_file"] = f
+        label["img"] = np.ascontiguousarray(out)
+
+        # Keep the degraded image on the same Mosaic mix pool as every other sample (cache != 'ram')
+        if self.augment and self.cache != "ram":
+            self.buffer.append(index)
+            if 1 < len(self.buffer) >= self.max_buffer_length:
+                self.buffer.pop(0)
+
+        # Optional save for visual inspection (weather_save_dir set). Annotated per
+        # slice_save_annotated, capped by slice_save_max_weather (falls back to slice_save_max),
+        # deduplicated per (image, wtype) across epochs. Saving does NOT depend on the slicing
+        # pipeline (slice_transform may be None when slice_prob=0): weather_save_dir alone enables it.
+        sdir = str(getattr(self, "weather_save_dir", "") or "")
+        st = getattr(self, "slice_transform", None)
+        if sdir:
+            cdir = Path(sdir)
+            if not hasattr(self, "_weather_saved"):
+                self._weather_saved = 0
+                self._weather_saved_keys = set()
+            key = ("weather", wtype, index)
+            save_cap = _save_cap(self, "weather")
+            if key not in self._weather_saved_keys and (save_cap == 0 or self._weather_saved < save_cap):
+                _ensure_dir(cdir)
+                img = out
+                boxes = np.asarray(label.get("bboxes", np.empty((0, 4))), dtype=np.float64)
+                save_annotated = bool(getattr(st, "save_annotated", True)) if st is not None else True
+                if save_annotated and len(boxes):
+                    img = out.copy()
+                    H2, W2 = out.shape[:2]
+                    cls = np.asarray(label.get("cls", np.empty((0, 1))))
+                    for b, c in zip(boxes, np.asarray(cls).reshape(-1)):
+                        cx, cy, bw, bh = (float(v) for v in b)
+                        x0 = int(round((cx - bw / 2) * W2))
+                        y0 = int(round((cy - bh / 2) * H2))
+                        x1 = int(round((cx + bw / 2) * W2))
+                        y1 = int(round((cy + bh / 2) * H2))
+                        cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
+                        cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                _imwrite(cdir / f"weather_{wtype}_p{os.getpid()}_img{img_index}_"
+                                f"{self._weather_saved:05d}_n{len(boxes)}.jpg", img)
+                self._weather_saved += 1
+                self._weather_saved_keys.add(key)
+
+        # Resize to the training size (same as the other online branches)
+        h1, w1 = out.shape[:2]
+        r = self.imgsz / max(h1, w1)
+        if r != 1:
+            out = cv2.resize(out, (math.ceil(w1 * r), math.ceil(h1 * r)), interpolation=cv2.INTER_LINEAR)
+        if out.ndim == 2:
+            out = out[..., None]
+        label["img"] = np.ascontiguousarray(out)
+        label["ori_shape"] = (h1, w1)
+        label["resized_shape"] = out.shape[:2]
         label["ratio_pad"] = (
             label["resized_shape"][0] / label["ori_shape"][0],
             label["resized_shape"][1] / label["ori_shape"][1],
@@ -1098,7 +1247,7 @@ class BaseDataset(Dataset):
         n_origin = len(self.labels)
         # The compose segment starts right after the base + ratio + blur segments (_segment_bases);
         # group = index - compose_base selects the group of 4 originals.
-        _base_len, _o_base, _r_base, _b_base, c_base = self._segment_bases()
+        _base_len, _o_base, _r_base, _b_base, c_base, _w_base = self._segment_bases()
         group = index - c_base
         base = group * 4
         # P1-2: with fewer than 4 originals the modulo wrap would put the SAME image in 2+ quadrants,
@@ -1263,16 +1412,20 @@ class BaseDataset(Dataset):
                 but do not inflate the ``neg_ratio`` quota or duplicate saved slices.
         """
         # Mixed-pool layout (see _segment_bases): a base segment holding ONLY the slicing pipeline's
-        # samples (4 tiles per image), followed by four INDEPENDENT segments gated only by their own
+        # samples (4 tiles per image), followed by five INDEPENDENT segments gated only by their own
         # switches -- origin (1 un-sliced original per image, keep_origin), ratio (1 per image),
-        # blur (2 per image), compose (1 per 4 images). None of them requires slicing or keep_origin.
+        # blur (2 per image), compose (1 per 4 images), weather (1 per image). None of them requires
+        # slicing or keep_origin.
         emit_all = getattr(self, "slice_all_tiles", False)
         origin_on = self._keep_origin_on()
         ratio_on = bool(getattr(self, "ratio_pad_keep", False))
         blur_on = bool(getattr(self, "blur_keep", False))
         compose_on = self._compose_on()
-        base_len, o_base, r_base, b_base, c_base = self._segment_bases()
+        weather_on = self._weather_on()
+        base_len, o_base, r_base, b_base, c_base, w_base = self._segment_bases()
 
+        if weather_on and index >= w_base:
+            return self._weather_at(index, index - w_base)  # origin index = offset inside the weather segment
         if compose_on and index >= c_base:
             return self._compose_at(index)  # composed 2x2 sample from 4 original images
         if blur_on and index >= b_base:
@@ -1354,10 +1507,11 @@ class BaseDataset(Dataset):
     def __len__(self) -> int:
         """Return the number of samples in the mixed pool.
 
-        Base segment (``_n_per`` samples per original) plus four independent segments: +N origin
-        (keep_origin), +N ratio, +2N blur, +ceil(N/4) compose -- each present only when its own
-        switch is on. Boundaries are centralized in ``_segment_bases`` so ``get_image_and_label``
-        / ``_compose_at`` cannot drift apart; a mismatch would silently drop samples with no error.
+        Base segment (``_n_per`` samples per original) plus five independent segments: +N origin
+        (keep_origin), +N ratio, +2N blur, +ceil(N/4) compose, +N weather -- each present only when
+        its own switch is on. Boundaries are centralized in ``_segment_bases`` so
+        ``get_image_and_label`` / ``_compose_at`` cannot drift apart; a mismatch would silently
+        drop samples with no error.
         """
         n = len(self.labels)
         total = n * self._n_per()
@@ -1369,6 +1523,8 @@ class BaseDataset(Dataset):
             total += 2 * n
         if self._compose_on():
             total += (n + 3) // 4
+        if self._weather_on():
+            total += n
         return total
 
     def update_labels_info(self, label: dict[str, Any]) -> dict[str, Any]:

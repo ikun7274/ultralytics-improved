@@ -1,0 +1,5 @@
+path: C:/Users/Administrator/Desktop/ultralytics-improved/pytools/_mini_val_set
+train: images/train
+val: images/val
+nc: 6
+names: ['Bus', 'Microbus', 'Minivan', 'Sedan', 'SUV', 'Truck']
