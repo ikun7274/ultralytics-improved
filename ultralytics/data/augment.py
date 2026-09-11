@@ -820,19 +820,82 @@ class Mosaic(BaseMixTransform):
         return final_labels
 
 
-def slice_geometry(w: int, h: int, overlap_ratio: float = 0.2) -> list[tuple[int, int, int, int]]:
+def slice_geometry(
+    w: int,
+    h: int,
+    overlap_ratio: float = 0.2,
+    bias_x: float = 0.0,
+    bias_y: float = 0.0,
+) -> list[tuple[int, int, int, int]]:
     """Return the 4 ``(x0, y0, x1, y1)`` tiles of the 2x2 overlap grid for a ``w x h`` image.
 
     Shared by the training-side ``OnlineSlice`` and the validation-side ``SliceValDataset`` so the
     training and validation slice geometry always stays aligned. Slice size = half the image extent
     scaled by ``(1 + overlap_ratio)`` (e.g. 4000x3000 + 0.2 -> 2400x1800 tiles).
+
+    ``bias_x`` / ``bias_y`` (in [-0.5, 0.5], relative to the image extent; 0 = centered grid) shift
+    the cut seam away from the image center: the vertical seam sits at ``w/2 + bias_x * w`` and the
+    horizontal seam at ``h/2 + bias_y * h``. This is the "target-aware slicing" hook: the caller
+    (``OnlineSlice``) computes the bias from the per-image box-center distribution so the seams land
+    in the sparsest regions and fewer objects get cut in half. The tile COUNT, full-image coverage
+    and total overlap ``2*sw - w`` are unchanged; a positive bias widens the left/top tile by
+    ``bias*w`` and narrows the right/bottom tile by the same amount, so the seam moves by ``bias*w``
+    while every pixel of the image still belongs to at least one tile.
     """
     assert 0.0 <= overlap_ratio < 1.0, f"slice_geometry: 'overlap_ratio' must be in [0, 1), got {overlap_ratio}."
+    assert -0.5 <= bias_x <= 0.5, f"slice_geometry: 'bias_x' must be in [-0.5, 0.5], got {bias_x}."
+    assert -0.5 <= bias_y <= 0.5, f"slice_geometry: 'bias_y' must be in [-0.5, 0.5], got {bias_y}."
     sw = min(w, max(1, int((1 + overlap_ratio) * w / 2)))
     sh = min(h, max(1, int((1 + overlap_ratio) * h / 2)))
-    xs = [max(0, x) for x in (0, w - sw)]
-    ys = [max(0, y) for y in (0, h - sh)]
-    return [(x, y, min(x + sw, w), min(y + sh, h)) for y in ys for x in xs]
+    # Seam delta in pixels. The seam moves by exactly `delta` while both tiles keep a positive width
+    # and the image stays fully covered: tile1 = [0, sw+dx], tile2 = [w-sw+dx, w].
+    dx = max(sw - w, min(w - sw, int(round(bias_x * w))))
+    dy = max(sh - h, min(h - sh, int(round(bias_y * h))))
+    tw1, tw2 = sw + dx, sw - dx
+    th1, th2 = sh + dy, sh - dy
+    return [
+        (0, 0, min(tw1, w), min(th1, h)),
+        (0, h - th2, min(tw1, w), h),
+        (w - tw2, 0, w, min(th1, h)),
+        (w - tw2, h - th2, w, h),
+    ]
+
+
+def compute_slice_bias(
+    w: int,
+    h: int,
+    xyxy: np.ndarray | None,
+    margin: float = 0.25,
+    jitter: float = 0.05,
+) -> tuple[float, float]:
+    """Target-aware seam bias for ``slice_geometry``.
+
+    Projects the box centers (from pixel ``xyxy`` boxes) onto the x/y axes and places each seam at the
+    candidate position (uniformly sampled inside ``[margin, 1-margin]``) that has the fewest box
+    centers within its window (window = median box width/height, floored at 5% of the extent). Returns
+    ``(bias_x, bias_y)`` in [-0.5, 0.5] relative positions, so the caller passes them straight to
+    ``slice_geometry``. ``jitter`` adds a uniform random perturbation each call (per-epoch variation
+    without re-computing anything) so the same image does not get the identical seams every epoch.
+    Empty boxes -> (0, 0) (centered grid, unchanged behavior).
+    """
+    if xyxy is None or len(xyxy) == 0:
+        return 0.0, 0.0
+    b = np.asarray(xyxy, dtype=np.float64)
+    cx = (b[:, 0] + b[:, 2]) / 2.0
+    cy = (b[:, 1] + b[:, 3]) / 2.0
+    win_x = max(np.median(b[:, 2] - b[:, 0]), w * 0.05)
+    win_y = max(np.median(b[:, 3] - b[:, 1]), h * 0.05)
+    cands = np.linspace(margin, 1.0 - margin, 32)
+    score_x = [float(np.sum(np.abs(cx - c * w) < win_x / 2)) for c in cands]
+    score_y = [float(np.sum(np.abs(cy - c * h) < win_y / 2)) for c in cands]
+    bx = float(cands[int(np.argmin(score_x))])
+    by = float(cands[int(np.argmin(score_y))])
+    if jitter > 0:
+        bx += random.uniform(-jitter, jitter)
+        by += random.uniform(-jitter, jitter)
+        bx = min(max(bx, margin), 1.0 - margin)
+        by = min(max(by, margin), 1.0 - margin)
+    return bx - 0.5, by - 0.5
 
 
 class OnlineSlice(BaseTransform):
@@ -886,6 +949,9 @@ class OnlineSlice(BaseTransform):
         center_constraint: bool = False,
         min_center_ratio: float = 0.6,
         full_box_only: bool = False,
+        center_bias: bool = False,
+        bias_margin: float = 0.25,
+        bias_jitter: float = 0.05,
     ):
         """Initialize OnlineSlice with slicing, filtering, background-ratio and save options.
 
@@ -914,6 +980,15 @@ class OnlineSlice(BaseTransform):
                 over ``center_constraint`` (which would otherwise drop targets from non-owning tiles), so
                 every fully-contained target is preserved in every tile that fully contains it (duplicates in
                 the overlap region are intentional).
+            center_bias (bool): Target-aware seam shifting. When True, each sliced image computes the 2x2
+                seam position from its own box-center distribution (projection onto each axis, seam placed at
+                the sparsest candidate inside ``[bias_margin, 1-bias_margin]``), so fewer boxes get cut in
+                half by a seam. Tile size/overlap/count are unchanged (only the seam moves). False = fixed
+                centered grid (fully backward compatible).
+            bias_margin (float): In (0, 0.5]. Seam search window edge: the seam position is restricted to
+                ``[bias_margin, 1-bias_margin]`` of each axis so tiles never become too small.
+            bias_jitter (float): Uniform random seam perturbation added each call (relative to the image
+                extent), so the same image does not get identical seams every epoch. 0 disables.
         """
         assert 0.0 <= p <= 1.0, f"OnlineSlice: 'p' must be in [0, 1], got {p}."
         assert 0.0 <= overlap_ratio < 1.0, f"OnlineSlice: 'overlap_ratio' must be in [0, 1), got {overlap_ratio}."
@@ -931,6 +1006,9 @@ class OnlineSlice(BaseTransform):
         self.center_constraint = center_constraint
         self.min_center_ratio = min_center_ratio
         self.full_box_only = full_box_only
+        self.center_bias = center_bias
+        self.bias_margin = bias_margin
+        self.bias_jitter = bias_jitter
         self.neg_ratio = neg_ratio
         self.save_dir = Path(save_dir) if save_dir else None
         self.save_exist_ok = exist_ok
@@ -988,9 +1066,16 @@ class OnlineSlice(BaseTransform):
         if src is not None:
             self._saved_keys.add(src)
 
-    def _grid(self, w: int, h: int) -> list[tuple[int, int, int, int]]:
-        """Return the 4 (x0, y0, x1, y1) tiles of the 2x2 overlap grid for a w x h image."""
-        return slice_geometry(w, h, self.overlap_ratio)
+    def _grid(self, w: int, h: int, xyxy: np.ndarray | None = None) -> tuple[list, float, float]:
+        """Return (tiles, bias_x, bias_y): the 4 (x0, y0, x1, y1) tiles of the 2x2 overlap grid.
+
+        With ``center_bias`` the seam position is computed from the box centers (pixel ``xyxy``) via
+        ``compute_slice_bias``; otherwise the centered grid is used (bias = 0, backward compatible).
+        """
+        bx, by = 0.0, 0.0
+        if self.center_bias:
+            bx, by = compute_slice_bias(w, h, xyxy, self.bias_margin, self.bias_jitter)
+        return slice_geometry(w, h, self.overlap_ratio, bx, by), bx, by
 
     def _geometry(self, img: np.ndarray, label: dict[str, Any]) -> list:
         """Convert boxes to pixel xyxy and compute the 4 tile intersection results.
@@ -1025,7 +1110,7 @@ class OnlineSlice(BaseTransform):
         if n:
             ori_area = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
 
-        tiles = self._grid(w, h)
+        tiles, bx, by = self._grid(w, h, xyxy if n else None)
         tile_results = []  # (x0, y0, x1, y1, keep_idx, tile_local_xyxy)
         for x0, y0, x1, y1 in tiles:
             if n == 0:
@@ -1049,8 +1134,10 @@ class OnlineSlice(BaseTransform):
             # adjacent tile when it retains >= min_center_ratio of its area there (large-object compat);
             # min_center_ratio=1.0 -> strictly unique. full_box_only takes precedence (see below).
             if self.center_constraint and not self.full_box_only:
-                mid_x = w / 2.0
-                mid_y = h / 2.0
+                # Ownership midline follows the biased seam (w/2 + bias*w), NOT the image center: with
+                # center_bias the non-overlap equal-division line is shifted, so ownership must shift too.
+                mid_x = w / 2.0 + bx * w
+                mid_y = h / 2.0 + by * h
                 cx = (xyxy[:, 0] + xyxy[:, 2]) / 2.0
                 cy = (xyxy[:, 1] + xyxy[:, 3]) / 2.0
                 # Ownership column/row is decided by the TILE CENTER (not the tile origin): with overlapping
@@ -3293,6 +3380,10 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
             center_constraint=bool(getattr(hyp, "slice_center_constraint", False)),
             min_center_ratio=float(getattr(hyp, "slice_min_center_retain_ratio", 0.6)),
             full_box_only=bool(getattr(hyp, "slice_full_box_only", False)),
+            # 目标感知切缝 (方案1): 切缝按本图目标中心分布微移, 减少目标被劈碎
+            center_bias=bool(getattr(hyp, "slice_center_bias", False)),
+            bias_margin=float(getattr(hyp, "slice_bias_margin", 0.25)),
+            bias_jitter=float(getattr(hyp, "slice_bias_jitter", 0.05)),
         )
         dataset.slice_all_tiles = bool(getattr(hyp, "slice_all_tiles", False))
         dataset.slice_ratio = float(getattr(hyp, "slice_ratio", 1.0))

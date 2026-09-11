@@ -81,6 +81,9 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 | `slice_center_constraint` | `False` | 目标唯一归属：只分配给"中心所在"切片，防同一目标被切两半重复 |
 | `slice_min_center_retain_ratio` | `0.6` | 配合 `center_constraint`：中心不在本片时，片内可见占比 ≥ 该值仍保留；1.0=严格只留中心片 |
 | `slice_full_box_only` | `False` | 目标必须完整落在片内才保留，被边界切开即过滤；优先于 `center_constraint` |
+| `slice_center_bias` | `False` | 目标感知切缝：切缝按本图目标中心分布微移，落在目标最稀疏区间，减少目标被劈碎；与 `center_constraint` 互补建议同开；验证侧固定网格不受影响 |
+| `slice_bias_margin` | `0.25` | 切缝偏移窗口：切缝只在 `[margin, 1-margin]` 区间内微移，保证 tile 不过小 |
+| `slice_bias_jitter` | `0.05` | 每图每调用随机扰动切缝（相对原图边长），防同图每 epoch 切缝相同而过拟合；0=关闭 |
 | `slice_keep_origin` | `False` | 独立开关：每图额外保留 1 张未切片原图（+N，提供全图上下文）；切片关闭时自动抑制 |
 | `slice_transform` | `""` | 切片后附加的变换名（如 `"hsv_h"` / `"blur"`），与 `pytools/sahi_*.py` 同名变换对应；空=不附加 |
 | `slice_raw_cache_size` | `2` | 在线增强 worker 内原图 LRU 缓存大小（原图数）；同一原图最多被 imread 8~9 次，LRU 把解码降到 ~1 次/原图 |

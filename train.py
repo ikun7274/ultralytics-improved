@@ -79,6 +79,9 @@ if __name__ == '__main__':
         slice_center_constraint=True,     # 目标唯一归属: 每个目标只分配给"中心所在"切片, 防同一目标被切两半重复出现
         slice_min_center_retain_ratio=0.6,# 中心不在本片时, 若本片内可见面积占比 >= 该值仍保留; 1.0=严格只留中心片
         slice_full_box_only=False,        # 目标必须完整落在切片内才保留, 被边界切开即过滤; 开启时优先于 slice_center_constraint
+        slice_center_bias=False,           # 目标感知切缝: 切缝按本图目标中心分布微移, 落在最稀疏区间, 减少目标被劈碎; 与 center_constraint 互补建议同开
+        slice_bias_margin=0.25,           # 切缝偏移窗口: 切缝只在 [margin, 1-margin] 区间内微移, 保证 tile 不过小
+        slice_bias_jitter=0.05,           # 每图每调用随机扰动切缝, 防同一图每 epoch 切缝相同而过拟合; 0=关闭
 
 
         # ---------在线合成 (compose_*): 每 4 张原图拼 1 张 2x2 大图, 提供更大范围多目标上下文--------- 

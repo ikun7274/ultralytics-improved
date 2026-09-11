@@ -143,6 +143,9 @@ slice_all_tiles: False # (bool) 每张原图的 4 片子图全部参与训练 (�
 slice_center_constraint: False # (bool) 目标唯一归属: 每个目标只分配给"中心所在"切片 (防同一目标被切两半重复出现在多个切片)
 slice_min_center_retain_ratio: 0.6 # (float) 配合 center_constraint: 目标中心不在本片时, 若本片内可见面积占比 >= 该值仍保留; 1.0=严格只留中心片
 slice_full_box_only: False # (bool) 目标必须完整落在切片内才保留; 被边界切开即过滤 (绝不保留残缺框); 开启时优先于 center_constraint
+slice_center_bias: False # (bool) 目标感知切缝: 切缝按本图目标中心分布微移, 落在目标最稀疏区间, 减少目标被劈碎; 切缝偏移不改变切片数量/尺寸/重叠语义, 与 center_constraint 互补建议同开; 与验证侧固定网格无关
+slice_bias_margin: 0.25 # (float) 切缝偏移窗口: 切缝只在 [margin, 1-margin] 区间内微移, 保证 tile 不过小
+slice_bias_jitter: 0.05 # (float) 每图每调用随机扰动切缝 (相对原图边长), 防同一图每 epoch 切缝相同而过拟合; 0=关闭
 # ---- 切片结果保存 (用于人工检查切片是否正确) ----
 slice_save_dir: # (str) 切片图保存目录; 空=不保存
 slice_save_max: 0 # (int) 默认保存限额: 同时作用于 [切片, ratio, blur, compose] 四类; 0=不限. 单独细调见 slice_save_max_{tile,ratio,blur,compose}
