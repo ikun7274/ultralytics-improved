@@ -368,8 +368,8 @@ class BaseDataset(Dataset):
 
         # Report the actual number of training samples after online augmentation expansion (train only),
         # so the user sees e.g. 140 samples from 28 images (4 slices + 1 origin + 1 ratio + 2 blur +
-        # N/4 compose) before training starts. Every branch is reported independently: slicing may be
-        # off while compose/ratio/blur are on, or vice versa.
+        # N/4 compose + 1 weather per image) before training starts. Every branch is reported
+        # independently: slicing may be off while compose/ratio/blur/weather are on, or vice versa.
         if self.augment:
             _n_total = len(self)
             _n_origin = self.ni
@@ -384,6 +384,8 @@ class BaseDataset(Dataset):
                 _parts.append("2 blur")
             if self._compose_on():
                 _parts.append("N/4 compose")
+            if self._weather_on():
+                _parts.append("1 weather")
             if _parts:
                 LOGGER.info(
                     f"{self.prefix}Online augment: {_n_total} training samples from {_n_origin} images "
