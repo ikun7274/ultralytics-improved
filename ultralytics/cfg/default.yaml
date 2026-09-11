@@ -205,6 +205,16 @@ weather_haze_beta: 0.4 # (float) 雾浓度 [0,1), 越大雾越浓 (大气散射 
 weather_noise_std: 15.0 # (float) 高斯噪声标准差(每通道独立), 模拟传感器/弱光噪点
 weather_save_dir: "" # (str, 可选, 需 weather_keep) 气象退化图保存目录 (画框/限数量/按图+类型跨 epoch 去重); 空=不保存 (默认)
 slice_save_max_weather: # (int|None, 可选) 气象退化图保存数量上限; 不填回退 slice_save_max; 0=不限
+# ---------- 在线遮挡模拟 (occlusion_*): 语义遮挡块 (树冠/电线/阴影), 标签不变, 独立开关 + epoch 比例 ----------
+occlusion_keep: False # (bool) 总开关: 每张被选中原图额外生成 1 张遮挡图进样本池 (区段 +N); 与 blur/weather 同构
+occlusion_ratio: 0.5 # (float) epoch 级比例: 被选中的原图才生成遮挡图 (复用 set_epoch 掩码); 0.3~0.6 推荐
+occlusion_types: rect,stripe # (str) 遮挡类型, 逗号分隔; rect=随机矩形(树冠/阴影), stripe=细长条带(电线/枝干/云影)
+occlusion_blocks: 1 # (int) 每图遮挡块数 (1~3)
+occlusion_size_ratio: 0.1 # (float) 单块面积上限(相对原图面积), 防目标被完全盖住
+occlusion_color: auto # (str) auto=采样图像深色分位均值(融入场景); 或 black/gray 固定色
+occlusion_max_cover: 0.95 # (float) 目标被遮挡面积占比 >= 该值则从标签剔除 (完全被盖住的目标=纯噪声); 1.0=标签永不变
+occlusion_save_dir: "" # (str, 可选, 需 occlusion_keep) 遮挡图保存目录; 空=不保存 (默认)
+slice_save_max_occlusion: # (int|None, 可选) 遮挡图保存数量上限; 不填回退 slice_save_max; 0=不限
 
 # ---------- 训练后期关闭在线增强 (close_aug_epoch): 与 close_mosaic 同构的"时间维衰减" ----------
 # 训练最后 close_aug_epoch 个 epoch 把全部在线增强 (切片/合成/比例/模糊/气象退化) 关闭, 各区段退回原图直通 (位置保留、

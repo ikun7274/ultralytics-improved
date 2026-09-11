@@ -9,10 +9,11 @@
 ```text
 4 张原图 ── 在线切片 16 张 ── 保留原图 4 张 ── 在线合成 1 张(2×2)
         ── 在线比例 4 张 ── 在线模糊 8 张(短+长) ── 气象退化 4 张(雨/雾/噪声)
-        ──► 37 张混合样本池 ──► Mosaic ──► 训练
+        ── 在线遮挡 4 张(rect/stripe)
+        ──► 41 张混合样本池 ──► Mosaic ──► 训练
 ```
 
-每个增强模块是**独立开关**（`slice_prob` / `slice_keep_origin` / `compose_keep` / `ratio_pad_keep` / `blur_keep` / `weather_keep`），且支持**epoch 级精确比例控制**（`slice_ratio` / `compose_ratio` / `ratio_pad_ratio` / `blur_ratio` / `weather_ratio`）与**训练后期统一关闭**（`close_aug_epoch`，类似 `close_mosaic`），可任意组合或全关（全关 = 原生 Ultralytics）。验证侧另支持**切片评估**（`val_slice_*`，SAHI 式切片推理 + NMS 融合 + 双口径 mAP 与两套权重）。
+每个增强模块是**独立开关**（`slice_prob` / `slice_keep_origin` / `compose_keep` / `ratio_pad_keep` / `blur_keep` / `weather_keep` / `occlusion_keep`），且支持**epoch 级精确比例控制**（`slice_ratio` / `compose_ratio` / `ratio_pad_ratio` / `blur_ratio` / `weather_ratio` / `occlusion_ratio`）与**训练后期统一关闭**（`close_aug_epoch`，类似 `close_mosaic`），可任意组合或全关（全关 = 原生 Ultralytics）。验证侧另支持**切片评估**（`val_slice_*`，SAHI 式切片推理 + NMS 融合 + 双口径 mAP 与两套权重）。
 
 ---
 
@@ -35,6 +36,7 @@ model.train(
     ratio_pad_keep=True,      # 在线比例调整（+N）
     blur_keep=True,           # 在线运动模糊，短+长（+2N）
     weather_keep=True,        # 在线气象退化（雨/雾/噪声，+N，推荐 weather_ratio=0.3~0.6）
+    occlusion_keep=True,      # 在线遮挡模拟（rect/stripe，+N，推荐 occlusion_ratio=0.3~0.6）
 )
 ```
 
@@ -57,9 +59,10 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 [6N, 8N)               模糊     blur_keep（每图短/长各 1 张）
 [8N, 8N+ceil(N/4))     合成     compose_keep（每 4 张原图拼 1 张 2×2 大图）
 [8N+ceil(N/4), +N)     气象退化 weather_keep（每图 1 张雨/雾/噪声图）
+[8N+ceil(N/4)+N, +N)   遮挡     occlusion_keep（每图 1 张 rect/stripe 遮挡图）
 ```
 
-- 全开总数 = `9N + ceil(N/4)`（N=4 时 = 37）；
+- 全开总数 = `10N + ceil(N/4)`（N=4 时 = 41）；
 - `len` 恒定：所有"被拒/未选中"样本位**位置保留、内容替换**（如被拒背景片退回原图、未选中组退回组内第 1 张原图），避免预计算 + len 不恒定导致的 Mosaic buffer 记账错乱；
 - 训练开始时日志打印实际参与训练样本数，可确认各增强确实参与训练。
 
@@ -134,11 +137,26 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 | `weather_noise_std` | `15.0` | 高斯噪声标准差（每通道独立），模拟传感器/弱光噪点 |
 | `weather_save_dir` | `""` | 保存目录（画框/限数量/按图+类型跨 epoch 去重）；空=不保存 |
 
+### 在线遮挡模拟 `occlusion_*`
+
+> 每张被选中原图生成 1 张语义遮挡图（rect=树冠/阴影随机矩形，stripe=电线/枝干细长条带），**标签不变**（超阈值目标除外），提升航拍模型对部分遮挡目标的鲁棒性。`occlusion_color=auto` 时块色采样图像暗 25% 分位均值，融入场景而非突兀黑块。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `occlusion_keep` | `False` | 独立开关：每图生成 1 张遮挡图（+N） |
+| `occlusion_ratio` | `0.5` | 原图级比例：每 epoch 选 `round(x×N)` 张做遮挡，未选中整图直通（len 恒定）；0.3~0.6 推荐 |
+| `occlusion_types` | `rect,stripe` | 遮挡类型池（逗号分隔），每图随机抽 1 种 |
+| `occlusion_blocks` | `1` | 每图遮挡块数（1~3） |
+| `occlusion_size_ratio` | `0.1` | 单块面积上限（相对原图面积），防目标被完全盖住 |
+| `occlusion_color` | `auto` | `auto`=采样图像暗分位均值融入场景；或 `black`/`gray` 固定色 |
+| `occlusion_max_cover` | `0.95` | 目标被遮挡面积占比 ≥ 阈值则从标签剔除（完全被盖住的目标=纯噪声）；1.0=标签永不变 |
+| `occlusion_save_dir` | `""` | 保存目录（画框/按图+类型跨 epoch 去重/限数量）；空=不保存 |
+
 ### 训练后期关闭在线增强 `close_aug_epoch`
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `close_aug_epoch` | `0` | 与 `close_mosaic` 同构的时间维调度：训练最后 N 个 epoch 把切片/合成/比例/模糊/气象退化**全部关闭**（各区段退回原图直通，len 恒定），让模型在真实分布上收敛；`0`=不启用（完全向后兼容） |
+| `close_aug_epoch` | `0` | 与 `close_mosaic` 同构的时间维调度：训练最后 N 个 epoch 把切片/合成/比例/模糊/气象退化/遮挡**全部关闭**（各区段退回原图直通，len 恒定），让模型在真实分布上收敛；`0`=不启用（完全向后兼容） |
 
 ### 验证侧在线切片评估 `val_slice_*`
 
@@ -158,7 +176,7 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `slice_save_dir` | `""` | 切片图保存目录；空=不保存 |
-| `slice_save_max` | `0` | 五类（切片/比例/模糊/合成/气象退化）共用保存限额；0=不限；可用 `slice_save_max_{tile,ratio,blur,compose,weather}` 单独覆盖 |
+| `slice_save_max` | `0` | 六类（切片/比例/模糊/合成/气象退化/遮挡）共用保存限额；0=不限；可用 `slice_save_max_{tile,ratio,blur,compose,weather,occlusion}` 单独覆盖 |
 | `slice_save_annotated` | `True` | 保存时画标注框+类别 |
 | `slice_save_exist_ok` | `True` | 目录已存在是否继续写入；False=抛错防覆盖 |
 | `mosaic_save_dir` | `""` | Mosaic 画布图保存目录（验证 mosaic 是否启用）；空=不保存 |

@@ -3421,6 +3421,15 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     dataset.weather_haze_beta = float(getattr(hyp, "weather_haze_beta", 0.4))
     dataset.weather_noise_std = float(getattr(hyp, "weather_noise_std", 15.0))
     dataset.weather_save_dir = str(getattr(hyp, "weather_save_dir", "") or "")
+    # ---- 在线遮挡模拟 (occlusion_*): rect/stripe 语义遮挡块, 标签不变(超阈值目标剔除), 独立开关 + epoch 比例 ----
+    dataset.occlusion_keep = online_aug_on and bool(getattr(hyp, "occlusion_keep", False))
+    dataset.occlusion_ratio = float(getattr(hyp, "occlusion_ratio", 0.5))
+    dataset.occlusion_types = str(getattr(hyp, "occlusion_types", "rect,stripe") or "rect,stripe")
+    dataset.occlusion_blocks = int(getattr(hyp, "occlusion_blocks", 1) or 1)
+    dataset.occlusion_size_ratio = float(getattr(hyp, "occlusion_size_ratio", 0.1))
+    dataset.occlusion_color = str(getattr(hyp, "occlusion_color", "auto") or "auto")
+    dataset.occlusion_max_cover = float(getattr(hyp, "occlusion_max_cover", 0.95))
+    dataset.occlusion_save_dir = str(getattr(hyp, "occlusion_save_dir", "") or "")
     # P2-3: per-branch save cap overrides (slice_save_max_{tile,blur,ratio,compose}).
     # base.py's _save_cap() reads these from `self`; if not set here it falls back to slice_save_max.
     # Keep tile in sync with the legacy `save_max` passed to OnlineSlice above.
@@ -3429,6 +3438,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     dataset.slice_save_max_ratio = getattr(hyp, "slice_save_max_ratio", None)
     dataset.slice_save_max_compose = getattr(hyp, "slice_save_max_compose", None)
     dataset.slice_save_max_weather = getattr(hyp, "slice_save_max_weather", None)
+    dataset.slice_save_max_occlusion = getattr(hyp, "slice_save_max_occlusion", None)
 
     if hyp.copy_paste_mode == "flip":
         pre_transform.insert(1, CopyPaste(dataset, p=hyp.copy_paste, mode=hyp.copy_paste_mode))

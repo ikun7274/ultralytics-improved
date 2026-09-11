@@ -141,6 +141,71 @@ def _apply_weather(img: np.ndarray, wtype: str, rain_density: float = 0.15, rain
     return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
 
+def _apply_occlusion(
+    img: np.ndarray,
+    otype: str,
+    blocks: int = 1,
+    size_ratio: float = 0.1,
+    color: str = "auto",
+) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
+    """Draw semantic occlusion blocks (rect / stripe) on a BGR image, in memory.
+
+    Simulates real drone-view occluders -- tree crowns, shadows, power lines, cloud edges. Labels
+    are NOT moved by the drawing itself (the caller decides max_cover-based removal); returns the
+    occluded image plus the pixel ``(x0, y0, x1, y1)`` boxes of every block so the caller can
+    compute per-target covered ratios.
+
+    - ``rect``: random rectangle, side in [0.5, 1.0] * base (base = sqrt(size_ratio * area)).
+    - ``stripe``: thin band (width ~2% of the short side, length 0.5-1.0 of the long side),
+      near-horizontal or near-vertical (models power lines / branches / cloud edges).
+    - ``color='auto'``: sample the image's dark-quartile mean so the block blends into the scene
+      instead of being a stark black blob; ``black`` / ``gray`` are fixed alternatives.
+    """
+    h, w = img.shape[:2]
+    out = img.copy()
+    base = max(2.0, math.sqrt(max(1.0, size_ratio) * h * w))
+    rng_color = "auto"
+    # auto color: mean of the darkest ~25% pixels (per-channel), a plausible tree/shadow tone
+    if color == "auto":
+        flat = img.reshape(-1, img.shape[2])
+        q = np.quantile(flat, 0.25, axis=0)
+        rng_color = tuple(int(round(float(v))) for v in q)
+    elif color == "black":
+        rng_color = (0, 0, 0)
+    else:  # gray
+        rng_color = (128, 128, 128)
+    boxes = []
+    for _ in range(max(1, int(blocks))):
+        if otype == "stripe":
+            thick = max(2, int(0.02 * min(h, w)))
+            length = int(max(h, w) * random.uniform(0.5, 1.0))
+            vertical = random.random() < 0.5
+            if vertical:
+                cx = random.uniform(0.0, float(w))
+                cy = random.uniform(0.0, float(h))
+                x0, x1 = max(0, int(cx - thick // 2)), min(w, int(cx + thick // 2) + 1)
+                y0, y1 = max(0, int(cy - length // 2)), min(h, int(cy + length // 2) + 1)
+                cv2.rectangle(out, (x0, y0), (x1, y1), rng_color, -1)
+                boxes.append((x0, y0, x1, y1))
+            else:
+                cx = random.uniform(0.0, float(w))
+                cy = random.uniform(0.0, float(h))
+                x0, x1 = max(0, int(cx - length // 2)), min(w, int(cx + length // 2) + 1)
+                y0, y1 = max(0, int(cy - thick // 2)), min(h, int(cy + thick // 2) + 1)
+                cv2.rectangle(out, (x0, y0), (x1, y1), rng_color, -1)
+                boxes.append((x0, y0, x1, y1))
+        else:  # rect
+            side = base * random.uniform(0.5, 1.0)
+            bw, bh = int(side * random.uniform(0.7, 1.3)), int(side * random.uniform(0.7, 1.3))
+            x0 = random.uniform(0.0, max(1.0, float(w - bw)))
+            y0 = random.uniform(0.0, max(1.0, float(h - bh)))
+            x0i, y0i = int(x0), int(y0)
+            x1i, y1i = min(w, x0i + bw), min(h, y0i + bh)
+            cv2.rectangle(out, (x0i, y0i), (x1i, y1i), rng_color, -1)
+            boxes.append((x0i, y0i, x1i, y1i))
+    return np.ascontiguousarray(out), boxes
+
+
 # Directories already created in this process (see _ensure_dir).
 _MKDIR_DONE: set[str] = set()
 
@@ -334,6 +399,7 @@ class BaseDataset(Dataset):
         self._ratio_mask = None
         self._blur_mask = None
         self._weather_mask = None
+        self._occlusion_mask = None
         self._compose_mask = None
 
         # Cache images (options are cache = True, False, None, "ram", "disk")
@@ -386,6 +452,8 @@ class BaseDataset(Dataset):
                 _parts.append("N/4 compose")
             if self._weather_on():
                 _parts.append("1 weather")
+            if self._occlusion_on():
+                _parts.append("1 occlusion")
             if _parts:
                 LOGGER.info(
                     f"{self.prefix}Online augment: {_n_total} training samples from {_n_origin} images "
@@ -687,6 +755,7 @@ class BaseDataset(Dataset):
             self._ratio_mask = np.zeros(n, dtype=bool)
             self._blur_mask = np.zeros(n, dtype=bool)
             self._weather_mask = np.zeros(n, dtype=bool)
+            self._occlusion_mask = np.zeros(n, dtype=bool)
             self._compose_mask = np.zeros((n + 3) // 4, dtype=bool)
             return
         # --- slice (original-level) ---
@@ -735,6 +804,15 @@ class BaseDataset(Dataset):
             self._weather_mask = mask
         else:
             self._weather_mask = None
+        # --- occlusion (original-level) ---
+        x = float(getattr(self, "occlusion_ratio", 0.5))
+        if aug_on and self._occlusion_on() and 0.0 <= x < 1.0:
+            mask = np.zeros(n, dtype=bool)
+            if x > 0:
+                mask[random.sample(range(n), int(round(x * n)))] = True
+            self._occlusion_mask = mask
+        else:
+            self._occlusion_mask = None
 
     def _n_per(self) -> int:
         """Single source of truth: how many samples each ORIGINAL image expands to in the BASE segment.
@@ -773,19 +851,25 @@ class BaseDataset(Dataset):
         """True when the weather branch allocates samples (weather_keep independent switch)."""
         return bool(getattr(self, "weather_keep", False))
 
-    def _segment_bases(self) -> tuple[int, int, int, int, int, int]:
-        """Return the six segment boundaries of the mixed sample pool.
+    def _occlusion_on(self) -> bool:
+        """True when the occlusion branch allocates samples (occlusion_keep independent switch)."""
+        return bool(getattr(self, "occlusion_keep", False))
+
+    def _segment_bases(self) -> tuple[int, int, int, int, int, int, int]:
+        """Return the seven segment boundaries of the mixed sample pool.
 
         Layout (each optional branch is an independent, contiguous segment gated ONLY by its own
         switch; slicing lives entirely inside the base segment):
-            [0, base_len)                 base:     _n_per samples per original (slicing pipeline)
-            [base_len, +N)                origin:   1 un-sliced original per image (keep_origin)
-            [base_len+N, +2N)             ratio:    1 aspect-ratio-padded image per original
-            [base_len+2N, +4N)            blur:     short + long motion-blurred images per original
-            [base_len+4N, +ceil(N/4))     compose:  one 2x2 stitched image per group of 4 originals
-            [base_len+4N+ceil(N/4), +N)   weather:  1 rain/haze/noise-degraded image per original
+            [0, base_len)                 base:      _n_per samples per original (slicing pipeline)
+            [base_len, +N)                origin:    1 un-sliced original per image (keep_origin)
+            [base_len+N, +2N)             ratio:     1 aspect-ratio-padded image per original
+            [base_len+2N, +4N)            blur:      short + long motion-blurred images per original
+            [base_len+4N, +ceil(N/4))     compose:   one 2x2 stitched image per group of 4 originals
+            [base_len+4N+ceil(N/4), +N)   weather:   1 rain/haze/noise-degraded image per original
+            [...+N, +N)                   occlusion: 1 rect/stripe-occluded image per original
 
-        Returns (base_len, origin_base, ratio_base, blur_base, compose_base, weather_base).
+        Returns (base_len, origin_base, ratio_base, blur_base, compose_base, weather_base,
+        occlusion_base).
         """
         n = len(self.labels)
         base_len = n * self._n_per()
@@ -794,7 +878,8 @@ class BaseDataset(Dataset):
         b_base = r_base + (n if bool(getattr(self, "ratio_pad_keep", False)) else 0)
         c_base = b_base + (2 * n if bool(getattr(self, "blur_keep", False)) else 0)
         w_base = c_base + ((n + 3) // 4 if self._compose_on() else 0)
-        return base_len, o_base, r_base, b_base, c_base, w_base
+        oc_base = w_base + (n if self._weather_on() else 0)
+        return base_len, o_base, r_base, b_base, c_base, w_base, oc_base
 
     def _origin_at(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one un-sliced ORIGINAL-resolution sample (slice_keep_origin independent segment).
@@ -846,6 +931,7 @@ class BaseDataset(Dataset):
             or bool(getattr(self, "ratio_pad_keep", False))
             or bool(getattr(self, "blur_keep", False))
             or self._weather_on()
+            or self._occlusion_on()
             or self._compose_on()
         )
 
@@ -1089,6 +1175,127 @@ class BaseDataset(Dataset):
         )
         return self.update_labels_info(label)
 
+    def _occlusion_at(self, index: int, img_index: int) -> dict[str, Any]:
+        """Build one in-memory occluded image (rect / stripe blocks) from an original.
+
+        Online port of the occlusion proposal: each selected original gets ``occlusion_blocks``
+        semantic blocks (type picked randomly from ``occlusion_types``) drawn on the ORIGINAL
+        resolution image. Labels stay UNCHANGED -- the point is occlusion-robust detection -- except
+        a box whose covered area ratio exceeds ``occlusion_max_cover`` is dropped from the label
+        (a fully-hidden target is pure noise). ``occlusion_ratio``: un-selected originals pass
+        through as the full image (slot kept, len constant, same pattern as weather_ratio). The
+        image is resized to the training size like every other branch and enters the Mosaic mix
+        pool. Nothing is written to disk unless ``occlusion_save_dir`` is set.
+
+        ``index`` is the EXPANDED mixed-pool index; ``img_index`` is the ORIGINAL image index.
+        """
+        f = self.im_files[img_index]
+        im = self._load_image_cached(img_index)
+        h, w = im.shape[:2]
+        # occlusion_ratio: 未选中原图整图直通 (位保留, len 恒定)
+        if self._occlusion_mask is not None and not self._occlusion_mask[img_index]:
+            out = im
+            oc_boxes = []
+        else:
+            types = [t.strip() for t in str(getattr(self, "occlusion_types", "rect,stripe")).split(",") if t.strip()]
+            otype = random.choice(types) if types else "rect"
+            out, oc_boxes = _apply_occlusion(
+                im,
+                otype,
+                blocks=int(getattr(self, "occlusion_blocks", 1) or 1),
+                size_ratio=float(getattr(self, "occlusion_size_ratio", 0.1)),
+                color=str(getattr(self, "occlusion_color", "auto") or "auto"),
+            )
+
+        label = deepcopy(self.labels[img_index])
+        label.pop("shape", None)
+        label["im_file"] = f
+        # max_cover: 目标被遮挡面积占比超过阈值 -> 从标签剔除 (完全被盖住的目标=纯噪声)
+        max_cover = float(getattr(self, "occlusion_max_cover", 0.95))
+        if oc_boxes and len(label.get("bboxes", [])):
+            boxes = np.asarray(label["bboxes"], dtype=np.float64).copy()  # normalized xywh
+            oc_area_sum = 0.0
+            for (ox0, oy0, ox1, oy1) in oc_boxes:
+                oc_area_sum += max(0, ox1 - ox0) * max(0, oy1 - oy0)
+            keep = np.ones(len(boxes), dtype=bool)
+            for i, b in enumerate(boxes):
+                cx, cy, bw, bh = b[0] * w, b[1] * h, b[2] * w, b[3] * h
+                x0, y0, x1, y1 = cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2
+                area = max(1.0, (x1 - x0) * (y1 - y0))
+                covered = 0.0
+                for (ox0, oy0, ox1, oy1) in oc_boxes:
+                    ix0, iy0 = max(x0, ox0), max(y0, oy0)
+                    ix1, iy1 = min(x1, ox1), min(y1, oy1)
+                    if ix1 > ix0 and iy1 > iy0:
+                        covered += (ix1 - ix0) * (iy1 - iy0)
+                if covered / area >= max_cover:
+                    keep[i] = False
+            if not keep.all():
+                label["bboxes"] = boxes[keep].astype(np.float32)
+                cls = np.asarray(label.get("cls", np.empty((0, 1))))
+                label["cls"] = np.asarray(cls).reshape(-1, 1)[keep].astype(np.float32) if len(cls) else cls
+                if label.get("segments"):
+                    label["segments"] = [s for k, s in zip(keep, label["segments"]) if k]
+
+        label["img"] = np.ascontiguousarray(out)
+
+        # Keep the occluded image on the same Mosaic mix pool as every other sample (cache != 'ram')
+        if self.augment and self.cache != "ram":
+            self.buffer.append(index)
+            if 1 < len(self.buffer) >= self.max_buffer_length:
+                self.buffer.pop(0)
+
+        # Optional save for visual inspection (occlusion_save_dir set). Annotated per
+        # slice_save_annotated, capped by slice_save_max_occlusion (falls back to slice_save_max),
+        # deduplicated per (image, otype) across epochs.
+        sdir = str(getattr(self, "occlusion_save_dir", "") or "")
+        st = getattr(self, "slice_transform", None)
+        if sdir:
+            cdir = Path(sdir)
+            if not hasattr(self, "_occlusion_saved"):
+                self._occlusion_saved = 0
+                self._occlusion_saved_keys = set()
+            key = ("occlusion", otype if oc_boxes else "none", index)
+            save_cap = _save_cap(self, "occlusion")
+            if key not in self._occlusion_saved_keys and (save_cap == 0 or self._occlusion_saved < save_cap):
+                _ensure_dir(cdir)
+                img = out
+                boxes = np.asarray(label.get("bboxes", np.empty((0, 4))), dtype=np.float64)
+                save_annotated = bool(getattr(st, "save_annotated", True)) if st is not None else True
+                if save_annotated and len(boxes):
+                    img = out.copy()
+                    H2, W2 = out.shape[:2]
+                    cls = np.asarray(label.get("cls", np.empty((0, 1))))
+                    for b, c in zip(boxes, np.asarray(cls).reshape(-1)):
+                        cx, cy, bw, bh = (float(v) for v in b)
+                        x0 = int(round((cx - bw / 2) * W2))
+                        y0 = int(round((cy - bh / 2) * H2))
+                        x1 = int(round((cx + bw / 2) * W2))
+                        y1 = int(round((cy + bh / 2) * H2))
+                        cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
+                        cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                _imwrite(cdir / f"occlusion_{otype if oc_boxes else 'none'}_p{os.getpid()}_img{img_index}_"
+                                f"{self._occlusion_saved:05d}_n{len(boxes)}.jpg", img)
+                self._occlusion_saved += 1
+                self._occlusion_saved_keys.add(key)
+
+        # Resize to the training size (same as the other online branches)
+        h1, w1 = out.shape[:2]
+        r = self.imgsz / max(h1, w1)
+        if r != 1:
+            out = cv2.resize(out, (math.ceil(w1 * r), math.ceil(h1 * r)), interpolation=cv2.INTER_LINEAR)
+        if out.ndim == 2:
+            out = out[..., None]
+        label["img"] = np.ascontiguousarray(out)
+        label["ori_shape"] = (h1, w1)
+        label["resized_shape"] = out.shape[:2]
+        label["ratio_pad"] = (
+            label["resized_shape"][0] / label["ori_shape"][0],
+            label["resized_shape"][1] / label["ori_shape"][1],
+        )
+        return self.update_labels_info(label)
+
     def _ratio_at(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one in-memory aspect-ratio-padded image from a single original image (online port of the
         offline change_image_resolution tool).
@@ -1249,7 +1456,7 @@ class BaseDataset(Dataset):
         n_origin = len(self.labels)
         # The compose segment starts right after the base + ratio + blur segments (_segment_bases);
         # group = index - compose_base selects the group of 4 originals.
-        _base_len, _o_base, _r_base, _b_base, c_base, _w_base = self._segment_bases()
+        _base_len, _o_base, _r_base, _b_base, c_base, _w_base, _oc_base = self._segment_bases()
         group = index - c_base
         base = group * 4
         # P1-2: with fewer than 4 originals the modulo wrap would put the SAME image in 2+ quadrants,
@@ -1414,18 +1621,21 @@ class BaseDataset(Dataset):
                 but do not inflate the ``neg_ratio`` quota or duplicate saved slices.
         """
         # Mixed-pool layout (see _segment_bases): a base segment holding ONLY the slicing pipeline's
-        # samples (4 tiles per image), followed by five INDEPENDENT segments gated only by their own
+        # samples (4 tiles per image), followed by SIX INDEPENDENT segments gated only by their own
         # switches -- origin (1 un-sliced original per image, keep_origin), ratio (1 per image),
-        # blur (2 per image), compose (1 per 4 images), weather (1 per image). None of them requires
-        # slicing or keep_origin.
+        # blur (2 per image), compose (1 per 4 images), weather (1 per image), occlusion (1 per
+        # image). None of them requires slicing or keep_origin.
         emit_all = getattr(self, "slice_all_tiles", False)
         origin_on = self._keep_origin_on()
         ratio_on = bool(getattr(self, "ratio_pad_keep", False))
         blur_on = bool(getattr(self, "blur_keep", False))
         compose_on = self._compose_on()
         weather_on = self._weather_on()
-        base_len, o_base, r_base, b_base, c_base, w_base = self._segment_bases()
+        occlusion_on = self._occlusion_on()
+        base_len, o_base, r_base, b_base, c_base, w_base, oc_base = self._segment_bases()
 
+        if occlusion_on and index >= oc_base:
+            return self._occlusion_at(index, index - oc_base)  # origin index = offset inside the occlusion segment
         if weather_on and index >= w_base:
             return self._weather_at(index, index - w_base)  # origin index = offset inside the weather segment
         if compose_on and index >= c_base:
@@ -1509,9 +1719,9 @@ class BaseDataset(Dataset):
     def __len__(self) -> int:
         """Return the number of samples in the mixed pool.
 
-        Base segment (``_n_per`` samples per original) plus five independent segments: +N origin
-        (keep_origin), +N ratio, +2N blur, +ceil(N/4) compose, +N weather -- each present only when
-        its own switch is on. Boundaries are centralized in ``_segment_bases`` so
+        Base segment (``_n_per`` samples per original) plus six independent segments: +N origin
+        (keep_origin), +N ratio, +2N blur, +ceil(N/4) compose, +N weather, +N occlusion -- each
+        present only when its own switch is on. Boundaries are centralized in ``_segment_bases`` so
         ``get_image_and_label`` / ``_compose_at`` cannot drift apart; a mismatch would silently
         drop samples with no error.
         """
@@ -1526,6 +1736,8 @@ class BaseDataset(Dataset):
         if self._compose_on():
             total += (n + 3) // 4
         if self._weather_on():
+            total += n
+        if self._occlusion_on():
             total += n
         return total
 

@@ -29,7 +29,8 @@ from ultralytics import YOLO
     [6N, 8N)       模糊    blur_keep         (独立开关, 短+长)
     [8N, 8N+N/4)   合成    compose_keep      (独立开关, 2×2 大图)
     [8N+N/4, +N)   气象退化 weather_keep     (独立开关, 雨/雾/噪声)
-N=4 全开 = 16 + 4 + 4 + 8 + 1 + 4 = 37 张混合样本池 → mosaic 取 4 张拼接 → 训练
+    [+N, +N)       遮挡    occlusion_keep    (独立开关, rect/stripe)
+N=4 全开 = 16 + 4 + 4 + 8 + 1 + 4 + 4 = 41 张混合样本池 → mosaic 取 4 张拼接 → 训练
 
 '''
 
@@ -117,6 +118,16 @@ if __name__ == '__main__':
         weather_noise_std=15.0,       # 高斯噪声标准差(每通道独立), 模拟传感器/弱光噪点
 
 
+        # ---------在线遮挡模拟 (occlusion_*): 语义遮挡块 (树冠/电线/阴影), 提升被遮挡目标鲁棒性, 标签不变---------
+        occlusion_keep=False,         # 独立开关, 开启在线遮挡模拟 (每图+1张遮挡图, 区段 +N); 与 blur/weather 同构
+        occlusion_ratio=0.5,          # 每epoch随机选 round(x*N) 张原图做遮挡(原图级), 未选中整图直通; 0.3~0.6 推荐
+        occlusion_types="rect,stripe",# 遮挡类型, 逗号分隔; rect=随机矩形(树冠/阴影), stripe=细长条带(电线/枝干/云影)
+        occlusion_blocks=1,           # 每图遮挡块数 (1~3)
+        occlusion_size_ratio=0.2,     # 单块面积上限(相对原图面积), 防目标被完全盖住
+        occlusion_color="auto",       # auto=采样图像深色分位均值(融入场景); 或 black/gray 固定色
+        occlusion_max_cover=0.95,     # 目标被遮挡面积占比 >= 该值则从标签剔除 (完全被盖住的目标=纯噪声); 1.0=标签永不变
+
+
         # ---------训练后期关闭在线增强 (close_aug_epoch): 与 close_mosaic 同构的时间维衰减---------
         # 训练最后 N 个 epoch 把切片/合成/比例/模糊/气象退化全部关闭, 各区段退回原图直通(len恒定), 让模型在真实分布上收敛;
         close_aug_epoch=20, # 0=关闭该调度(默认, 完全向后兼容)
@@ -143,5 +154,6 @@ if __name__ == '__main__':
         # ratio_pad_save_dir=r"path/change_proportion_save_dir",
         # blur_save_dir=r"path/motion_blur_save_dir",
         # weather_save_dir=r"path/weather_save_dir",
+        # occlusion_save_dir=r"path/occlusion_save_dir",
         # mosaic_save_dir=r"path/mosaic_save_dir",
     )

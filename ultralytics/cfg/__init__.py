@@ -260,6 +260,9 @@ CFG_FRACTION_KEYS = frozenset(
         "slice_min_center_retain_ratio",
         "slice_bias_margin",
         "slice_bias_jitter",
+        "occlusion_ratio",
+        "occlusion_size_ratio",
+        "occlusion_max_cover",
         "val_slice_ratio",
         "val_slice_overlap_ratio",
         "val_slice_nms_iou",
@@ -280,6 +283,8 @@ CFG_INT_KEYS = frozenset(
         "resume_extend_epochs",
         "compose_max_side",
         "slice_save_max_weather",
+        "slice_save_max_occlusion",
+        "occlusion_blocks",
         "workers",
         "seed",
         "close_mosaic",
@@ -349,6 +354,7 @@ CFG_BOOL_KEYS = frozenset(
         "ratio_pad_keep",
         "blur_keep",
         "weather_keep",
+        "occlusion_keep",
         "slice_center_constraint",
         "slice_full_box_only",
         "slice_center_bias",
@@ -362,7 +368,8 @@ CFG_BOOL_KEYS = frozenset(
 CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment", "slice_save_dir",
                           "compose_save_dir", "ratio_pad_save_dir", "blur_save_dir",
                           "ratio_pad_target", "ratio_pad_color", "mosaic_save_dir",
-                          "weather_types", "weather_save_dir"})
+                          "weather_types", "weather_save_dir",
+                          "occlusion_types", "occlusion_color", "occlusion_save_dir"})
 
 
 def cfg2dict(cfg: str | Path | dict | SimpleNamespace) -> dict:
