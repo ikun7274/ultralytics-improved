@@ -1391,3 +1391,148 @@ class BaseDataset(Dataset):
             ... )
         """
         raise NotImplementedError
+
+
+class SliceValDataset(Dataset):
+    """Validation-side online slicing: expand each val image into 2x2 (+overlap) sub-tiles (SAHI eval).
+
+    Wraps the native validation ``YOLODataset`` and reuses its labels / transforms / collate_fn, so the
+    validator pipeline stays untouched except for prediction remapping + NMS fusion (see
+    ``DetectionValidator``). Every sub-tile is inferred -- no target filtering (the training-side
+    filters are about what the model SEES; the val side evaluates slicing INFERENCE, so all boxes of
+    every tile are kept and overlapping duplicates are merged later by NMS).
+
+    ``val_slice_ratio < 1`` picks ``round(x * N)`` originals to slice this round, the rest pass through
+    as full images (1 "tile" = the whole image). ``len`` is fixed at construction; the dataset is
+    rebuilt by the validator on every validation round.
+
+    Each sample carries ``val_slice_meta`` with the metadata needed to remap predictions back to the
+    original image coordinates: ``orig_idx``, ``k``, ``offset`` (tile origin), ``tile_shape``,
+    ``orig_shape``, ``n_tiles``, ``sliced``.
+    """
+
+    def __init__(
+        self,
+        base: Dataset,
+        overlap_ratio: float = 0.2,
+        all_tiles: bool = True,
+        ratio: float = 1.0,
+    ) -> None:
+        self.base = base
+        self.labels = base.labels
+        self.n = len(self.labels)
+        self.overlap_ratio = overlap_ratio
+        self.all_tiles = all_tiles
+        self.ratio = float(ratio)
+        self.transforms = base.transforms
+        # Forward the base dataset's collate_fn so build_dataloader assembles batches identically.
+        self.collate_fn = base.collate_fn
+        self._build()
+
+    def _build(self) -> None:
+        """Build the per-original tile layout: mask (val_slice_ratio) + per-orig tile boxes."""
+        import bisect
+
+        from ultralytics.data.augment import slice_geometry
+
+        n = self.n
+        mask = None
+        if 0.0 <= self.ratio < 1.0:
+            mask = np.zeros(n, dtype=bool)
+            if self.ratio > 0:
+                mask[random.sample(range(n), int(round(self.ratio * n)))] = True
+        self._mask = mask
+        counts: list[int] = []
+        metas: list[list[tuple[int, int, int, int]]] = []
+        self._shapes: list[tuple[int, int]] = []
+        for i, lb in enumerate(self.labels):
+            h, w = lb.get("shape", (0, 0))[:2]
+            self._shapes.append((int(h), int(w)))
+            slice_it = bool(self.all_tiles) and (mask is None or bool(mask[i])) and h >= 2 and w >= 2
+            if slice_it:
+                tiles = slice_geometry(w, h, self.overlap_ratio)
+                counts.append(len(tiles))
+                metas.append(tiles)
+            else:
+                counts.append(1)
+                metas.append([(0, 0, w, h)])
+        self._counts = counts
+        self._metas = metas
+        self._cum = [0]
+        for c in counts:
+            self._cum.append(self._cum[-1] + c)
+
+    def __len__(self) -> int:
+        """Total number of validation samples (sum of per-original tile counts)."""
+        return self._cum[-1]
+
+    def _decode(self, index: int) -> tuple[int, int]:
+        """Map an expanded sample index to ``(original_index, tile_index)``."""
+        import bisect
+
+        i = bisect.bisect_right(self._cum, index) - 1
+        return i, index - self._cum[i]
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """Build one validation sample: (sub-image or full image) + remapped label + remap metadata."""
+        oi, k = self._decode(index)
+        x0, y0, x1, y1 = self._metas[oi][k]
+        h, w = self._shapes[oi]
+        sliced = (x0, y0, x1, y1) != (0, 0, w, h)
+        label = deepcopy(self.labels[oi])
+        label.pop("shape", None)  # shape is for rect, remove it
+        # Load the ORIGINAL-resolution image (worker LRU cache when available).
+        if hasattr(self.base, "_load_image_cached"):
+            im = self.base._load_image_cached(oi)
+        else:
+            im = cv2.imread(label["im_file"])
+        if im is None:
+            im = cv2.imread(label["im_file"])
+        tw, th = x1 - x0, y1 - y0
+        sub = np.ascontiguousarray(im[y0:y1, x0:x1])
+        if sliced:
+            # Remap ALL boxes to the sub-image (clip at tile borders, no filtering): normalized
+            # xywh (orig) -> pixel xyxy -> clip to tile -> normalized xywh (sub).
+            boxes = np.asarray(label["bboxes"], dtype=np.float64)
+            if len(boxes):
+                cx, cy, bw, bh = boxes[:, 0] * w, boxes[:, 1] * h, boxes[:, 2] * w, boxes[:, 3] * h
+                xa, ya = cx - bw / 2, cy - bh / 2
+                xb, yb = cx + bw / 2, cy + bh / 2
+                lx0 = np.clip(xa - x0, 0.0, tw)
+                ly0 = np.clip(ya - y0, 0.0, th)
+                lx1 = np.clip(xb - x0, 0.0, tw)
+                ly1 = np.clip(yb - y0, 0.0, th)
+                nw2, nh2 = lx1 - lx0, ly1 - ly0
+                keep = (nw2 > 1) & (nh2 > 1)
+                if keep.any():
+                    lx0, ly0, lx1, ly1 = lx0[keep], ly0[keep], lx1[keep], ly1[keep]
+                    label["bboxes"] = np.stack(
+                        [(lx0 + lx1) / 2 / tw, (ly0 + ly1) / 2 / th, (lx1 - lx0) / tw, (ly1 - ly0) / th], axis=1
+                    ).astype(np.float32)
+                    label["cls"] = np.asarray(label["cls"])[keep]
+                else:
+                    label["bboxes"] = np.empty((0, 4), dtype=np.float32)
+                    label["cls"] = np.empty((0, 1), dtype=np.float32)
+            else:
+                label["bboxes"] = np.empty((0, 4), dtype=np.float32)
+            label["bbox_format"] = "xywh"
+            label["normalized"] = True
+            label["segments"] = []
+            if label.get("keypoints") is not None:
+                label["keypoints"] = np.empty((0, 0, 3), dtype=np.float32)
+        label["img"] = sub
+        # Convert to the "instances" structure expected by the val transforms chain (LetterBox+Format).
+        label = self.base.update_labels_info(label) if hasattr(self.base, "update_labels_info") else label
+        label["ori_shape"] = (th, tw)  # the sub-image is the new "original" for downstream transforms
+        label["resized_shape"] = sub.shape[:2]
+        label["ratio_pad"] = (1.0, 1.0)
+        label["val_slice_meta"] = {
+            "orig_idx": oi,
+            "k": k,
+            "offset": (x0, y0),
+            "tile_shape": (th, tw),
+            "orig_shape": (h, w),
+            "n_tiles": len(self._metas[oi]),
+            "sliced": bool(sliced),
+        }
+        return self.transforms(label)

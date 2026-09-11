@@ -151,6 +151,8 @@ class BaseTrainer:
             self.args.save_dir = str(self.save_dir)
             YAML.save(self.save_dir / "args.yaml", vars(self.args))  # save run args
         self.last, self.best = self.wdir / "last.pt", self.wdir / "best.pt"  # checkpoint paths
+        # Dual-metric (val_slice_dual_metric): a second whole-image best/last pair, saved only when enabled.
+        self.last_whole, self.best_whole = self.wdir / "last_whole.pt", self.wdir / "best_whole.pt"
         self.save_period = self.args.save_period
 
         self.batch_size = self.args.batch
@@ -193,6 +195,10 @@ class BaseTrainer:
         # Epoch level metrics
         self.best_fitness = None
         self.fitness = None
+        # Dual-metric (whole-image reference pass) state, used only when val_slice_dual_metric=True.
+        self.best_fitness_whole = None
+        self.fitness_whole = None
+        self.whole_metrics = None
         self.loss = None
         self.tloss = None
         self.loss_names = ()
@@ -718,6 +724,50 @@ class BaseTrainer:
             if any(filter(lambda f: f in n, self.freeze_layer_names)) and isinstance(m, nn.BatchNorm2d):
                 m.eval()
 
+    def _dual_weights_on(self) -> bool:
+        """True when the second (whole-image) best/last checkpoint pair should be saved."""
+        return bool(getattr(self.args, "val_slice_dual_metric", False)) and bool(getattr(self.args, "val_slice_enable", False))
+
+    def _serialize_ckpt(self, metrics: dict | None, fitness: float | None) -> bytes:
+        """Serialize a checkpoint to bytes with the given (already-prefixed) metrics."""
+        import io
+
+        ema = unwrap_model(self.ema.ema)
+        ema = deepcopy(ema).half().to(memory_format=torch.contiguous_format)
+        if hasattr(ema, "criterion"):
+            ema.criterion = None  # strip training-only state from the serialization snapshot
+        for v in ema.state_dict().values():
+            if isinstance(v, torch.Tensor) and v.is_floating_point():
+                torch.nan_to_num_(v)
+        buffer = io.BytesIO()
+        torch.save(
+            {
+                "epoch": self.epoch,
+                "best_fitness": self.best_fitness,
+                "model": None,  # resume and final checkpoints derive from EMA
+                "ema": ema,
+                "updates": self.ema.updates,
+                "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
+                "scaler": self.scaler.state_dict(),
+                "train_args": vars(self.args),  # save as dict
+                "train_metrics": {**(metrics or {}), "fitness": fitness},
+                "train_results": self.read_results_csv(),
+                "date": datetime.now().astimezone().isoformat(),
+                "version": __version__,
+                "git": {
+                    "root": str(GIT.root),
+                    "branch": GIT.branch,
+                    "commit": GIT.commit,
+                    "message": GIT.message,
+                    "origin": GIT.origin,
+                },
+                "license": "AGPL-3.0 (https://ultralytics.com/license)",
+                "docs": "https://docs.ultralytics.com",
+            },
+            buffer,
+        )
+        return buffer.getvalue()
+
     def save_model(self):
         """Save model training checkpoints with additional metadata."""
         import io
@@ -743,40 +793,19 @@ class BaseTrainer:
                 torch.nan_to_num_(v)
 
         # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
-        buffer = io.BytesIO()
-        torch.save(
-            {
-                "epoch": self.epoch,
-                "best_fitness": self.best_fitness,
-                "model": None,  # resume and final checkpoints derive from EMA
-                "ema": ema,
-                "updates": self.ema.updates,
-                "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
-                "scaler": self.scaler.state_dict(),
-                "train_args": vars(self.args),  # save as dict
-                "train_metrics": {**self.metrics, "fitness": self.fitness},
-                "train_results": self.read_results_csv(),
-                "date": datetime.now().astimezone().isoformat(),
-                "version": __version__,
-                "git": {
-                    "root": str(GIT.root),
-                    "branch": GIT.branch,
-                    "commit": GIT.commit,
-                    "message": GIT.message,
-                    "origin": GIT.origin,
-                },
-                "license": "AGPL-3.0 (https://ultralytics.com/license)",
-                "docs": "https://docs.ultralytics.com",
-            },
-            buffer,
-        )
-        serialized_ckpt = buffer.getvalue()  # get the serialized content to save
+        serialized_ckpt = self._serialize_ckpt(self.metrics, self.fitness)
 
         # Save checkpoints
         self.wdir.mkdir(parents=True, exist_ok=True)  # ensure weights directory exists
         self.last.write_bytes(serialized_ckpt)  # save last.pt
         if self.best_fitness == self.fitness:
             self.best.write_bytes(serialized_ckpt)  # save best.pt
+        # Dual-metric: save the second (whole-image reference) pair with its own metrics.
+        if self._dual_weights_on() and self.whole_metrics is not None and self.fitness_whole is not None:
+            serialized_whole = self._serialize_ckpt(self.whole_metrics, self.fitness_whole)
+            self.last_whole.write_bytes(serialized_whole)  # save last_whole.pt
+            if self.best_fitness_whole == self.fitness_whole:
+                self.best_whole.write_bytes(serialized_whole)  # save best_whole.pt
         if (self.save_period > 0) and (self.epoch % self.save_period == 0):
             (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
         return True
@@ -883,6 +912,23 @@ class BaseTrainer:
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
         if self.best_fitness is None or self.best_fitness < fitness:
             self.best_fitness = fitness
+        # Dual-metric pass: also evaluate on the WHOLE image (reference) when sliced validation is enabled,
+        # so the sliced mAP (main fitness / best.pt / early-stop) is reported next to a comparable
+        # whole-image mAP (whole_* keys, best_whole.pt / last_whole.pt). Cost: one extra validation pass.
+        if bool(getattr(self.args, "val_slice_dual_metric", False)) and bool(getattr(self.args, "val_slice_enable", False)):
+            self.validator.dataloader = None  # force dataset rebuild in whole-image mode
+            self.validator.args.val_slice_enable = False
+            metrics_whole = self.validator(self)
+            self.validator.args.val_slice_enable = True
+            self.validator.dataloader = None
+            if metrics_whole is not None:
+                fitness_whole = metrics_whole.pop("fitness", fitness)
+                if self.best_fitness_whole is None or self.best_fitness_whole < fitness_whole:
+                    self.best_fitness_whole = fitness_whole
+                self.fitness_whole = fitness_whole
+                self.whole_metrics = {k: v for k, v in metrics_whole.items()}
+                for k, v in self.whole_metrics.items():
+                    metrics[f"whole_{k}"] = v
         return metrics, fitness
 
     def get_model(self, cfg=None, weights=None, verbose=True):

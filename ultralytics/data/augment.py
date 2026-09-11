@@ -820,6 +820,21 @@ class Mosaic(BaseMixTransform):
         return final_labels
 
 
+def slice_geometry(w: int, h: int, overlap_ratio: float = 0.2) -> list[tuple[int, int, int, int]]:
+    """Return the 4 ``(x0, y0, x1, y1)`` tiles of the 2x2 overlap grid for a ``w x h`` image.
+
+    Shared by the training-side ``OnlineSlice`` and the validation-side ``SliceValDataset`` so the
+    training and validation slice geometry always stays aligned. Slice size = half the image extent
+    scaled by ``(1 + overlap_ratio)`` (e.g. 4000x3000 + 0.2 -> 2400x1800 tiles).
+    """
+    assert 0.0 <= overlap_ratio < 1.0, f"slice_geometry: 'overlap_ratio' must be in [0, 1), got {overlap_ratio}."
+    sw = min(w, max(1, int((1 + overlap_ratio) * w / 2)))
+    sh = min(h, max(1, int((1 + overlap_ratio) * h / 2)))
+    xs = [max(0, x) for x in (0, w - sw)]
+    ys = [max(0, y) for y in (0, h - sh)]
+    return [(x, y, min(x + sw, w), min(y + sh, h)) for y in ys for x in xs]
+
+
 class OnlineSlice(BaseTransform):
     """Online SAHI-style 2x2 overlap slicing on the ORIGINAL-resolution image.
 
@@ -975,11 +990,7 @@ class OnlineSlice(BaseTransform):
 
     def _grid(self, w: int, h: int) -> list[tuple[int, int, int, int]]:
         """Return the 4 (x0, y0, x1, y1) tiles of the 2x2 overlap grid for a w x h image."""
-        sw = min(w, max(1, int((1 + self.overlap_ratio) * w / 2)))
-        sh = min(h, max(1, int((1 + self.overlap_ratio) * h / 2)))
-        xs = [max(0, x) for x in (0, w - sw)]
-        ys = [max(0, y) for y in (0, h - sh)]
-        return [(x, y, min(x + sw, w), min(y + sh, h)) for y in ys for x in xs]
+        return slice_geometry(w, h, self.overlap_ratio)
 
     def _geometry(self, img: np.ndarray, label: dict[str, Any]) -> list:
         """Convert boxes to pixel xyxy and compute the 4 tile intersection results.

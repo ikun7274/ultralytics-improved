@@ -11,7 +11,7 @@
         ── 在线比例 4 张 ── 在线模糊 8 张(短+长) ──► 33 张混合样本池 ──► Mosaic ──► 训练
 ```
 
-每个增强模块是**独立开关**（`slice_prob` / `slice_keep_origin` / `compose_keep` / `ratio_pad_keep` / `blur_keep`），且支持**epoch 级精确比例控制**（`slice_ratio` / `compose_ratio` / `ratio_pad_ratio` / `blur_ratio`），可任意组合或全关（全关 = 原生 Ultralytics）。
+每个增强模块是**独立开关**（`slice_prob` / `slice_keep_origin` / `compose_keep` / `ratio_pad_keep` / `blur_keep`），且支持**epoch 级精确比例控制**（`slice_ratio` / `compose_ratio` / `ratio_pad_ratio` / `blur_ratio`），可任意组合或全关（全关 = 原生 Ultralytics）。验证侧另支持**切片评估**（`val_slice_*`，SAHI 式切片推理 + NMS 融合 + 双口径 mAP 与两套权重）。
 
 ---
 
@@ -113,6 +113,19 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 | `blur_long_defocus_sigma` | `1.0` | 长模糊失焦高斯 σ 上限 [0,该值]，每张随机取；0=不加失焦 |
 | `blur_save_dir` | `""` | 保存目录；空=不保存 |
 
+### 验证侧在线切片评估 `val_slice_*`
+
+> 训练侧已在线切片，验证侧整图直推会因小目标被降采样而**低估切片训练的收益**。开启后验证阶段把验证图切成 2×2 重叠子图独立推理，子图框还原到原图坐标，跨切片重复框 NMS 融合后与原图 GT 算 mAP（SAHI 评估）；`val_slice_dual_metric=True` 时另跑一遍整图验证输出 `whole_*` 参考指标，并额外保存 `best_whole.pt`/`last_whole.pt`。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `val_slice_enable` | `True` | 总开关；False=回归原生整图验证（完全等价原版） |
+| `val_slice_all_tiles` | `True` | True=每图全部 2×2 子图推理（与训练侧对齐）；False=每图随机 1 片（快速验证） |
+| `val_slice_ratio` | `1.0` | 每轮验证随机选 `round(x×N_val)` 张验证图走切片，其余整图直通；1.0=全部切片，0=全部整图 |
+| `val_slice_overlap_ratio` | `0.2` | 验证侧切片重叠比例，建议与训练侧 `slice_overlap_ratio` 一致 |
+| `val_slice_nms_iou` | `0.5` | 跨切片重复框 NMS 融合 IoU 阈值 |
+| `val_slice_dual_metric` | `True` | 双口径：切片 mAP 为主（驱动 fitness/早停/best.pt），整图 mAP 为参考（`whole_*` 指标 + `best_whole.pt`/`last_whole.pt`） |
+
 ### 中间图保存（默认不落盘）
 
 | 参数 | 默认 | 说明 |
@@ -126,7 +139,7 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 | `mosaic_save_annotated` | `True` | Mosaic 画布是否画框+类别 |
 | `mosaic_save_exist_ok` | `True` | 目录已存在是否继续写入 |
 
-### 修补续训（见 `项目说明.md` §3.6 详解）
+### 修补续训（见 `项目说明.md` §3.7 详解）
 
 | 参数 | 说明 |
 |---|---|

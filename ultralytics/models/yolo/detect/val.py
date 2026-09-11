@@ -61,6 +61,26 @@ class DetectionValidator(BaseValidator):
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
         self.metrics = DetMetrics()
+        # --- validation-side online slicing (SAHI-style eval): sub-tile inference + remap + NMS fusion ---
+        self.val_slice_on = bool(args.get("val_slice_enable") if isinstance(args, dict) else getattr(args, "val_slice_enable", False))
+        self.val_slice_overlap_ratio = float(
+            args.get("val_slice_overlap_ratio") if isinstance(args, dict) else getattr(args, "val_slice_overlap_ratio", 0.2)
+        )
+        self.val_slice_all_tiles = bool(
+            args.get("val_slice_all_tiles") if isinstance(args, dict) else getattr(args, "val_slice_all_tiles", True)
+        )
+        self.val_slice_ratio = float(
+            args.get("val_slice_ratio") if isinstance(args, dict) else getattr(args, "val_slice_ratio", 1.0)
+        )
+        self.val_slice_nms_iou = float(
+            args.get("val_slice_nms_iou") if isinstance(args, dict) else getattr(args, "val_slice_nms_iou", 0.5)
+        )
+        self._slice_acc: dict[int, dict] = {}  # per-original accumulation of sub-tile predictions
+        self._slice_base_labels: list[dict] | None = None  # original (whole-image) val labels for GT
+
+    def _val_slice_active(self) -> bool:
+        """Dynamically read val_slice_enable (the trainer toggles it for the dual-metric whole-image pass)."""
+        return bool(getattr(self.args, "val_slice_enable", False))
 
     @staticmethod
     def _check_max_det(args, datasets: dict[str, torch.utils.data.Dataset]) -> None:
@@ -136,6 +156,7 @@ class DetectionValidator(BaseValidator):
             native_model.set_head_attr(max_det=self.args.max_det, agnostic_nms=self.args.agnostic_nms)
         self.seen = 0
         self.jdict = []
+        self._slice_acc = {}  # reset sliced-validation accumulation per validation round
         self.is_custom_json = self.args.save_json and self.args.task == "detect" and not (self.is_coco or self.is_lvis)
         self.gdict = getattr(self, "gdict", None) if self.is_custom_json else None
         self.build_gdict = self.is_custom_json and self.gdict is None
@@ -222,6 +243,12 @@ class DetectionValidator(BaseValidator):
             preds (list[dict[str, torch.Tensor]]): List of predictions from the model.
             batch (dict[str, Any]): Batch data containing ground truth.
         """
+        if self.val_slice_on and "val_slice_meta" in batch:
+            # SAHI-style sliced validation: collect sub-tile predictions per ORIGINAL image, remap them
+            # to the original coordinates, fuse duplicates with class-wise NMS, then evaluate against the
+            # whole-image GT (the original path stays untouched for val_slice_enable=False).
+            self._update_metrics_sliced(preds, batch)
+            return
         for si, pred in enumerate(preds):
             self.seen += 1
             pbatch = self._prepare_batch(si, batch)
@@ -284,6 +311,118 @@ class DetectionValidator(BaseValidator):
                     self.save_dir / "labels" / f"{Path(pbatch['im_file']).stem}.txt",
                 )
 
+    # ------------------------------------------------------------------ #
+    #  Validation-side online slicing (SAHI eval): sub-tile inference     #
+    #  + remap to original coordinates + class-wise NMS fusion.           #
+    # ------------------------------------------------------------------ #
+    def _update_metrics_sliced(self, preds: list[dict[str, torch.Tensor]], batch: dict[str, Any]) -> None:
+        """SAHI-style sliced validation: collect + remap + fuse sub-tile predictions per original image.
+
+        Sub-tile predictions from different batches accumulate in ``self._slice_acc`` (keyed by the
+        ORIGINAL image index); when every tile of an original image has been inferred, its predictions
+        are fused with class-wise NMS and evaluated against the whole-image GT (``_finalize_sliced_orig``).
+        """
+        imgsz = batch["img"].shape[2]  # square validation input
+        for si, pred in enumerate(preds):
+            meta = batch["val_slice_meta"][si]
+            oi = int(meta["orig_idx"])
+            acc = self._slice_acc.get(oi)
+            if acc is None:
+                acc = self._slice_acc[oi] = {
+                    "preds": [],
+                    "done": 0,
+                    "n_tiles": int(meta["n_tiles"]),
+                    "im_file": batch["im_file"][si],
+                }
+            if pred["cls"].shape[0]:
+                boxes = self._remap_boxes_imgsz_to_orig(pred["bboxes"], meta, imgsz)
+                acc["preds"].append(
+                    {"bboxes": boxes, "conf": pred["conf"], "cls": pred["cls"], "extra": pred["extra"]}
+                )
+            acc["done"] += 1
+            if acc["done"] >= acc["n_tiles"]:
+                self._finalize_sliced_orig(oi, acc)
+
+    def _remap_boxes_imgsz_to_orig(self, boxes: torch.Tensor, meta: dict, imgsz: int) -> torch.Tensor:
+        """Invert the validation LetterBox + tile offset: imgsz-canvas xyxy -> original-image xyxy."""
+        th, tw = int(meta["tile_shape"][0]), int(meta["tile_shape"][1])
+        x0, y0 = int(meta["offset"][0]), int(meta["offset"][1])
+        # LetterBox(new_shape=(imgsz, imgsz), scaleup=False, center=True): r = min(1, imgsz/max), pad centered.
+        r = min(1.0, imgsz / max(th, tw))
+        left = round((imgsz - round(tw * r)) / 2.0 - 0.1)
+        top = round((imgsz - round(th * r)) / 2.0 - 0.1)
+        out = boxes.clone()
+        if out.shape[0]:
+            out[:, [0, 2]] = (out[:, [0, 2]] - left) / r + x0
+            out[:, [1, 3]] = (out[:, [1, 3]] - top) / r + y0
+        return out
+
+    @staticmethod
+    def _class_wise_nms(boxes: torch.Tensor, conf: torch.Tensor, cls: torch.Tensor, iou_thres: float) -> torch.Tensor:
+        """Class-aware NMS used to fuse duplicate detections across overlapping sub-tiles (SAHI fusion)."""
+        import torchvision
+
+        keep = []
+        order = torch.arange(len(cls), device=cls.device)
+        for c in torch.unique(cls):
+            idx = order[cls == c]
+            k = torchvision.ops.nms(boxes[idx], conf[idx], iou_thres)
+            keep.append(idx[k])
+        return torch.cat(keep) if keep else torch.empty(0, dtype=torch.long, device=cls.device)
+
+    def _gt_orig_pixels(self, lb: dict, h: int, w: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Whole-image GT in original pixels: (cls tensor, xyxy tensor) on self.device."""
+        boxes = np.asarray(lb["bboxes"], dtype=np.float64)
+        cls = np.asarray(lb["cls"]).reshape(-1)
+        cls_t = torch.as_tensor(cls, dtype=torch.float32, device=self.device)
+        if len(boxes):
+            cx, cy, bw, bh = boxes[:, 0] * w, boxes[:, 1] * h, boxes[:, 2] * w, boxes[:, 3] * h
+            xyxy = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
+            boxes_t = torch.as_tensor(xyxy, dtype=torch.float32, device=self.device)
+        else:
+            boxes_t = torch.empty((0, 4), dtype=torch.float32, device=self.device)
+        return cls_t, boxes_t
+
+    def _finalize_sliced_orig(self, oi: int, acc: dict) -> None:
+        """Evaluate one ORIGINAL image: NMS-fuse all its sub-tile predictions, compare with whole-image GT."""
+        self.seen += 1  # count ORIGINAL images, not sub-tiles
+        if acc["preds"]:
+            boxes = torch.cat([p["bboxes"] for p in acc["preds"]], 0)
+            conf = torch.cat([p["conf"] for p in acc["preds"]], 0)
+            cls = torch.cat([p["cls"] for p in acc["preds"]], 0)
+            keep = self._class_wise_nms(boxes, conf, cls, self.val_slice_nms_iou)
+            boxes, conf, cls = boxes[keep], conf[keep], cls[keep]
+            extra = (
+                torch.cat([p["extra"] for p in acc["preds"]], 0)[keep]
+                if any(p["extra"] is not None for p in acc["preds"])
+                else None
+            )
+        else:
+            boxes = torch.empty((0, 4), device=self.device)
+            conf = torch.empty(0, device=self.device)
+            cls = torch.empty(0, device=self.device)
+            extra = None
+        lb = self._slice_base_labels[oi]
+        h, w = int(lb["shape"][0]), int(lb["shape"][1])
+        gt_cls, gt_boxes = self._gt_orig_pixels(lb, h, w)
+        pbatch = {"cls": gt_cls, "bboxes": gt_boxes}  # preds and GT share the original-image space
+        predn = {"bboxes": boxes, "conf": conf, "cls": cls, "extra": extra}
+        if self.args.single_cls:
+            predn["cls"] *= 0
+        no_pred = predn["cls"].shape[0] == 0
+        target_cls = gt_cls.cpu().numpy()
+        self.metrics.update_stats(
+            {
+                **self._process_batch(predn, pbatch),
+                "target_cls": target_cls,
+                "target_img": np.unique(target_cls),
+                "conf": np.zeros(0) if no_pred else conf.cpu().numpy(),
+                "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
+                "im_name": Path(acc["im_file"]).name,
+            }
+        )
+        del self._slice_acc[oi]
+
     def finalize_metrics(self) -> None:
         """Set final values for metrics speed and confusion matrix."""
         if self.args.plots:
@@ -326,7 +465,8 @@ class DetectionValidator(BaseValidator):
                     self.gdict[key] = [x for _, gdict, _ in gathered_json for x in gdict[key]]
             self.metrics.stats = merged_stats
             self._gather_image_metrics(self.metrics.box)
-            self.seen = len(self.dataloader.dataset)  # total image count from dataset
+            if not self._val_slice_active():  # sliced validation already counts ORIGINAL images in _finalize_sliced_orig
+                self.seen = len(self.dataloader.dataset)  # total image count from dataset
         elif RANK > 0:
             dist.gather_object(self.metrics.stats, None, dst=0)
             dist.gather_object((self.jdict, self.gdict if self.build_gdict else None, self.pred_counts), None, dst=0)
@@ -417,6 +557,18 @@ class DetectionValidator(BaseValidator):
             (torch.utils.data.DataLoader): DataLoader for validation.
         """
         dataset = self.build_dataset(dataset_path, batch=batch_size, mode="val")
+        if self._val_slice_active() and self.args.task == "detect":
+            # Validation-side online slicing: expand each val image into 2x2 (+overlap) sub-tiles.
+            # Predictions are remapped to the original image and fused with NMS in update_metrics.
+            from ultralytics.data.base import SliceValDataset
+
+            dataset = SliceValDataset(
+                dataset,
+                overlap_ratio=self.val_slice_overlap_ratio,
+                all_tiles=self.val_slice_all_tiles,
+                ratio=self.val_slice_ratio,
+            )
+            self._slice_base_labels = dataset.base.labels  # whole-image GT for fusion/evaluation
         return build_dataloader(
             dataset,
             batch_size,

@@ -105,6 +105,17 @@ if __name__ == '__main__':
         blur_long_len_max=35,         # 长模糊(重度) 长度上限(像素)
         blur_long_defocus_sigma=1.0,  # 长模糊失焦高斯 σ 上限; 0=不加失焦
 
+        # ---------验证侧在线切片评估 (val_slice_*): 验证集切片推理 + 坐标还原 + NMS 融合 (SAHI评估)---------
+        # 训练侧已在线切片, 验证侧整图直推会因小目标被降采样而低估切片训练收益.
+        val_slice_enable=True,        # 总开关: 验证时把验证图切成 2x2 重叠子图独立推理, 子图框还原到原图坐标,
+                                      #         跨切片重复框 NMS 融合后与原图 GT 算 mAP; False=回归原生整图验证
+        val_slice_all_tiles=True,     # True=每张验证图全部 2x2 子图都推理(与训练侧对齐); False=每图随机1片(快速验证)
+        val_slice_ratio=1.0,          # 每轮验证随机选 round(x*N_val) 张验证图走切片, 其余整图直通; 1.0=全部切片
+        val_slice_overlap_ratio=0.2,  # 验证侧切片重叠比例 [0,1), 建议与训练侧 slice_overlap_ratio 一致
+        val_slice_nms_iou=0.5,        # 跨切片重复框 NMS 融合 IoU 阈值
+        val_slice_dual_metric=True,   # 双口径: 先跑切片验证(主, 驱动 fitness/早停/best.pt), 再跑整图验证(参考),
+                                      #         输出 whole_* 指标并额外保存 best_whole.pt/last_whole.pt (耗时为两遍验证)
+
         
         # ---- 在线增强保存 (人工检查切片是否正确) ----
         # slice_save_annotated=True,   # 保存时画标注框+类别

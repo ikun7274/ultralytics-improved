@@ -157,6 +157,17 @@ slice_save_max_compose: # (int, optional) 合成图保存上限; 0=不限; 未�
 # ---- 样本池: 每张原图额外保留 1 张未切片原图 (提供全图上下文) ----
 slice_keep_origin: False # (bool, 独立开关, 需 slice_all_tiles=True) 每张原图额外保留 1 张未切片原图进样本池 (独立区段 +N, 不受 slice_prob 影响) -> 样本池 +N, 共同进入 mosaic
 
+# ---------- 验证侧在线切片评估 (val_slice_*): 验证集按 2x2 重叠子图推理 + 坐标还原 + NMS 融合 ----------
+# 训练侧已在线切片, 验证侧整图直推会因小目标被降采样而低估切片训练的收益. 开启后验证阶段把验证图切成
+# 与训练一致的子图, 每子图独立推理, 子图框还原到原图坐标, 跨切片重复框 NMS 融合后与原图 GT 算 mAP (SAHI 评估).
+# val_slice_dual_metric=True 时另跑一遍整图验证, 输出 whole_* 参考指标, 并额外保存 best_whole.pt/last_whole.pt.
+val_slice_enable: True # (bool, 总开关) 验证侧切片评估; False=回归原生整图验证 (完全等价原版)
+val_slice_all_tiles: True # (bool) True=每张验证图全部 2x2 子图都推理 (与训练侧 slice_all_tiles 对齐); False=每图随机 1 片 (快速验证)
+val_slice_ratio: 1.0 # (float) 每轮验证随机选 round(x*N_val) 张验证图走切片, 其余整图直通(1片=整图); 1.0=全部切片; 0=全部整图(等效关闭)
+val_slice_overlap_ratio: 0.2 # (float) 验证侧切片重叠比例 [0,1), 建议与训练侧 slice_overlap_ratio 一致
+val_slice_nms_iou: 0.5 # (float) 跨切片重复框 NMS 融合 IoU 阈值
+val_slice_dual_metric: True # (bool) 双口径: 先跑切片验证(主, 驱动 fitness/早停/best.pt), 再跑整图验证(参考), 输出 whole_* 指标并保存 best_whole.pt/last_whole.pt
+
 # ---------- 在线合成 (compose_*): 每 4 张原图拼 1 张 2x2 大图, 提供更大范围多目标上下文 ----------
 compose_keep: False # (bool, 独立开关, 不依赖切片/keep_origin) 每 4 张原图额外合成 1 张 2x2 拼接大图进样本池 -> 样本池 +ceil(N/4)
 compose_ratio: 1.0 # (float, 需 compose_keep) 每 epoch 随机选 round(x*ceil(N/4)) 组做合成(组级), 未选中组退回组内第 1 张原图(整图直通, len 恒定); 1.0=全量合成
