@@ -1,4 +1,4 @@
-path: C:/Users/Administrator/Desktop/ultralytics-improved/pytools/_mini_val_set
+path: _mini_val_set
 train: images/train
 val: images/val
 nc: 6
