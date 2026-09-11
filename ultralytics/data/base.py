@@ -614,7 +614,7 @@ class BaseDataset(Dataset):
         """Return transformed label information for given index."""
         return self.transforms(self.get_image_and_label(index))
 
-    def set_epoch(self, epoch: int = 0) -> None:
+    def set_epoch(self, epoch: int = 0, epochs: int | None = None) -> None:
         """Rebuild per-epoch masks for exact-ratio ORIGINAL-level augmentation selection.
 
         Exactly ``round(x * N)`` ORIGINAL images are randomly chosen this epoch for each
@@ -622,9 +622,15 @@ class BaseDataset(Dataset):
         and ``round(x * ceil(N/4))`` 4-image GROUPS for compose_ratio. Un-selected positions keep
         their segment slot but fall back to the ORIGINAL full image (len stays constant; same
         principle as the mode-A background fallback). Resampled every epoch by the trainer
-        (``trainer.py`` calls ``dataset.set_epoch(epoch)`` at each epoch start).
+        (``trainer.py`` calls ``dataset.set_epoch(epoch, epochs)`` at each epoch start).
 
         Mask = None (all augmented / branch off) when the branch is off or its ratio >= 1.
+
+        ``close_aug_epoch`` (direction A, close_mosaic-style time schedule): during the final N
+        epochs, ALL online augmentations (slice / compose / ratio_pad / blur) are disabled --
+        every mask is an all-False array, so every segment falls back to its ORIGINAL full image
+        (slot kept, content replaced, ``len`` constant). ``epochs`` is passed by the trainer so the
+        dataset does not need to know the training schedule itself.
         """
         # P3 fix: reset OnlineSlice's positive/background counters every epoch so the neg_ratio
         # background quota restarts per epoch instead of accumulating monotonically across epochs
@@ -636,6 +642,14 @@ class BaseDataset(Dataset):
             st.reset_counters()
         n = len(self.labels)
         aug_on = bool(self.augment)
+        # --- close_aug_epoch: final N epochs disable all online augmentation (fallback to origin) ---
+        close_epoch = int(getattr(self, "close_aug_epoch", 0))
+        if aug_on and close_epoch > 0 and epochs is not None and epoch >= epochs - close_epoch:
+            self._slice_mask = np.zeros(n, dtype=bool)
+            self._ratio_mask = np.zeros(n, dtype=bool)
+            self._blur_mask = np.zeros(n, dtype=bool)
+            self._compose_mask = np.zeros((n + 3) // 4, dtype=bool)
+            return
         # --- slice (original-level) ---
         x = float(getattr(self, "slice_ratio", 1.0))
         if aug_on and getattr(self, "slice_transform", None) is not None and 0.0 <= x < 1.0:

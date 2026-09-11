@@ -275,6 +275,7 @@ CFG_INT_KEYS = frozenset(
         "workers",
         "seed",
         "close_mosaic",
+        "close_aug_epoch",
         "mask_ratio",
         "max_det",
         "vid_stride",

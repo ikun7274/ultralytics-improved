@@ -11,7 +11,7 @@
         ── 在线比例 4 张 ── 在线模糊 8 张(短+长) ──► 33 张混合样本池 ──► Mosaic ──► 训练
 ```
 
-每个增强模块是**独立开关**（`slice_prob` / `slice_keep_origin` / `compose_keep` / `ratio_pad_keep` / `blur_keep`），且支持**epoch 级精确比例控制**（`slice_ratio` / `compose_ratio` / `ratio_pad_ratio` / `blur_ratio`），可任意组合或全关（全关 = 原生 Ultralytics）。验证侧另支持**切片评估**（`val_slice_*`，SAHI 式切片推理 + NMS 融合 + 双口径 mAP 与两套权重）。
+每个增强模块是**独立开关**（`slice_prob` / `slice_keep_origin` / `compose_keep` / `ratio_pad_keep` / `blur_keep`），且支持**epoch 级精确比例控制**（`slice_ratio` / `compose_ratio` / `ratio_pad_ratio` / `blur_ratio`）与**训练后期统一关闭**（`close_aug_epoch`，类似 `close_mosaic`），可任意组合或全关（全关 = 原生 Ultralytics）。验证侧另支持**切片评估**（`val_slice_*`，SAHI 式切片推理 + NMS 融合 + 双口径 mAP 与两套权重）。
 
 ---
 
@@ -112,6 +112,12 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 | `blur_long_len_min/max` | `20`/`35` | 长模糊（重度）长度范围（像素） |
 | `blur_long_defocus_sigma` | `1.0` | 长模糊失焦高斯 σ 上限 [0,该值]，每张随机取；0=不加失焦 |
 | `blur_save_dir` | `""` | 保存目录；空=不保存 |
+
+### 训练后期关闭在线增强 `close_aug_epoch`
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `close_aug_epoch` | `0` | 与 `close_mosaic` 同构的时间维调度：训练最后 N 个 epoch 把切片/合成/比例/模糊**全部关闭**（各区段退回原图直通，len 恒定），让模型在真实分布上收敛；`0`=不启用（完全向后兼容） |
 
 ### 验证侧在线切片评估 `val_slice_*`
 
