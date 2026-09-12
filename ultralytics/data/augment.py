@@ -886,8 +886,10 @@ def compute_slice_bias(
     win_x = max(np.median(b[:, 2] - b[:, 0]), w * 0.05)
     win_y = max(np.median(b[:, 3] - b[:, 1]), h * 0.05)
     cands = np.linspace(margin, 1.0 - margin, 32)
-    score_x = [float(np.sum(np.abs(cx - c * w) < win_x / 2)) for c in cands]
-    score_y = [float(np.sum(np.abs(cy - c * h) < win_y / 2)) for c in cands]
+    # L3 fix: 旧实现 32 候选 x 2 轴的 Python 列表推导 (逐候选内层求和); 改为一次广播比较。
+    # (N,1) 目标中心 vs (1,32) 候选 -> (N,32) 布尔, axis=0 求和即每候选窗口内目标数。
+    score_x = (np.abs(cx[:, None] - (cands * w)[None, :]) < (win_x / 2)).sum(axis=0)
+    score_y = (np.abs(cy[:, None] - (cands * h)[None, :]) < (win_y / 2)).sum(axis=0)
     bx = float(cands[int(np.argmin(score_x))])
     by = float(cands[int(np.argmin(score_y))])
     if jitter > 0:
@@ -3357,36 +3359,41 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     # pipeline itself; see BaseDataset._segment_bases for the mixed-pool layout).
     online_aug_on = not getattr(dataset, "rect", False) and not getattr(dataset, "use_obb", False)
 
+    # ---- 训练后期关闭在线增强 (close_aug_epoch, 与 close_mosaic 同构的时间维调度) ----
+    # S5 修复附带: 此前该值从未被复制到 dataset 上, base.py 的 getattr(self, "close_aug_epoch", 0)
+    # 恒为 0, 时间维调度从未生效; set_epoch/_rebuild_epoch_masks 靠它判断最后 N 个 epoch 全部关增强。
+    dataset.close_aug_epoch = int(getattr(hyp, "close_aug_epoch"))
+
     # ---- 在线切片 (slice_prob 独立开关) ----
-    slice_enabled = online_aug_on and getattr(hyp, "slice_prob", 0.0) > 0.0
+    slice_enabled = online_aug_on and getattr(hyp, "slice_prob") > 0.0
     if slice_enabled:
         # P2-3: tile cap honours slice_save_max_tile override (falls back to slice_save_max when None).
         # tile is the ONLY branch whose cap lives on the OnlineSlice instance itself (see _save in
         # augment.py: line 941), so the override must be applied here at construction time -- unlike
         # blur/ratio/compose whose caps base.py reads per-call from `self`.
-        _tile_cap = getattr(hyp, "slice_save_max_tile", None)
+        _tile_cap = getattr(hyp, "slice_save_max_tile")
         if _tile_cap is None:
-            _tile_cap = int(getattr(hyp, "slice_save_max", 0))
+            _tile_cap = int(getattr(hyp, "slice_save_max"))
         dataset.slice_transform = OnlineSlice(
-            p=float(getattr(hyp, "slice_prob", 1.0)),
-            overlap_ratio=float(getattr(hyp, "slice_overlap_ratio", 0.2)),
-            min_area_ratio=float(getattr(hyp, "slice_min_tile_area_ratio", 0.005)),
-            min_retain_ratio=float(getattr(hyp, "slice_min_box_retain_ratio", 0.4)),
-            neg_ratio=float(getattr(hyp, "slice_background_ratio", 0.2)),
-            save_dir=str(getattr(hyp, "slice_save_dir", "") or ""),
+            p=float(getattr(hyp, "slice_prob")),
+            overlap_ratio=float(getattr(hyp, "slice_overlap_ratio")),
+            min_area_ratio=float(getattr(hyp, "slice_min_tile_area_ratio")),
+            min_retain_ratio=float(getattr(hyp, "slice_min_box_retain_ratio")),
+            neg_ratio=float(getattr(hyp, "slice_background_ratio")),
+            save_dir=str(getattr(hyp, "slice_save_dir") or ""),
             save_max=int(_tile_cap),
-            save_annotated=bool(getattr(hyp, "slice_save_annotated", True)),
-            exist_ok=bool(getattr(hyp, "slice_save_exist_ok", True)),
-            center_constraint=bool(getattr(hyp, "slice_center_constraint", False)),
-            min_center_ratio=float(getattr(hyp, "slice_min_center_retain_ratio", 0.6)),
-            full_box_only=bool(getattr(hyp, "slice_full_box_only", False)),
+            save_annotated=bool(getattr(hyp, "slice_save_annotated")),
+            exist_ok=bool(getattr(hyp, "slice_save_exist_ok")),
+            center_constraint=bool(getattr(hyp, "slice_center_constraint")),
+            min_center_ratio=float(getattr(hyp, "slice_min_center_retain_ratio")),
+            full_box_only=bool(getattr(hyp, "slice_full_box_only")),
             # 目标感知切缝 (方案1): 切缝按本图目标中心分布微移, 减少目标被劈碎
-            center_bias=bool(getattr(hyp, "slice_center_bias", False)),
-            bias_margin=float(getattr(hyp, "slice_bias_margin", 0.25)),
-            bias_jitter=float(getattr(hyp, "slice_bias_jitter", 0.05)),
+            center_bias=bool(getattr(hyp, "slice_center_bias")),
+            bias_margin=float(getattr(hyp, "slice_bias_margin")),
+            bias_jitter=float(getattr(hyp, "slice_bias_jitter")),
         )
-        dataset.slice_all_tiles = bool(getattr(hyp, "slice_all_tiles", False))
-        dataset.slice_ratio = float(getattr(hyp, "slice_ratio", 1.0))
+        dataset.slice_all_tiles = bool(getattr(hyp, "slice_all_tiles"))
+        dataset.slice_ratio = float(getattr(hyp, "slice_ratio"))
     else:
         dataset.slice_transform = None
         dataset.slice_all_tiles = False
@@ -3394,51 +3401,73 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
 
     # ---- 独立增强开关 (slice_keep_origin / compose_keep / ratio_pad_keep / blur_keep 互不影响,
     # 不受 slice_prob 控制; keep_origin 无切片时由 _keep_origin_on() 自动抑制) ----
-    dataset.slice_keep_origin = online_aug_on and bool(getattr(hyp, "slice_keep_origin", False))
+    dataset.slice_keep_origin = online_aug_on and bool(getattr(hyp, "slice_keep_origin"))
     # ---- 独立增强开关 (compose_keep / ratio_pad_keep / blur_keep 互不影响, 不受 slice_prob 控制) ----
     # compose/ratio/blur 不需要切片或 keep_origin, 单独开启即生效(见 _segment_bases 区段布局)。
-    dataset.compose_keep = online_aug_on and bool(getattr(hyp, "compose_keep", False))
-    dataset.compose_save = online_aug_on and bool(getattr(hyp, "compose_save", False))
-    dataset.compose_save_dir = str(getattr(hyp, "compose_save_dir", "") or "")
-    dataset.compose_max_side = int(getattr(hyp, "compose_max_side", 0) or 0)
-    dataset.ratio_pad_keep = online_aug_on and bool(getattr(hyp, "ratio_pad_keep", False))
-    dataset.ratio_pad_target = str(getattr(hyp, "ratio_pad_target", "auto") or "auto")
-    dataset.ratio_pad_color = str(getattr(hyp, "ratio_pad_color", "black") or "black")
-    dataset.ratio_pad_save_dir = str(getattr(hyp, "ratio_pad_save_dir", "") or "")
-    dataset.blur_keep = online_aug_on and bool(getattr(hyp, "blur_keep", False))
-    dataset.blur_short_len_min = float(getattr(hyp, "blur_short_len_min", 5))
-    dataset.blur_short_len_max = float(getattr(hyp, "blur_short_len_max", 12))
-    dataset.blur_long_len_min = float(getattr(hyp, "blur_long_len_min", 20))
-    dataset.blur_long_len_max = float(getattr(hyp, "blur_long_len_max", 35))
-    dataset.blur_long_defocus_sigma = float(getattr(hyp, "blur_long_defocus_sigma", 1.0))
-    dataset.blur_save_dir = str(getattr(hyp, "blur_save_dir", "") or "")
+    dataset.compose_keep = online_aug_on and bool(getattr(hyp, "compose_keep"))
+    dataset.compose_save = online_aug_on and bool(getattr(hyp, "compose_save"))
+    dataset.compose_save_dir = str(getattr(hyp, "compose_save_dir") or "")
+    dataset.compose_max_side = int(getattr(hyp, "compose_max_side") or 0)
+    dataset.ratio_pad_keep = online_aug_on and bool(getattr(hyp, "ratio_pad_keep"))
+    dataset.ratio_pad_target = str(getattr(hyp, "ratio_pad_target") or "auto")
+    dataset.ratio_pad_color = str(getattr(hyp, "ratio_pad_color") or "black")
+    dataset.ratio_pad_save_dir = str(getattr(hyp, "ratio_pad_save_dir") or "")
+    dataset.blur_keep = online_aug_on and bool(getattr(hyp, "blur_keep"))
+    dataset.blur_short_len_min = float(getattr(hyp, "blur_short_len_min"))
+    dataset.blur_short_len_max = float(getattr(hyp, "blur_short_len_max"))
+    dataset.blur_long_len_min = float(getattr(hyp, "blur_long_len_min"))
+    dataset.blur_long_len_max = float(getattr(hyp, "blur_long_len_max"))
+    dataset.blur_long_defocus_sigma = float(getattr(hyp, "blur_long_defocus_sigma"))
+    dataset.blur_save_dir = str(getattr(hyp, "blur_save_dir") or "")
     # ---- 在线气象退化 (weather_*): 雨/雾/噪声, 标签不变, 独立开关 + epoch 级比例 (复用掩码机制) ----
-    dataset.weather_keep = online_aug_on and bool(getattr(hyp, "weather_keep", False))
-    dataset.weather_ratio = float(getattr(hyp, "weather_ratio", 0.5))
-    dataset.weather_types = str(getattr(hyp, "weather_types", "rain,haze,noise") or "rain,haze,noise")
-    dataset.weather_rain_density = float(getattr(hyp, "weather_rain_density", 0.15))
-    dataset.weather_rain_length = float(getattr(hyp, "weather_rain_length", 15.0))
-    dataset.weather_haze_beta = float(getattr(hyp, "weather_haze_beta", 0.4))
-    dataset.weather_noise_std = float(getattr(hyp, "weather_noise_std", 15.0))
-    dataset.weather_save_dir = str(getattr(hyp, "weather_save_dir", "") or "")
+    dataset.weather_keep = online_aug_on and bool(getattr(hyp, "weather_keep"))
+    dataset.weather_ratio = float(getattr(hyp, "weather_ratio"))
+    dataset.weather_types = str(getattr(hyp, "weather_types") or "rain,haze,noise")
+    dataset.weather_rain_density = float(getattr(hyp, "weather_rain_density"))
+    dataset.weather_rain_length = float(getattr(hyp, "weather_rain_length"))
+    dataset.weather_haze_beta = float(getattr(hyp, "weather_haze_beta"))
+    dataset.weather_noise_std = float(getattr(hyp, "weather_noise_std"))
+    dataset.weather_save_dir = str(getattr(hyp, "weather_save_dir") or "")
     # ---- 在线遮挡模拟 (occlusion_*): rect/stripe 语义遮挡块, 标签不变(超阈值目标剔除), 独立开关 + epoch 比例 ----
-    dataset.occlusion_keep = online_aug_on and bool(getattr(hyp, "occlusion_keep", False))
-    dataset.occlusion_ratio = float(getattr(hyp, "occlusion_ratio", 0.5))
-    dataset.occlusion_types = str(getattr(hyp, "occlusion_types", "rect,stripe") or "rect,stripe")
-    dataset.occlusion_blocks = int(getattr(hyp, "occlusion_blocks", 1) or 1)
-    dataset.occlusion_size_ratio = float(getattr(hyp, "occlusion_size_ratio", 0.1))
-    dataset.occlusion_color = str(getattr(hyp, "occlusion_color", "auto") or "auto")
-    dataset.occlusion_max_cover = float(getattr(hyp, "occlusion_max_cover", 0.95))
-    dataset.occlusion_save_dir = str(getattr(hyp, "occlusion_save_dir", "") or "")
+    dataset.occlusion_keep = online_aug_on and bool(getattr(hyp, "occlusion_keep"))
+    dataset.occlusion_ratio = float(getattr(hyp, "occlusion_ratio"))
+    dataset.occlusion_types = str(getattr(hyp, "occlusion_types") or "rect,stripe")
+    dataset.occlusion_blocks = int(getattr(hyp, "occlusion_blocks") or 1)
+    dataset.occlusion_size_ratio = float(getattr(hyp, "occlusion_size_ratio"))
+    dataset.occlusion_color = str(getattr(hyp, "occlusion_color") or "auto")
+    dataset.occlusion_max_cover = float(getattr(hyp, "occlusion_max_cover"))
+    dataset.occlusion_save_dir = str(getattr(hyp, "occlusion_save_dir") or "")
+    # M4 fix: weather/occlusion 类型白名单校验 (拼错立即在构造期报错, 不再静默落入默认分支)。
+    # 与 base.py 的 _WEATHER_TYPES / _OCCLUSION_TYPES 及 _apply_weather / _apply_occlusion 分派一致;
+    # 空串回退默认类型 (与 base.py 运行时行为一致)。
+    from ultralytics.data.base import _OCCLUSION_TYPES, _WEATHER_TYPES
+
+    _w = [t.strip() for t in dataset.weather_types.split(",") if t.strip()]
+    _bad = sorted(set(_w) - _WEATHER_TYPES)
+    if _bad:
+        raise ValueError(
+            f"weather_types contains unknown type(s) {_bad}; valid types: {sorted(_WEATHER_TYPES)}."
+        )
+    dataset.weather_types = ",".join(_w) if _w else "haze"
+    _o = [t.strip() for t in dataset.occlusion_types.split(",") if t.strip()]
+    _bad = sorted(set(_o) - _OCCLUSION_TYPES)
+    if _bad:
+        raise ValueError(
+            f"occlusion_types contains unknown type(s) {_bad}; valid types: {sorted(_OCCLUSION_TYPES)}."
+        )
+    dataset.occlusion_types = ",".join(_o) if _o else "rect"
     # P2-3: per-branch save cap overrides (slice_save_max_{tile,blur,ratio,compose}).
     # base.py's _save_cap() reads these from `self`; if not set here it falls back to slice_save_max.
     # Keep tile in sync with the legacy `save_max` passed to OnlineSlice above.
-    dataset.slice_save_max_tile = getattr(hyp, "slice_save_max_tile", None)
-    dataset.slice_save_max_blur = getattr(hyp, "slice_save_max_blur", None)
-    dataset.slice_save_max_ratio = getattr(hyp, "slice_save_max_ratio", None)
-    dataset.slice_save_max_compose = getattr(hyp, "slice_save_max_compose", None)
-    dataset.slice_save_max_weather = getattr(hyp, "slice_save_max_weather", None)
-    dataset.slice_save_max_occlusion = getattr(hyp, "slice_save_max_occlusion", None)
+    dataset.slice_save_max_tile = getattr(hyp, "slice_save_max_tile")
+    dataset.slice_save_max_blur = getattr(hyp, "slice_save_max_blur")
+    dataset.slice_save_max_ratio = getattr(hyp, "slice_save_max_ratio")
+    dataset.slice_save_max_compose = getattr(hyp, "slice_save_max_compose")
+    dataset.slice_save_max_weather = getattr(hyp, "slice_save_max_weather")
+    dataset.slice_save_max_occlusion = getattr(hyp, "slice_save_max_occlusion")
+    # L5: 全局画框开关与切片解耦 —— 各在线分支 (blur/ratio/weather/occlusion/compose) 的保存块
+    # 统一只读 dataset 属性, 不再依赖 slice_transform 实例 (slice_transform=None 时亦可保存)。
+    dataset.slice_save_annotated = bool(getattr(hyp, "slice_save_annotated"))
 
     if hyp.copy_paste_mode == "flip":
         pre_transform.insert(1, CopyPaste(dataset, p=hyp.copy_paste, mode=hyp.copy_paste_mode))

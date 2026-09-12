@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import bisect
 import glob
 import math
+import multiprocessing
 import os
 import random
+import zlib
 from copy import deepcopy
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, NamedTuple
 
 import cv2
 import numpy as np
@@ -122,14 +125,22 @@ def _apply_weather(img: np.ndarray, wtype: str, rain_density: float = 0.15, rain
         n = max(1, int(rain_density * max(h, w)))
         ang = math.radians(20.0)
         dx, dy = math.sin(ang), math.cos(ang)
+        # L1 fix: 向量化生成 n 条线段端点, 按厚度分两批 cv2.polylines 一次画完。
+        # 旧实现逐根 cv2.line (大图 density=0.15*4000px ≈ 600 次 Python->C 调用/样本,
+        # 比向量化的 haze/noise 慢 1-2 个量级)。线段数量/位置/长度/厚度分布语义不变。
+        x0s = np.random.uniform(0.0, float(w), size=n)
+        y0s = np.random.uniform(0.0, float(h), size=n)
+        lens = rain_length * np.random.uniform(0.5, 1.0, size=n)
+        x1s = np.clip(x0s - dx * lens, 0.0, float(w))
+        y1s = np.clip(y0s - dy * lens, 0.0, float(h))
+        pts = np.stack([np.stack([x0s, y0s], axis=1), np.stack([x1s, y1s], axis=1)], axis=1).astype(np.int32)
+        thick2 = np.random.rand(n) < 0.5  # ~一半厚度 2, 一半厚度 1 (与原 random.choice((1,2)) 一致)
         overlay = img.copy()
-        for _ in range(n):
-            x0 = random.uniform(0.0, float(w))
-            y0 = random.uniform(0.0, float(h))
-            length = rain_length * random.uniform(0.5, 1.0)
-            cv2.line(overlay, (int(round(x0)), int(round(y0))),
-                     (int(round(x0 - dx * length)), int(round(y0 - dy * length))),
-                     (205, 205, 225), thickness=random.choice((1, 2)), lineType=cv2.LINE_AA)
+        for t in (1, 2):
+            batch = pts[thick2] if t == 2 else pts[~thick2]
+            if len(batch):
+                cv2.polylines(overlay, [p for p in batch], isClosed=False, color=(205, 205, 225),
+                              thickness=t, lineType=cv2.LINE_AA)
         alpha = random.uniform(0.2, 0.6)
         return cv2.addWeighted(img, 1.0 - alpha, overlay, alpha, 0)
     if wtype == "haze":
@@ -167,7 +178,9 @@ def _apply_occlusion(
     rng_color = "auto"
     # auto color: mean of the darkest ~25% pixels (per-channel), a plausible tree/shadow tone
     if color == "auto":
-        flat = img.reshape(-1, img.shape[2])
+        # L2 fix: 旧实现 reshape 全图(1200万像素)后 np.quantile 全量排序, 大图每样本约 1-2s 纯浪费;
+        # 改为大步长均匀采样 (步长 37 为素数, 与图像行宽互质, 覆盖全图任意偏移), ~32 万像素足够稳定估计 25 分位。
+        flat = img.reshape(-1, img.shape[2])[::37]
         q = np.quantile(flat, 0.25, axis=0)
         rng_color = tuple(int(round(float(v))) for v in q)
     elif color == "black":
@@ -253,6 +266,39 @@ def _save_cap(dataset, branch: str) -> int:
     if val is None:
         val = getattr(dataset, "slice_save_max", 0) or 0
     return int(val)
+
+
+# M2/M3: epoch 级比例参数的默认值唯一事实源。default.yaml 是训练侧的权威默认; 这里只在
+# dataset 脱离 v8_transforms 直接构造时兜底, 任何一处改动都必须与 default.yaml 同步。
+_RATIO_DEFAULTS: dict[str, float] = {
+    "slice_ratio": 1.0,
+    "ratio_pad_ratio": 1.0,
+    "blur_ratio": 1.0,
+    "compose_ratio": 1.0,
+    "weather_ratio": 0.5,
+    "occlusion_ratio": 0.5,
+}
+
+# M4: weather/occlusion 类型的合法集合 (与 _apply_weather / _apply_occlusion 的分派一致)。
+_WEATHER_TYPES: frozenset[str] = frozenset({"rain", "haze", "noise"})
+_OCCLUSION_TYPES: frozenset[str] = frozenset({"rect", "stripe"})
+
+
+class SegmentBases(NamedTuple):
+    """Mixed-pool segment boundaries (M5 refactor: named fields instead of a bare 8-tuple).
+
+    Field order equals the legacy tuple order, so position-unpacking call sites remain valid;
+    new code should prefer the named fields to avoid mis-ordering bugs.
+    """
+
+    base: int
+    origin: int
+    ratio: int
+    blur: int
+    compose: int
+    weather: int
+    occlusion: int
+    total: int
 
 
 
@@ -401,6 +447,25 @@ class BaseDataset(Dataset):
         self._weather_mask = None
         self._occlusion_mask = None
         self._compose_mask = None
+        # S5 fix: cross-process epoch channel for DataLoader workers. InfiniteDataLoader spawns its
+        # workers ONCE at loader construction -- BEFORE any set_epoch -- and reuses them for the
+        # whole run (reset() fires only at the close_mosaic epoch), so worker-side dataset copies
+        # never see main-process mask rebuilds, on Windows spawn AND Linux fork alike. The trainer's
+        # set_epoch publishes the epoch through these shared ints; each worker notices the change
+        # lazily in get_image_and_label (see _sync_epoch_masks) and rebuilds its own masks
+        # deterministically. None => channel unavailable; behavior degrades to pre-fix semantics.
+        try:
+            self._mp_epoch = multiprocessing.Value("i", -1)
+            self._mp_epochs = multiprocessing.Value("i", -1)
+        except Exception:
+            self._mp_epoch = None
+            self._mp_epochs = None
+        # Epoch stamp of the masks/counters currently built in THIS process (-1 = none built yet).
+        self._mask_stamp = -1
+        # Per-epoch mask RNG seed: derived from the file list only (stable across processes, runs
+        # and PYTHONHASHSEED), so every process rebuilding masks for the same epoch derives
+        # IDENTICAL masks without transporting them (see _rebuild_epoch_masks).
+        self._mask_seed = zlib.crc32("\n".join(self.im_files).encode("utf-8", "ignore"))
 
         # Cache images (options are cache = True, False, None, "ram", "disk")
         self.ims, self.im_hw0, self.im_hw = [None] * self.ni, [None] * self.ni, [None] * self.ni
@@ -721,28 +786,46 @@ class BaseDataset(Dataset):
         return self.transforms(self.get_image_and_label(index))
 
     def set_epoch(self, epoch: int = 0, epochs: int | None = None) -> None:
-        """Rebuild per-epoch masks for exact-ratio ORIGINAL-level augmentation selection.
+        """Publish the epoch and rebuild this process's per-epoch masks (trainer / main-process entry).
 
-        Exactly ``round(x * N)`` ORIGINAL images are randomly chosen this epoch for each
-        image-level branch (slice_ratio / ratio_pad_ratio / blur_ratio; blur 短+长 同命运),
-        and ``round(x * ceil(N/4))`` 4-image GROUPS for compose_ratio. Un-selected positions keep
-        their segment slot but fall back to the ORIGINAL full image (len stays constant; same
-        principle as the mode-A background fallback). Resampled every epoch by the trainer
-        (``trainer.py`` calls ``dataset.set_epoch(epoch, epochs)`` at each epoch start).
+        Called by ``trainer.py`` at each epoch start. The epoch (and the total ``epochs``, needed by
+        ``close_aug_epoch``) is published through shared memory so ALREADY-RUNNING DataLoader workers
+        can pick it up -- see ``_sync_epoch_masks``. This process's masks are rebuilt immediately
+        (the workers=0 / direct-iteration paths read them right here).
 
-        Mask = None (all augmented / branch off) when the branch is off or its ratio >= 1.
-
-        ``close_aug_epoch`` (direction A, close_mosaic-style time schedule): during the final N
-        epochs, ALL online augmentations (slice / compose / ratio_pad / blur / weather) are
-        disabled -- every mask is an all-False array, so every segment falls back to its ORIGINAL
-        full image (slot kept, content replaced, ``len`` constant). ``epochs`` is passed by the
-        trainer so the dataset does not need to know the training schedule itself.
+        Mask semantics per branch (unchanged): exactly ``round(x * N)`` ORIGINAL images are randomly
+        chosen each epoch (``round(x * ceil(N/4))`` groups for compose); un-selected slots keep their
+        segment position but fall back to the ORIGINAL full image (``len`` constant). Mask = None
+        (all augmented / branch off) when the branch is off or its ratio >= 1. ``close_aug_epoch``:
+        during the final N epochs all masks become all-False so every segment falls back to the
+        original image.
         """
-        # P3 fix: reset OnlineSlice's positive/background counters every epoch so the neg_ratio
-        # background quota restarts per epoch instead of accumulating monotonically across epochs
-        # (later epochs would otherwise keep ever fewer background tiles). Like the slice mask,
-        # the reset propagates to DataLoader workers via fork inheritance (same architectural
-        # assumption as the mask rebuild).
+        if self._mp_epoch is not None:
+            try:
+                self._mp_epoch.value = int(epoch)
+                self._mp_epochs.value = int(epochs) if epochs is not None else -1
+            except Exception:  # e.g. called inside a worker process; workers rebuild via _sync instead
+                pass
+        self._rebuild_epoch_masks(epoch, epochs)
+
+    def _rebuild_epoch_masks(self, epoch: int, epochs: int | None = None) -> None:
+        """(Re)build the per-epoch masks and reset the OnlineSlice counters for ``epoch``.
+
+        Deterministic per (dataset, epoch, epochs): masks are drawn from an RNG seeded ONLY by
+        ``(_mask_seed, epoch, epochs)`` -- NOT from the global ``random`` stream -- so the main
+        process and every DataLoader worker rebuilding the same epoch derive IDENTICAL masks with no
+        cross-process mask transport (S5). A worker that missed epochs and rebuilds late therefore
+        still produces exactly the masks of the current epoch. ``_mask_stamp`` is bumped first: the
+        rebuild is idempotent for a given (epoch, epochs) pair.
+        """
+        self._mask_stamp = int(epoch)
+        rng = random.Random(f"{self._mask_seed}:{int(epoch)}:{-1 if epochs is None else int(epochs)}")
+        # P3 fix (comment corrected by S5): reset OnlineSlice's positive/background counters every
+        # epoch so the neg_ratio background quota restarts per epoch instead of accumulating
+        # monotonically. The reset used to claim it "propagates to workers via fork inheritance" --
+        # it does not: InfiniteDataLoader forks/spawns workers once at construction, BEFORE any
+        # set_epoch. The reset now runs in EVERY process that rebuilds (main via set_epoch, each
+        # worker via _sync_epoch_masks).
         st = getattr(self, "slice_transform", None)
         if st is not None and hasattr(st, "reset_counters"):
             st.reset_counters()
@@ -758,61 +841,61 @@ class BaseDataset(Dataset):
             self._occlusion_mask = np.zeros(n, dtype=bool)
             self._compose_mask = np.zeros((n + 3) // 4, dtype=bool)
             return
-        # --- slice (original-level) ---
-        x = float(getattr(self, "slice_ratio", 1.0))
-        if aug_on and getattr(self, "slice_transform", None) is not None and 0.0 <= x < 1.0:
-            mask = np.zeros(n, dtype=bool)
-            if x > 0:
-                mask[random.sample(range(n), int(round(x * n)))] = True
-            self._slice_mask = mask
-        else:
-            self._slice_mask = None
-        # --- ratio_pad (original-level) ---
-        x = float(getattr(self, "ratio_pad_ratio", 1.0))
-        if aug_on and bool(getattr(self, "ratio_pad_keep", False)) and 0.0 <= x < 1.0:
-            mask = np.zeros(n, dtype=bool)
-            if x > 0:
-                mask[random.sample(range(n), int(round(x * n)))] = True
-            self._ratio_mask = mask
-        else:
-            self._ratio_mask = None
-        # --- blur (original-level, short+long same fate) ---
-        x = float(getattr(self, "blur_ratio", 1.0))
-        if aug_on and bool(getattr(self, "blur_keep", False)) and 0.0 <= x < 1.0:
-            mask = np.zeros(n, dtype=bool)
-            if x > 0:
-                mask[random.sample(range(n), int(round(x * n)))] = True
-            self._blur_mask = mask
-        else:
-            self._blur_mask = None
-        # --- compose (group-level) ---
-        x = float(getattr(self, "compose_ratio", 1.0))
-        if aug_on and self._compose_on() and 0.0 <= x < 1.0:
-            n_groups = (n + 3) // 4
-            mask = np.zeros(n_groups, dtype=bool)
-            if x > 0:
-                mask[random.sample(range(n_groups), int(round(x * n_groups)))] = True
-            self._compose_mask = mask
-        else:
-            self._compose_mask = None
-        # --- weather (original-level) ---
-        x = float(getattr(self, "weather_ratio", 0.5))
-        if aug_on and self._weather_on() and 0.0 <= x < 1.0:
-            mask = np.zeros(n, dtype=bool)
-            if x > 0:
-                mask[random.sample(range(n), int(round(x * n)))] = True
-            self._weather_mask = mask
-        else:
-            self._weather_mask = None
-        # --- occlusion (original-level) ---
-        x = float(getattr(self, "occlusion_ratio", 0.5))
-        if aug_on and self._occlusion_on() and 0.0 <= x < 1.0:
-            mask = np.zeros(n, dtype=bool)
-            if x > 0:
-                mask[random.sample(range(n), int(round(x * n)))] = True
-            self._occlusion_mask = mask
-        else:
-            self._occlusion_mask = None
+        # --- 表驱动 (M2): 六条增强分支共享同构的"掩码 = round(x*count) 个随机位"逻辑。
+        # 差异点只有: 开关谓词 / 比例属性 / 样本数 (compose 是组级 (n+3)//4, 其余原图级 n)。
+        # 未选中位保留区段位置但回退原图 (len 恒定); 分支关闭或比例 >=1 时掩码为 None (全增强)。
+        for attr, ratio_attr, on_fn, count in self._mask_specs(n):
+            x = float(getattr(self, ratio_attr, _RATIO_DEFAULTS[ratio_attr]))
+            mask = None
+            if aug_on and on_fn() and 0.0 <= x < 1.0:
+                mask = np.zeros(count, dtype=bool)
+                if x > 0:
+                    mask[rng.sample(range(count), int(round(x * count)))] = True
+            setattr(self, f"_{attr}_mask", mask)
+
+    def _mask_specs(self, n: int) -> list[tuple[str, str, Callable[[], bool], int]]:
+        """Table-driven per-epoch mask construction (M2 refactor).
+
+        Each row: (mask attr suffix, ratio attr, branch-on predicate, sample count). compose is
+        GROUP-level -- ``ceil(N/4)`` groups -- while every other branch is original-level (``N``).
+        Ratios fall back to ``_RATIO_DEFAULTS`` only when the dataset was built without
+        ``v8_transforms`` (training always copies them from default.yaml).
+        """
+        return [
+            ("slice", "slice_ratio", lambda: getattr(self, "slice_transform", None) is not None, n),
+            ("ratio", "ratio_pad_ratio", lambda: bool(getattr(self, "ratio_pad_keep", False)), n),
+            ("blur", "blur_ratio", lambda: bool(getattr(self, "blur_keep", False)), n),
+            ("compose", "compose_ratio", self._compose_on, (n + 3) // 4),
+            ("weather", "weather_ratio", self._weather_on, n),
+            ("occlusion", "occlusion_ratio", self._occlusion_on, n),
+        ]
+
+    def _sync_epoch_masks(self) -> None:
+        """Rebuild this process's masks when the trainer published a NEW epoch through shared memory.
+
+        This is what makes ``set_epoch`` effective inside DataLoader workers at all (S5 fix):
+        InfiniteDataLoader spawns workers once at loader construction -- before any set_epoch -- and
+        reuses them for the whole run, so they can never observe the trainer's main-process calls.
+        Each worker polls the shared epoch on every ``__getitem__`` (one locked int read) and
+        rebuilds only on change; the rebuild is deterministic per epoch, so the worker's masks always
+        match the main process's. Same-process callers (workers=0 / direct iteration) pay the int
+        read and never rebuild here because ``set_epoch`` already rebuilt them.
+        """
+        v = self._mp_epoch
+        if v is None or not self.augment:
+            return
+        try:
+            epoch = v.value
+        except Exception:
+            return
+        if epoch < 0 or epoch == self._mask_stamp:
+            return
+        ev = self._mp_epochs
+        try:
+            epochs = ev.value if ev is not None else -1
+        except Exception:
+            epochs = -1
+        self._rebuild_epoch_masks(epoch, epochs if epochs >= 0 else None)
 
     def _n_per(self) -> int:
         """Single source of truth: how many samples each ORIGINAL image expands to in the BASE segment.
@@ -855,8 +938,68 @@ class BaseDataset(Dataset):
         """True when the occlusion branch allocates samples (occlusion_keep independent switch)."""
         return bool(getattr(self, "occlusion_keep", False))
 
-    def _segment_bases(self) -> tuple[int, int, int, int, int, int, int]:
-        """Return the seven segment boundaries of the mixed sample pool.
+    def _save_annotated(self, branch: str, cdir, img: np.ndarray, boxes, cls, fname_body: str,
+                        key: tuple, save_annotated: bool) -> None:
+        """Shared annotated-save block for the online branches (M1 refactor).
+
+        Draws green boxes + class labels when ``save_annotated`` and boxes exist, then writes
+        ``<cdir>/<fname_body>_{seq:05d}_n{len(boxes)}.jpg``. Deduplicated per ``key`` across
+        epochs and capped by the per-branch save cap (``_save_cap``). Counter state lives on
+        ``self._{branch}_saved`` / ``self._{branch}_saved_keys`` (lazily created on first call).
+        The counter advances only when the write actually succeeds.
+        """
+        cnt = getattr(self, f"_{branch}_saved", None)
+        if cnt is None:
+            cnt = 0
+            setattr(self, f"_{branch}_saved", cnt)
+            setattr(self, f"_{branch}_saved_keys", set())
+        keys = getattr(self, f"_{branch}_saved_keys")
+        save_cap = _save_cap(self, branch)
+        if key in keys or (save_cap != 0 and cnt >= save_cap):
+            return
+        out = img
+        boxes_arr = np.asarray(boxes, dtype=np.float64)
+        if save_annotated and len(boxes_arr):
+            out = img.copy()
+            H2, W2 = img.shape[:2]
+            cls_arr = np.asarray(cls).reshape(-1)
+            for b, c in zip(boxes_arr, cls_arr):
+                cx, cy, bw, bh = (float(v) for v in b)
+                x0 = int(round((cx - bw / 2) * W2))
+                y0 = int(round((cy - bh / 2) * H2))
+                x1 = int(round((cx + bw / 2) * W2))
+                y1 = int(round((cy + bh / 2) * H2))
+                cv2.rectangle(out, (x0, y0), (x1, y1), (0, 255, 0), 2)
+                cv2.putText(out, f"cls{int(c)}", (x0, max(0, y0 - 4)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        _ensure_dir(cdir)
+        if _imwrite(cdir / f"{fname_body}_{cnt:05d}_n{len(boxes_arr)}.jpg", out):
+            setattr(self, f"_{branch}_saved", cnt + 1)
+            keys.add(key)
+
+    def _finalize_label(self, label: dict[str, Any], img: np.ndarray) -> dict[str, Any]:
+        """Resize ``img`` to the training size and attach ori_shape / resized_shape / ratio_pad.
+
+        Shared tail of every online-augmentation branch (blur / weather / occlusion / ratio /
+        compose). Kept in one place so resizing semantics cannot drift between branches (M1).
+        """
+        h1, w1 = img.shape[:2]
+        r = self.imgsz / max(h1, w1)
+        if r != 1:
+            img = cv2.resize(img, (math.ceil(w1 * r), math.ceil(h1 * r)), interpolation=cv2.INTER_LINEAR)
+        if img.ndim == 2:
+            img = img[..., None]
+        label["img"] = np.ascontiguousarray(img)
+        label["ori_shape"] = (h1, w1)
+        label["resized_shape"] = img.shape[:2]
+        label["ratio_pad"] = (
+            label["resized_shape"][0] / label["ori_shape"][0],
+            label["resized_shape"][1] / label["ori_shape"][1],
+        )
+        return self.update_labels_info(label)
+
+    def _segment_bases(self) -> SegmentBases:
+        """Return the seven segment boundaries of the mixed sample pool, plus the pool total.
 
         Layout (each optional branch is an independent, contiguous segment gated ONLY by its own
         switch; slicing lives entirely inside the base segment):
@@ -868,18 +1011,26 @@ class BaseDataset(Dataset):
             [base_len+4N+ceil(N/4), +N)   weather:   1 rain/haze/noise-degraded image per original
             [...+N, +N)                   occlusion: 1 rect/stripe-occluded image per original
 
-        Returns (base_len, origin_base, ratio_base, blur_base, compose_base, weather_base,
-        occlusion_base).
+        Returns a :class:`SegmentBases` named tuple (base, origin, ratio, blur, compose, weather,
+        occlusion, total). ``total`` is derived from the SAME per-segment lengths as the
+        boundaries, and ``__len__`` returns it verbatim -- the pool length and the decodable
+        index range therefore share one source of truth and can never drift apart. (M5)
         """
         n = len(self.labels)
-        base_len = n * self._n_per()
-        o_base = base_len  # origin segment starts right after the base slicing segment
-        r_base = o_base + (n if self._keep_origin_on() else 0)
-        b_base = r_base + (n if bool(getattr(self, "ratio_pad_keep", False)) else 0)
-        c_base = b_base + (2 * n if bool(getattr(self, "blur_keep", False)) else 0)
-        w_base = c_base + ((n + 3) // 4 if self._compose_on() else 0)
-        oc_base = w_base + (n if self._weather_on() else 0)
-        return base_len, o_base, r_base, b_base, c_base, w_base, oc_base
+        base_len = n * self._n_per()  # base segment: the slicing pipeline's samples
+        seg_lens = [
+            n if self._keep_origin_on() else 0,  # origin
+            n if bool(getattr(self, "ratio_pad_keep", False)) else 0,  # ratio
+            2 * n if bool(getattr(self, "blur_keep", False)) else 0,  # blur (short + long)
+            (n + 3) // 4 if self._compose_on() else 0,  # compose (groups of 4)
+            n if self._weather_on() else 0,  # weather
+            n if self._occlusion_on() else 0,  # occlusion
+        ]
+        bases = [base_len]
+        for seg in seg_lens:
+            bases.append(bases[-1] + seg)
+        *boundaries, total = bases
+        return SegmentBases(base_len, *boundaries, total)
 
     def _origin_at(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one un-sliced ORIGINAL-resolution sample (slice_keep_origin independent segment).
@@ -1031,53 +1182,19 @@ class BaseDataset(Dataset):
         # slice_save_annotated, capped by slice_save_max_blur (P2-3: per-branch override; falls back to
         # slice_save_max when the per-branch cap is not set), deduplicated per (image, tier) across epochs.
         sdir = str(getattr(self, "blur_save_dir", "") or "")
-        st = getattr(self, "slice_transform", None)
-        if sdir and st is not None:
+        if sdir:
             cdir = Path(sdir)
-            if not hasattr(self, "_blur_saved"):
-                self._blur_saved = 0
-                self._blur_saved_keys = set()
             key = ("blur", tier, index)
-            save_cap = _save_cap(self, "blur")
-            if key not in self._blur_saved_keys and (save_cap == 0 or self._blur_saved < save_cap):
-                _ensure_dir(cdir)
-                img = blur
-                boxes = np.asarray(label.get("bboxes", np.empty((0, 4))), dtype=np.float64)
-                if st.save_annotated and len(boxes):
-                    img = blur.copy()
-                    H2, W2 = blur.shape[:2]
-                    cls = np.asarray(label.get("cls", np.empty((0, 1))))
-                    for b, c in zip(boxes, np.asarray(cls).reshape(-1)):
-                        cx, cy, bw, bh = (float(v) for v in b)
-                        x0 = int(round((cx - bw / 2) * W2))
-                        y0 = int(round((cy - bh / 2) * H2))
-                        x1 = int(round((cx + bw / 2) * W2))
-                        y1 = int(round((cy + bh / 2) * H2))
-                        cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                        cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                # p{pid}: counters are per-worker, so two workers can emit the same sequence number.
-                # img{img_index} already disambiguates in practice, but Mosaic proved the pattern is fragile.
-                _imwrite(cdir / f"blur_{tier}_p{os.getpid()}_img{img_index}_"
-                                f"{self._blur_saved:05d}_n{len(boxes)}.jpg", img)
-                self._blur_saved += 1
-                self._blur_saved_keys.add(key)
+            # M1: 画框/去重/限额/命名抽到 _save_annotated; 计数仅在写入成功时前进。
+            self._save_annotated(
+                "blur", cdir, blur,
+                label.get("bboxes", np.empty((0, 4))), label.get("cls", np.empty((0, 1))),
+                f"blur_{tier}_p{os.getpid()}_img{img_index}", key,
+                bool(getattr(self, "slice_save_annotated", True)),
+            )
 
-        # Resize to the training size (same as the sliced / original / ratio / composed branches)
-        h1, w1 = blur.shape[:2]
-        r = self.imgsz / max(h1, w1)
-        if r != 1:
-            blur = cv2.resize(blur, (math.ceil(w1 * r), math.ceil(h1 * r)), interpolation=cv2.INTER_LINEAR)
-        if blur.ndim == 2:
-            blur = blur[..., None]
-        label["img"] = np.ascontiguousarray(blur)
-        label["ori_shape"] = (h1, w1)
-        label["resized_shape"] = blur.shape[:2]
-        label["ratio_pad"] = (
-            label["resized_shape"][0] / label["ori_shape"][0],
-            label["resized_shape"][1] / label["ori_shape"][1],
-        )
-        return self.update_labels_info(label)
+        # Resize to the training size (M1: shared tail)
+        return self._finalize_label(label, blur)
 
     def _weather_at(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one in-memory weather-degraded image (rain / haze / Gaussian noise) from an original.
@@ -1128,52 +1245,20 @@ class BaseDataset(Dataset):
         # deduplicated per (image, wtype) across epochs. Saving does NOT depend on the slicing
         # pipeline (slice_transform may be None when slice_prob=0): weather_save_dir alone enables it.
         sdir = str(getattr(self, "weather_save_dir", "") or "")
-        st = getattr(self, "slice_transform", None)
         if sdir:
             cdir = Path(sdir)
-            if not hasattr(self, "_weather_saved"):
-                self._weather_saved = 0
-                self._weather_saved_keys = set()
             key = ("weather", wtype, index)
-            save_cap = _save_cap(self, "weather")
-            if key not in self._weather_saved_keys and (save_cap == 0 or self._weather_saved < save_cap):
-                _ensure_dir(cdir)
-                img = out
-                boxes = np.asarray(label.get("bboxes", np.empty((0, 4))), dtype=np.float64)
-                save_annotated = bool(getattr(st, "save_annotated", True)) if st is not None else True
-                if save_annotated and len(boxes):
-                    img = out.copy()
-                    H2, W2 = out.shape[:2]
-                    cls = np.asarray(label.get("cls", np.empty((0, 1))))
-                    for b, c in zip(boxes, np.asarray(cls).reshape(-1)):
-                        cx, cy, bw, bh = (float(v) for v in b)
-                        x0 = int(round((cx - bw / 2) * W2))
-                        y0 = int(round((cy - bh / 2) * H2))
-                        x1 = int(round((cx + bw / 2) * W2))
-                        y1 = int(round((cy + bh / 2) * H2))
-                        cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                        cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                _imwrite(cdir / f"weather_{wtype}_p{os.getpid()}_img{img_index}_"
-                                f"{self._weather_saved:05d}_n{len(boxes)}.jpg", img)
-                self._weather_saved += 1
-                self._weather_saved_keys.add(key)
+            # M1: 画框/去重/限额/命名抽到 _save_annotated。保存不依赖切片管线
+            # (slice_transform 可能为 None), save_annotated 此时按 True 兜底。
+            self._save_annotated(
+                "weather", cdir, out,
+                label.get("bboxes", np.empty((0, 4))), label.get("cls", np.empty((0, 1))),
+                f"weather_{wtype}_p{os.getpid()}_img{img_index}", key,
+                bool(getattr(self, "slice_save_annotated", True)),
+            )
 
-        # Resize to the training size (same as the other online branches)
-        h1, w1 = out.shape[:2]
-        r = self.imgsz / max(h1, w1)
-        if r != 1:
-            out = cv2.resize(out, (math.ceil(w1 * r), math.ceil(h1 * r)), interpolation=cv2.INTER_LINEAR)
-        if out.ndim == 2:
-            out = out[..., None]
-        label["img"] = np.ascontiguousarray(out)
-        label["ori_shape"] = (h1, w1)
-        label["resized_shape"] = out.shape[:2]
-        label["ratio_pad"] = (
-            label["resized_shape"][0] / label["ori_shape"][0],
-            label["resized_shape"][1] / label["ori_shape"][1],
-        )
-        return self.update_labels_info(label)
+        # Resize to the training size (M1: shared tail)
+        return self._finalize_label(label, out)
 
     def _occlusion_at(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one in-memory occluded image (rect / stripe blocks) from an original.
@@ -1214,20 +1299,27 @@ class BaseDataset(Dataset):
         max_cover = float(getattr(self, "occlusion_max_cover", 0.95))
         if oc_boxes and len(label.get("bboxes", [])):
             boxes = np.asarray(label["bboxes"], dtype=np.float64).copy()  # normalized xywh
-            oc_area_sum = 0.0
+            # M8 fix: covered 改为"块与目标框交集的并集面积"。旧实现逐块累加交叉面积,
+            # 多个遮挡块相互重叠时重叠区被重复计入, 覆盖率虚高, 目标可能被提前按 max_cover
+            # 误剔除。块数通常 1~3 且只对含目标的图执行, 布尔掩码开销可忽略。
+            # (M7: 顺带删除从未被使用的 oc_area_sum 死代码)
+            oc_mask = np.zeros((h, w), dtype=bool)
             for (ox0, oy0, ox1, oy1) in oc_boxes:
-                oc_area_sum += max(0, ox1 - ox0) * max(0, oy1 - oy0)
+                ox0i, oy0i = max(0, int(ox0)), max(0, int(oy0))
+                ox1i, oy1i = min(w, int(math.ceil(ox1))), min(h, int(math.ceil(oy1)))
+                if ox1i > ox0i and oy1i > oy0i:
+                    oc_mask[oy0i:oy1i, ox0i:ox1i] = True
             keep = np.ones(len(boxes), dtype=bool)
             for i, b in enumerate(boxes):
                 cx, cy, bw, bh = b[0] * w, b[1] * h, b[2] * w, b[3] * h
                 x0, y0, x1, y1 = cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2
                 area = max(1.0, (x1 - x0) * (y1 - y0))
-                covered = 0.0
-                for (ox0, oy0, ox1, oy1) in oc_boxes:
-                    ix0, iy0 = max(x0, ox0), max(y0, oy0)
-                    ix1, iy1 = min(x1, ox1), min(y1, oy1)
-                    if ix1 > ix0 and iy1 > iy0:
-                        covered += (ix1 - ix0) * (iy1 - iy0)
+                x0i, y0i = max(0, int(math.floor(x0))), max(0, int(math.floor(y0)))
+                x1i, y1i = min(w, int(math.ceil(x1))), min(h, int(math.ceil(y1)))
+                if x1i > x0i and y1i > y0i:
+                    covered = float(oc_mask[y0i:y1i, x0i:x1i].sum())
+                else:
+                    covered = 0.0
                 if covered / area >= max_cover:
                     keep[i] = False
             if not keep.all():
@@ -1249,52 +1341,19 @@ class BaseDataset(Dataset):
         # slice_save_annotated, capped by slice_save_max_occlusion (falls back to slice_save_max),
         # deduplicated per (image, otype) across epochs.
         sdir = str(getattr(self, "occlusion_save_dir", "") or "")
-        st = getattr(self, "slice_transform", None)
         if sdir:
             cdir = Path(sdir)
-            if not hasattr(self, "_occlusion_saved"):
-                self._occlusion_saved = 0
-                self._occlusion_saved_keys = set()
             key = ("occlusion", otype if oc_boxes else "none", index)
-            save_cap = _save_cap(self, "occlusion")
-            if key not in self._occlusion_saved_keys and (save_cap == 0 or self._occlusion_saved < save_cap):
-                _ensure_dir(cdir)
-                img = out
-                boxes = np.asarray(label.get("bboxes", np.empty((0, 4))), dtype=np.float64)
-                save_annotated = bool(getattr(st, "save_annotated", True)) if st is not None else True
-                if save_annotated and len(boxes):
-                    img = out.copy()
-                    H2, W2 = out.shape[:2]
-                    cls = np.asarray(label.get("cls", np.empty((0, 1))))
-                    for b, c in zip(boxes, np.asarray(cls).reshape(-1)):
-                        cx, cy, bw, bh = (float(v) for v in b)
-                        x0 = int(round((cx - bw / 2) * W2))
-                        y0 = int(round((cy - bh / 2) * H2))
-                        x1 = int(round((cx + bw / 2) * W2))
-                        y1 = int(round((cy + bh / 2) * H2))
-                        cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                        cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                _imwrite(cdir / f"occlusion_{otype if oc_boxes else 'none'}_p{os.getpid()}_img{img_index}_"
-                                f"{self._occlusion_saved:05d}_n{len(boxes)}.jpg", img)
-                self._occlusion_saved += 1
-                self._occlusion_saved_keys.add(key)
+            # M1: 画框/去重/限额/命名抽到 _save_annotated; 保存不依赖切片管线。
+            self._save_annotated(
+                "occlusion", cdir, out,
+                label.get("bboxes", np.empty((0, 4))), label.get("cls", np.empty((0, 1))),
+                f"occlusion_{otype if oc_boxes else 'none'}_p{os.getpid()}_img{img_index}", key,
+                bool(getattr(self, "slice_save_annotated", True)),
+            )
 
-        # Resize to the training size (same as the other online branches)
-        h1, w1 = out.shape[:2]
-        r = self.imgsz / max(h1, w1)
-        if r != 1:
-            out = cv2.resize(out, (math.ceil(w1 * r), math.ceil(h1 * r)), interpolation=cv2.INTER_LINEAR)
-        if out.ndim == 2:
-            out = out[..., None]
-        label["img"] = np.ascontiguousarray(out)
-        label["ori_shape"] = (h1, w1)
-        label["resized_shape"] = out.shape[:2]
-        label["ratio_pad"] = (
-            label["resized_shape"][0] / label["ori_shape"][0],
-            label["resized_shape"][1] / label["ori_shape"][1],
-        )
-        return self.update_labels_info(label)
+        # Resize to the training size (M1: shared tail)
+        return self._finalize_label(label, out)
 
     def _ratio_at(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one in-memory aspect-ratio-padded image from a single original image (online port of the
@@ -1399,49 +1458,19 @@ class BaseDataset(Dataset):
         # falls back to slice_save_max), deduplicated per (image) across epochs/mix visits.
         # Disabled by default (empty dir).
         sdir = str(getattr(self, "ratio_pad_save_dir", "") or "")
-        st = getattr(self, "slice_transform", None)
-        if sdir and st is not None:
+        if sdir:
             cdir = Path(sdir)
-            if not hasattr(self, "_ratio_saved"):
-                self._ratio_saved = 0
-                self._ratio_saved_keys = set()
             key = ("ratio", index)
-            save_cap = _save_cap(self, "ratio")
-            if key not in self._ratio_saved_keys and (save_cap == 0 or self._ratio_saved < save_cap):
-                _ensure_dir(cdir)
-                img = big
-                if st.save_annotated and len(boxes):
-                    img = big.copy()
-                    H2, W2 = big.shape[:2]
-                    for b, c in zip(boxes, np.asarray(cls).reshape(-1)):
-                        cx, cy, bw, bh = (float(v) for v in b)
-                        x0 = int(round((cx - bw / 2) * W2))
-                        y0 = int(round((cy - bh / 2) * H2))
-                        x1 = int(round((cx + bw / 2) * W2))
-                        y1 = int(round((cy + bh / 2) * H2))
-                        cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                        cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                _imwrite(cdir / f"ratio_p{os.getpid()}_img{img_index}_"
-                                f"{self._ratio_saved:05d}_n{len(boxes)}.jpg", img)
-                self._ratio_saved += 1
-                self._ratio_saved_keys.add(key)
+            # M1: 画框/去重/限额/命名抽到 _save_annotated。
+            self._save_annotated(
+                "ratio", cdir, big,
+                label.get("bboxes", np.empty((0, 4))), label.get("cls", np.empty((0, 1))),
+                f"ratio_p{os.getpid()}_img{img_index}", key,
+                bool(getattr(self, "slice_save_annotated", True)),
+            )
 
-        # Resize to the training size (same as the sliced / original / composed branches)
-        h1, w1 = big.shape[:2]
-        r = self.imgsz / max(h1, w1)
-        if r != 1:
-            big = cv2.resize(big, (math.ceil(w1 * r), math.ceil(h1 * r)), interpolation=cv2.INTER_LINEAR)
-        if big.ndim == 2:
-            big = big[..., None]
-        label["img"] = np.ascontiguousarray(big)
-        label["ori_shape"] = (h1, w1)
-        label["resized_shape"] = big.shape[:2]
-        label["ratio_pad"] = (
-            label["resized_shape"][0] / label["ori_shape"][0],
-            label["resized_shape"][1] / label["ori_shape"][1],
-        )
-        return self.update_labels_info(label)
+        # Resize to the training size (M1: shared tail)
+        return self._finalize_label(label, big)
 
     def _compose_at(self, index: int) -> dict[str, Any]:
         """Build a 2x2 composed image from 4 original images (online port of the offline compose tool).
@@ -1455,9 +1484,9 @@ class BaseDataset(Dataset):
         """
         n_origin = len(self.labels)
         # The compose segment starts right after the base + ratio + blur segments (_segment_bases);
-        # group = index - compose_base selects the group of 4 originals.
-        _base_len, _o_base, _r_base, _b_base, c_base, _w_base, _oc_base = self._segment_bases()
-        group = index - c_base
+        # group = index - compose_base selects the group of 4 originals. (M5: named access)
+        sb = self._segment_bases()
+        group = index - sb.compose
         base = group * 4
         # P1-2: with fewer than 4 originals the modulo wrap would put the SAME image in 2+ quadrants,
         # duplicating its targets and skewing the label distribution. _compose_on() never allocates
@@ -1549,9 +1578,9 @@ class BaseDataset(Dataset):
         # slice_save_annotated, capped by slice_save_max_compose (P2-3: per-branch override, falls back to
         # slice_save_max), deduplicated per (group) across epochs/mix visits.
         st = getattr(self, "slice_transform", None)
-        if st is not None and getattr(self, "compose_save", False):
+        if getattr(self, "compose_save", False):
             comp_dir = str(getattr(self, "compose_save_dir", "") or "")
-            cdir = Path(comp_dir) if comp_dir else (st.save_dir / "compose" if st.save_dir is not None else None)
+            cdir = Path(comp_dir) if comp_dir else (st.save_dir / "compose" if st is not None and st.save_dir is not None else None)
             if cdir is None and not getattr(self, "_compose_warned", False):
                 # P2-4: args.yaml ships compose_save=True with an empty compose_save_dir and no
                 # slice_save_dir -> nothing was ever written and nothing said why.
@@ -1562,32 +1591,14 @@ class BaseDataset(Dataset):
                     f"Skipping compose save."
                 )
             if cdir is not None:
-                if not hasattr(self, "_compose_saved"):
-                    self._compose_saved = 0
-                    self._compose_saved_keys = set()
                 key = ("compose", group)
-                save_cap = _save_cap(self, "compose")
-                if key not in self._compose_saved_keys and (save_cap == 0 or self._compose_saved < save_cap):
-                    _ensure_dir(cdir)
-                    img = big
-                    if st.save_annotated and len(bboxes):
-                        img = big.copy()
-                        H2, W2 = big.shape[:2]
-                        for b, c in zip(bboxes, np.asarray(cls).reshape(-1)):
-                            cx, cy, bw, bh = (float(v) for v in b)
-                            x0 = int(round((cx - bw / 2) * W2))
-                            y0 = int(round((cy - bh / 2) * H2))
-                            x1 = int(round((cx + bw / 2) * W2))
-                            y1 = int(round((cy + bh / 2) * H2))
-                            cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                            cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    if _imwrite(
-                        str(cdir / f"compose_p{os.getpid()}_g{group}_{self._compose_saved:05d}_n{len(bboxes)}.jpg"),
-                        img,
-                    ):
-                        self._compose_saved += 1
-                        self._compose_saved_keys.add(key)
+                # M1: 画框/去重/限额/命名抽到 _save_annotated (成功写盘才计数)。
+                self._save_annotated(
+                    "compose", cdir, big,
+                    bboxes, cls,
+                    f"compose_p{os.getpid()}_g{group}", key,
+                    bool(getattr(self, "slice_save_annotated", True)),
+                )
 
         # Keep the composed image on the same Mosaic mix pool as every other sample (cache != 'ram')
         if self.augment and self.cache != "ram":
@@ -1595,21 +1606,8 @@ class BaseDataset(Dataset):
             if 1 < len(self.buffer) >= self.max_buffer_length:
                 self.buffer.pop(0)
 
-        # Resize to the training size (same as the sliced / original branches)
-        h1, w1 = big.shape[:2]
-        r = self.imgsz / max(h1, w1)
-        if r != 1:
-            big = cv2.resize(big, (math.ceil(w1 * r), math.ceil(h1 * r)), interpolation=cv2.INTER_LINEAR)
-        if big.ndim == 2:
-            big = big[..., None]
-        label["img"] = np.ascontiguousarray(big)
-        label["ori_shape"] = (h1, w1)
-        label["resized_shape"] = big.shape[:2]
-        label["ratio_pad"] = (
-            label["resized_shape"][0] / label["ori_shape"][0],
-            label["resized_shape"][1] / label["ori_shape"][1],
-        )
-        return self.update_labels_info(label)
+        # Resize to the training size (M1: shared tail)
+        return self._finalize_label(label, big)
 
     def get_image_and_label(self, index: int, count_slice: bool = True) -> dict[str, Any]:
         """Get and return label information from the dataset.
@@ -1620,6 +1618,10 @@ class BaseDataset(Dataset):
                 Auxiliary "mix" samples requested by Mosaic/CutMix/MixUp pass ``False`` so they slice normally
                 but do not inflate the ``neg_ratio`` quota or duplicate saved slices.
         """
+        # S5: pick up the trainer's latest set_epoch() publish. No-op (one locked int read) in the
+        # main process and whenever the epoch is unchanged; in a DataLoader worker with a stale mask
+        # set this deterministically rebuilds the masks for the published epoch.
+        self._sync_epoch_masks()
         # Mixed-pool layout (see _segment_bases): a base segment holding ONLY the slicing pipeline's
         # samples (4 tiles per image), followed by SIX INDEPENDENT segments gated only by their own
         # switches -- origin (1 un-sliced original per image, keep_origin), ratio (1 per image),
@@ -1632,7 +1634,11 @@ class BaseDataset(Dataset):
         compose_on = self._compose_on()
         weather_on = self._weather_on()
         occlusion_on = self._occlusion_on()
-        base_len, o_base, r_base, b_base, c_base, w_base, oc_base = self._segment_bases()
+        # M5: named access instead of a bare 8-tuple unpack.
+        sb = self._segment_bases()
+        base_len, o_base, r_base, b_base, c_base, w_base, oc_base = (
+            sb.base, sb.origin, sb.ratio, sb.blur, sb.compose, sb.weather, sb.occlusion,
+        )
 
         if occlusion_on and index >= oc_base:
             return self._occlusion_at(index, index - oc_base)  # origin index = offset inside the occlusion segment
@@ -1665,10 +1671,19 @@ class BaseDataset(Dataset):
         # the rest are fed as un-sliced full images. Mask None = pure slicing (default) or slicing off.
         # The un-sliced originals live in their own independent segment (_origin_at) and never slice.
         slice_t = getattr(self, "slice_transform", None)
-        # Lazy init: if the trainer never called set_epoch (direct sampling / validation path),
-        # build the mask once on first access so 0 < slice_ratio < 1 still works.
-        if self._slice_mask is None and 0.0 <= float(getattr(self, "slice_ratio", 1.0)) < 1.0:
-            self.set_epoch(getattr(self, "epoch", 0))
+        # Lazy init (standalone / direct-iteration use, no trainer ever calling set_epoch): rebuild
+        # once on first access so 0 <= *_ratio < 1 still works. MAIN process only -- DataLoader
+        # workers (InfiniteDataLoader spawns them before any set_epoch) must NOT self-build here:
+        # they would stamp epoch 0 without the total `epochs` (breaking close_aug_epoch) and pin the
+        # shared channel; they wait for the trainer's publish via _sync_epoch_masks instead. This
+        # once-per-stamp form also fixes the old refire-per-sample bug (mask None + ratio < 1 used
+        # to re-run the whole rebuild on every single sample).
+        if (
+            self._mask_stamp < 0
+            and 0.0 <= float(getattr(self, "slice_ratio", 1.0)) < 1.0
+            and multiprocessing.parent_process() is None
+        ):
+            self._rebuild_epoch_masks(int(getattr(self, "epoch", 0)))
         slice_ok = self._slice_mask is None or bool(self._slice_mask[img_index])
         # The mosaic buffer is maintained centrally here using DATASET (expanded) indices whenever
         # load_image does NOT self-manage it: slicing on, or any project extension on (load_image's
@@ -1721,25 +1736,14 @@ class BaseDataset(Dataset):
 
         Base segment (``_n_per`` samples per original) plus six independent segments: +N origin
         (keep_origin), +N ratio, +2N blur, +ceil(N/4) compose, +N weather, +N occlusion -- each
-        present only when its own switch is on. Boundaries are centralized in ``_segment_bases`` so
-        ``get_image_and_label`` / ``_compose_at`` cannot drift apart; a mismatch would silently
-        drop samples with no error.
+        present only when its own switch is on.
+
+        Single source of truth (S4 fix): the total comes from ``_segment_bases()``, which derives
+        it from the same per-segment lengths as every boundary. The accumulation used to be
+        re-implemented here; adding a new branch and missing this copy would desynchronise
+        ``len(dataset)`` from the decodable index range and silently drop samples.
         """
-        n = len(self.labels)
-        total = n * self._n_per()
-        if self._keep_origin_on():
-            total += n
-        if bool(getattr(self, "ratio_pad_keep", False)):
-            total += n
-        if bool(getattr(self, "blur_keep", False)):
-            total += 2 * n
-        if self._compose_on():
-            total += (n + 3) // 4
-        if self._weather_on():
-            total += n
-        if self._occlusion_on():
-            total += n
-        return total
+        return self._segment_bases().total
 
     def update_labels_info(self, label: dict[str, Any]) -> dict[str, Any]:
         """Customize your label format here."""
@@ -1815,8 +1819,6 @@ class SliceValDataset(Dataset):
 
     def _build(self) -> None:
         """Build the per-original tile layout: mask (val_slice_ratio) + per-orig tile boxes."""
-        import bisect
-
         from ultralytics.data.augment import slice_geometry
 
         n = self.n
@@ -1852,8 +1854,6 @@ class SliceValDataset(Dataset):
 
     def _decode(self, index: int) -> tuple[int, int]:
         """Map an expanded sample index to ``(original_index, tile_index)``."""
-        import bisect
-
         i = bisect.bisect_right(self._cum, index) - 1
         return i, index - self._cum[i]
 
@@ -1866,12 +1866,20 @@ class SliceValDataset(Dataset):
         label = deepcopy(self.labels[oi])
         label.pop("shape", None)  # shape is for rect, remove it
         # Load the ORIGINAL-resolution image (worker LRU cache when available).
+        # M9 fix: _load_image_cached 可能返回 None (缓存未命中且读盘失败), 旧实现随后用同一
+        # 路径再 imread 一次 —— 与缓存通道的失败同源, 必然再次失败, 最终以 None 切片
+        # im[y0:y1, x0:x1] 抛难以定位的 TypeError。现在缓存失败走独立 imread 通道重试,
+        # 再失败则带路径明确报错。
+        im = None
         if hasattr(self.base, "_load_image_cached"):
             im = self.base._load_image_cached(oi)
-        else:
-            im = cv2.imread(label["im_file"])
         if im is None:
             im = cv2.imread(label["im_file"])
+        if im is None:
+            raise FileNotFoundError(
+                f"SliceValDataset: failed to load image {label['im_file']!r} for val-slicing "
+                f"(original index {oi}); check the file exists and is decodable."
+            )
         tw, th = x1 - x0, y1 - y0
         sub = np.ascontiguousarray(im[y0:y1, x0:x1])
         if sliced:

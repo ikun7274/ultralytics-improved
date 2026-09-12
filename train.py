@@ -40,7 +40,7 @@ if __name__ == '__main__':
     model.load('weights/yolo26n.pt')
     model.train(
         #---------训练参数---------------
-        data='data.yaml',
+        data='_mini_val_set/_mini_data.yaml',
         cache=False,                
         imgsz=640,
         epochs=1,

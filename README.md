@@ -197,7 +197,7 @@ Online augment: 231 training samples from 28 images (4 slices + 1 origin + 1 rat
 
 - **索引空间扩展**：`__getitem__` 索引从 N（原图）扩展为 `4N + N + N + 2N + ceil(N/4) + N`；`get_image_and_label` 按区段边界路由到切片 / 原图 / 比例 / 模糊 / 合成 / 气象退化分支，每个子样本即时生成，`buffer.append(扩展索引)` 统一记账后供 Mosaic 采样；
 - **在线切片在原分辨率上进行**（切片前不缩放到训练尺寸），小目标随子图缩放真实放大；
-- **epoch 级精确比例**：`set_epoch(epoch)` 主进程重建各比例掩码（`random.sample` 精确选 `round(x×N)`），worker 经 fork 继承，无 per-worker 漂移；
+- **epoch 级精确比例**：`set_epoch(epoch)` 重建各比例掩码（`random.sample` 精确选 `round(x×N)`）；掩码经共享内存 epoch 通道（`_mp_epoch`/`_sync_epoch_masks`）传播到各 DataLoader worker，各进程按确定性 RNG（`crc32(文件列表):epoch:epochs`）重建完全一致的掩码，无 per-worker 漂移（非 "fork 继承"；`persistent_workers=True/False` 均安全）；
 - **标签始终与像素对齐**：切片/合成/比例都同步换算 bbox 坐标，模糊标签原样不变；
 - **纯原版兼容**：所有增强全关时，`load_image` 恢复原生 buffer 自管路径，行为与原生 Ultralytics 完全一致（含 buffer 记账守卫，防止扩展索引与原生索引混用）。
 

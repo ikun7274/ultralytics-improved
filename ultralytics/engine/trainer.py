@@ -894,6 +894,27 @@ class BaseTrainer:
         """Allow custom preprocessing of model inputs and ground truths depending on task type."""
         return batch
 
+    def _run_val(self, slice_enable: bool) -> dict | None:
+        """Run one validation pass in the requested val_slice mode, restoring validator state after.
+
+        M6 refactor: the dual-metric code used to mutate ``self.validator.args.val_slice_enable``
+        and ``self.validator.dataloader`` in place and restore them manually. If a pass raised, the
+        validator stayed in the mode of the failed pass and every later epoch validated with the
+        wrong mode. ``try/finally`` restores both fields no matter how the pass exits. The dataloader
+        is only reset (forcing a rebuild) when the requested mode differs from the validator's
+        current mode -- an unchanged whole-image mode keeps reusing the prebuilt loader.
+        """
+        cur_enable = bool(getattr(self.validator.args, "val_slice_enable", False))
+        prev_loader = self.validator.dataloader
+        try:
+            if bool(slice_enable) != cur_enable:
+                self.validator.args.val_slice_enable = bool(slice_enable)
+                self.validator.dataloader = None  # mode change -> force rebuild in the new mode
+            return self.validator(self)
+        finally:
+            self.validator.args.val_slice_enable = cur_enable
+            self.validator.dataloader = prev_loader
+
     def validate(self):
         """Run validation on val set using self.validator.
 
@@ -906,14 +927,12 @@ class BaseTrainer:
             # Sync EMA buffers from rank 0 to all ranks
             for buffer in self.ema.ema.buffers():
                 dist.broadcast(buffer, src=0)
-        # Main validation pass: when val_slice_enable is on, force the validator to REBUILD its
-        # dataloader -- the trainer's prebuilt test_loader is a whole-image loader and would bypass
-        # the val_slice wrap (which only exists in DetectionValidator.get_dataloader).
+        # Main validation pass: when val_slice_enable is on, _run_val switches the validator into
+        # sliced mode (and forces a rebuild -- the trainer's prebuilt test_loader is a whole-image
+        # loader and would bypass the val_slice wrap, which only exists in
+        # DetectionValidator.get_dataloader). M6: validator state is restored afterwards.
         slice_on = bool(getattr(self.args, "val_slice_enable", False))
-        if slice_on:
-            self.validator.args.val_slice_enable = True
-            self.validator.dataloader = None  # force rebuild as sliced loader
-        metrics = self.validator(self)
+        metrics = self._run_val(slice_on)
         if metrics is None:
             return None, None
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
@@ -923,11 +942,7 @@ class BaseTrainer:
         # so the sliced mAP (main fitness / best.pt / early-stop) is reported next to a comparable
         # whole-image mAP (whole_* keys, best_whole.pt / last_whole.pt). Cost: one extra validation pass.
         if bool(getattr(self.args, "val_slice_dual_metric", False)) and slice_on:
-            self.validator.dataloader = None  # force dataset rebuild in whole-image mode
-            self.validator.args.val_slice_enable = False
-            metrics_whole = self.validator(self)
-            self.validator.args.val_slice_enable = True
-            self.validator.dataloader = None
+            metrics_whole = self._run_val(False)
             if metrics_whole is not None:
                 fitness_whole = metrics_whole.pop("fitness", fitness)
                 if self.best_fitness_whole is None or self.best_fitness_whole < fitness_whole:
