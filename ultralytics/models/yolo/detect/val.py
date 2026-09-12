@@ -62,7 +62,9 @@ class DetectionValidator(BaseValidator):
         self.niou = self.iouv.numel()
         self.metrics = DetMetrics()
         # --- validation-side online slicing (SAHI-style eval): sub-tile inference + remap + NMS fusion ---
-        self.val_slice_on = bool(args.get("val_slice_enable", False) if isinstance(args, dict) else getattr(args, "val_slice_enable", False))
+        # M-4 fix: no cached val_slice_on flag. The trainer toggles args.val_slice_enable between the sliced
+        # pass and the whole-image reference pass, so a value captured here goes stale; every decision reads
+        # _val_slice_active() instead (single source of truth).
         self.val_slice_overlap_ratio = float(
             args.get("val_slice_overlap_ratio", 0.2) if isinstance(args, dict) else getattr(args, "val_slice_overlap_ratio", 0.2)
         )
@@ -243,7 +245,7 @@ class DetectionValidator(BaseValidator):
             preds (list[dict[str, torch.Tensor]]): List of predictions from the model.
             batch (dict[str, Any]): Batch data containing ground truth.
         """
-        if self.val_slice_on and "val_slice_meta" in batch:
+        if self._val_slice_active() and "val_slice_meta" in batch:
             # SAHI-style sliced validation: collect sub-tile predictions per ORIGINAL image, remap them
             # to the original coordinates, fuse duplicates with class-wise NMS, then evaluate against the
             # whole-image GT (the original path stays untouched for val_slice_enable=False).
@@ -322,7 +324,23 @@ class DetectionValidator(BaseValidator):
         ORIGINAL image index); when every tile of an original image has been inferred, its predictions
         are fused with class-wise NMS and evaluated against the whole-image GT (``_finalize_sliced_orig``).
         """
-        imgsz = batch["img"].shape[2]  # square validation input
+        if self._slice_base_labels is None:
+            # L-2: only get_dataloader() sets this. A prebuilt sliced DataLoader handed to the constructor
+            # would otherwise crash later with an opaque "NoneType is not subscriptable" in _finalize_sliced_orig.
+            raise RuntimeError(
+                "val_slice: sub-tile batches arrived but the whole-image GT (_slice_base_labels) is unset. "
+                "The dataloader must be built via DetectionValidator.get_dataloader, where the SliceValDataset "
+                "wrap and the whole-image labels are established."
+            )
+        _b, _c, h_img, w_img = batch["img"].shape
+        if h_img != w_img:
+            # L-3: remap uses a single scale factor / centered pad, so a non-square canvas would silently
+            # produce wrong original-image coordinates. Fail loudly instead.
+            raise RuntimeError(
+                f"val_slice assumes a square validation canvas, got {h_img}x{w_img}. Use a square imgsz "
+                f"for sliced validation, or extend _remap_boxes_imgsz_to_orig to per-axis scale/pad."
+            )
+        imgsz = h_img  # square validation input
         for si, pred in enumerate(preds):
             meta = batch["val_slice_meta"][si]
             oi = int(meta["orig_idx"])
@@ -425,6 +443,16 @@ class DetectionValidator(BaseValidator):
 
     def finalize_metrics(self) -> None:
         """Set final values for metrics speed and confusion matrix."""
+        if self._slice_acc:
+            # L-4: an entry survives only if some original never saw all of its sub-tiles (dropped tail batch,
+            # a mid-pass mask change, ...). Those images are missing from the metrics denominator -- say so.
+            unfinished = len(self._slice_acc)
+            LOGGER.warning(
+                f"val_slice: {unfinished} original image(s) never completed all sub-tiles and were excluded "
+                f"from the metrics (scored originals: {self.seen}). Check drop_last / batch size and whether "
+                f"the slice masks changed during the pass."
+            )
+            self._slice_acc.clear()
         if self.args.plots:
             for normalize in True, False:
                 self.confusion_matrix.plot(save_dir=self.save_dir, normalize=normalize, on_plot=self.on_plot)
@@ -557,7 +585,8 @@ class DetectionValidator(BaseValidator):
             (torch.utils.data.DataLoader): DataLoader for validation.
         """
         dataset = self.build_dataset(dataset_path, batch=batch_size, mode="val")
-        if self._val_slice_active() and self.args.task == "detect":
+        sliced = self._val_slice_active() and self.args.task == "detect"
+        if sliced:
             # Validation-side online slicing: expand each val image into 2x2 (+overlap) sub-tiles.
             # Predictions are remapped to the original image and fused with NMS in update_metrics.
             # NOTE: rect=True (model.val() default) builds labels without real per-image shapes, which
@@ -580,7 +609,9 @@ class DetectionValidator(BaseValidator):
             self.args.workers,
             shuffle=False,
             rank=-1,
-            drop_last=self.args.compile,
+            # L-4: dropping the tail batch would leave some originals unfinished (done < n_tiles); they are
+            # never scored, silently shrinking the metric denominator. Never drop in sliced mode.
+            drop_last=self.args.compile and not sliced,
             pin_memory=self.training,
             device=self.device,
         )

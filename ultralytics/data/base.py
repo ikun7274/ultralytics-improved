@@ -141,7 +141,7 @@ def _apply_weather(img: np.ndarray, wtype: str, rain_density: float = 0.15, rain
             if len(batch):
                 cv2.polylines(overlay, [p for p in batch], isClosed=False, color=(205, 205, 225),
                               thickness=t, lineType=cv2.LINE_AA)
-        alpha = random.uniform(0.2, 0.6)
+        alpha = np.random.uniform(0.2, 0.6)  # single RNG family (np.random) with the rain lines
         return cv2.addWeighted(img, 1.0 - alpha, overlay, alpha, 0)
     if wtype == "haze":
         t = max(0.0, min(1.0, 1.0 - haze_beta))
@@ -150,6 +150,37 @@ def _apply_weather(img: np.ndarray, wtype: str, rain_density: float = 0.15, rain
     # noise
     noise = np.random.normal(0.0, max(0.0, float(noise_std)), img.shape)
     return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+
+def _union_area(rects: list[tuple[int, int, int, int]]) -> float:
+    """Exact area of the union of axis-aligned integer rectangles (x-sweep + y-interval merge).
+
+    Replaces the full-image bool mask (h*w bytes per occluded sample -- 4000x3000 ~ 12 MB)
+    with an exact small computation: occluder counts are 1~3 per sample, so the sweep is O(k^2 log k).
+    Integer pixel semantics match the old mask exactly: a rect [x0, x1) x [y0, y1) covers
+    (x1-x0) * (y1-y0) pixels.
+    """
+    if not rects:
+        return 0.0
+    xs = sorted({x0 for x0, _, _, _ in rects} | {x1 for _, _, x1, _ in rects})
+    total = 0.0
+    for a, b in zip(xs, xs[1:]):
+        if b <= a:
+            continue
+        ys = sorted((y0, y1) for x0, y0, x1, y1 in rects if x0 <= a and b <= x1)
+        if not ys:
+            continue
+        cur0, cur1 = ys[0]
+        span = 0.0
+        for y0, y1 in ys:
+            if y0 <= cur1:
+                cur1 = max(cur1, y1)
+            else:
+                span += cur1 - cur0
+                cur0, cur1 = y0, y1
+        span += cur1 - cur0  # last merged interval
+        total += span * (b - a)
+    return total
 
 
 def _apply_occlusion(
@@ -175,18 +206,18 @@ def _apply_occlusion(
     h, w = img.shape[:2]
     out = img.copy()
     base = max(2.0, math.sqrt(max(1.0, size_ratio) * h * w))
-    rng_color = "auto"
+    oc_color = "auto"
     # auto color: mean of the darkest ~25% pixels (per-channel), a plausible tree/shadow tone
     if color == "auto":
         # L2 fix: 旧实现 reshape 全图(1200万像素)后 np.quantile 全量排序, 大图每样本约 1-2s 纯浪费;
         # 改为大步长均匀采样 (步长 37 为素数, 与图像行宽互质, 覆盖全图任意偏移), ~32 万像素足够稳定估计 25 分位。
         flat = img.reshape(-1, img.shape[2])[::37]
         q = np.quantile(flat, 0.25, axis=0)
-        rng_color = tuple(int(round(float(v))) for v in q)
+        oc_color = tuple(int(round(float(v))) for v in q)
     elif color == "black":
-        rng_color = (0, 0, 0)
+        oc_color = (0, 0, 0)
     else:  # gray
-        rng_color = (128, 128, 128)
+        oc_color = (128, 128, 128)
     boxes = []
     for _ in range(max(1, int(blocks))):
         if otype == "stripe":
@@ -198,14 +229,14 @@ def _apply_occlusion(
                 cy = random.uniform(0.0, float(h))
                 x0, x1 = max(0, int(cx - thick // 2)), min(w, int(cx + thick // 2) + 1)
                 y0, y1 = max(0, int(cy - length // 2)), min(h, int(cy + length // 2) + 1)
-                cv2.rectangle(out, (x0, y0), (x1, y1), rng_color, -1)
+                cv2.rectangle(out, (x0, y0), (x1, y1), oc_color, -1)
                 boxes.append((x0, y0, x1, y1))
             else:
                 cx = random.uniform(0.0, float(w))
                 cy = random.uniform(0.0, float(h))
                 x0, x1 = max(0, int(cx - length // 2)), min(w, int(cx + length // 2) + 1)
                 y0, y1 = max(0, int(cy - thick // 2)), min(h, int(cy + thick // 2) + 1)
-                cv2.rectangle(out, (x0, y0), (x1, y1), rng_color, -1)
+                cv2.rectangle(out, (x0, y0), (x1, y1), oc_color, -1)
                 boxes.append((x0, y0, x1, y1))
         else:  # rect
             side = base * random.uniform(0.5, 1.0)
@@ -214,7 +245,7 @@ def _apply_occlusion(
             y0 = random.uniform(0.0, max(1.0, float(h - bh)))
             x0i, y0i = int(x0), int(y0)
             x1i, y1i = min(w, x0i + bw), min(h, y0i + bh)
-            cv2.rectangle(out, (x0i, y0i), (x1i, y1i), rng_color, -1)
+            cv2.rectangle(out, (x0i, y0i), (x1i, y1i), oc_color, -1)
             boxes.append((x0i, y0i, x1i, y1i))
     return np.ascontiguousarray(out), boxes
 
@@ -430,13 +461,20 @@ class BaseDataset(Dataset):
         self.buffer = []  # buffer size = batch size
         self.max_buffer_length = min((self.ni, self.batch_size * 8, 1000)) if self.augment else 0
 
-        # P0-4: per-worker LRU cache of ORIGINAL-resolution images. With n_per=8 one source image is
-        # otherwise decoded 8 times per epoch (4 tiles + 1 origin + 1 ratio + 2 blur), plus 4 more for
-        # compose -- measured at 9.0x on the reference dataset. Sub-samples of the same image live at
-        # consecutive indices, so a tiny cache absorbs nearly all of that once the sampler keeps them
-        # adjacent (see GroupedRandomSampler in data/build.py). Keyed by original image index.
+        # P0-4: per-worker LRU cache of ORIGINAL-resolution images. Without it one source image is
+        # decoded once per sub-sample (4 tiles + 1 origin + 1 ratio + 2 blur + weather/occlusion, plus
+        # 4 compose reads) -- measured at 9.0x on the reference dataset. Sub-samples of the same image
+        # live at CONSECUTIVE DATASET INDICES (`index // n_per == img_index`), so a capacity >= n_per
+        # absorbs nearly all of that WHEN the sampler visits them together. M-2 note: data/build.py has
+        # no grouped sampler (RandomSampler permutes globally under shuffle=True), so the sampling ORDER
+        # is not guaranteed adjacent and the LRU hit rate is lower than the index layout suggests.
+        # Keyed by original image index.
         self._raw_cache = {}
-        self._raw_cache_size = int(getattr(self, "slice_raw_cache_size", 2) or 0)
+        # M-1 fix: read the capacity from ``hyp`` (the same source v8_transforms reads), NOT from ``self``.
+        # v8_transforms copies hyp's keys onto the dataset only AFTER __init__ returns, so the previous
+        # `getattr(self, "slice_raw_cache_size", 2)` always fell back to 2 -- the documented knob (and its
+        # "0 = off" semantics, and the raise-it-to-speed-up hint at the cache='ram' warning below) was dead.
+        self._raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", 2) or 0)
         # Per-epoch slice mask (slice_ratio exact ratio, original-level). None = pure slicing or
         # slicing off. Rebuilt by set_epoch(epoch) at every epoch start; see get_image_and_label.
         self._slice_mask = None
@@ -804,8 +842,8 @@ class BaseDataset(Dataset):
             try:
                 self._mp_epoch.value = int(epoch)
                 self._mp_epochs.value = int(epochs) if epochs is not None else -1
-            except Exception:  # e.g. called inside a worker process; workers rebuild via _sync instead
-                pass
+            except Exception as e:  # e.g. called inside a worker process; workers rebuild via _sync instead
+                LOGGER.debug(f"set_epoch: shared-memory epoch update skipped in this process: {e}")
         self._rebuild_epoch_masks(epoch, epochs)
 
     def _rebuild_epoch_masks(self, epoch: int, epochs: int | None = None) -> None:
@@ -930,6 +968,17 @@ class BaseDataset(Dataset):
             and getattr(self, "slice_transform", None) is not None
         )
 
+    def _touch_buffer(self, index: int) -> None:
+        """Record ``index`` in the mosaic-buffer FIFO, evicting the oldest entry past capacity.
+
+        Single home for the append/pop bookkeeping that used to be copy-pasted across every pool
+        branch (M3): the buffer strategy (capacity rule, eviction) now changes in one place.
+        """
+        if self.augment and self.cache != "ram":
+            self.buffer.append(index)
+            if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent empty buffer
+                self.buffer.pop(0)
+
     def _weather_on(self) -> bool:
         """True when the weather branch allocates samples (weather_keep independent switch)."""
         return bool(getattr(self, "weather_keep", False))
@@ -986,7 +1035,10 @@ class BaseDataset(Dataset):
         h1, w1 = img.shape[:2]
         r = self.imgsz / max(h1, w1)
         if r != 1:
-            img = cv2.resize(img, (math.ceil(w1 * r), math.ceil(h1 * r)), interpolation=cv2.INTER_LINEAR)
+            # M6: clamp to imgsz exactly like load_image does -- float error could otherwise
+            # produce resized_shape == imgsz+1 and diverge from the vanilla-path semantics.
+            img = cv2.resize(img, (min(math.ceil(w1 * r), self.imgsz), min(math.ceil(h1 * r), self.imgsz)),
+                             interpolation=cv2.INTER_LINEAR)
         if img.ndim == 2:
             img = img[..., None]
         label["img"] = np.ascontiguousarray(img)
@@ -1000,6 +1052,16 @@ class BaseDataset(Dataset):
 
     def _segment_bases(self) -> SegmentBases:
         """Return the seven segment boundaries of the mixed sample pool, plus the pool total.
+
+        L8: cached after the first call -- branch switches are fixed once ``v8_transforms`` is
+        assembled, so recomputing 6 getattrs + a list on every ``__getitem__`` was pure overhead.
+        """
+        if getattr(self, "_seg_cache", None) is None:
+            self._seg_cache = self._compute_segment_bases()
+        return self._seg_cache
+
+    def _compute_segment_bases(self) -> SegmentBases:
+        """Compute (once) the seven segment boundaries of the mixed sample pool, plus the total.
 
         Layout (each optional branch is an independent, contiguous segment gated ONLY by its own
         switch; slicing lives entirely inside the base segment):
@@ -1053,10 +1115,7 @@ class BaseDataset(Dataset):
         if self.rect:
             label["rect_shape"] = self.batch_shapes[self.batch[index]]
         # Keep the original on the same Mosaic mix pool as every other sample (cache != 'ram')
-        if self.augment and self.cache != "ram":
-            self.buffer.append(index)
-            if 1 < len(self.buffer) >= self.max_buffer_length:
-                self.buffer.pop(0)
+        self._touch_buffer(index)
         return self.update_labels_info(label)
 
     def _compose_on(self) -> bool:
@@ -1173,10 +1232,7 @@ class BaseDataset(Dataset):
         label["img"] = np.ascontiguousarray(blur)
 
         # Keep the blurred image on the same Mosaic mix pool as every other sample (cache != 'ram')
-        if self.augment and self.cache != "ram":
-            self.buffer.append(index)
-            if 1 < len(self.buffer) >= self.max_buffer_length:
-                self.buffer.pop(0)
+        self._touch_buffer(index)
 
         # Optional save for visual inspection (blur_save_dir set). Annotated per
         # slice_save_annotated, capped by slice_save_max_blur (P2-3: per-branch override; falls back to
@@ -1235,10 +1291,7 @@ class BaseDataset(Dataset):
         label["img"] = np.ascontiguousarray(out)
 
         # Keep the degraded image on the same Mosaic mix pool as every other sample (cache != 'ram')
-        if self.augment and self.cache != "ram":
-            self.buffer.append(index)
-            if 1 < len(self.buffer) >= self.max_buffer_length:
-                self.buffer.pop(0)
+        self._touch_buffer(index)
 
         # Optional save for visual inspection (weather_save_dir set). Annotated per
         # slice_save_annotated, capped by slice_save_max_weather (falls back to slice_save_max),
@@ -1281,6 +1334,7 @@ class BaseDataset(Dataset):
         if self._occlusion_mask is not None and not self._occlusion_mask[img_index]:
             out = im
             oc_boxes = []
+            otype = "none"  # defensive: keep the name defined on every path
         else:
             types = [t.strip() for t in str(getattr(self, "occlusion_types", "rect,stripe")).split(",") if t.strip()]
             otype = random.choice(types) if types else "rect"
@@ -1303,23 +1357,21 @@ class BaseDataset(Dataset):
             # 多个遮挡块相互重叠时重叠区被重复计入, 覆盖率虚高, 目标可能被提前按 max_cover
             # 误剔除。块数通常 1~3 且只对含目标的图执行, 布尔掩码开销可忽略。
             # (M7: 顺带删除从未被使用的 oc_area_sum 死代码)
-            oc_mask = np.zeros((h, w), dtype=bool)
-            for (ox0, oy0, ox1, oy1) in oc_boxes:
-                ox0i, oy0i = max(0, int(ox0)), max(0, int(oy0))
-                ox1i, oy1i = min(w, int(math.ceil(ox1))), min(h, int(math.ceil(oy1)))
-                if ox1i > ox0i and oy1i > oy0i:
-                    oc_mask[oy0i:oy1i, ox0i:ox1i] = True
             keep = np.ones(len(boxes), dtype=bool)
             for i, b in enumerate(boxes):
                 cx, cy, bw, bh = b[0] * w, b[1] * h, b[2] * w, b[3] * h
                 x0, y0, x1, y1 = cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2
                 area = max(1.0, (x1 - x0) * (y1 - y0))
-                x0i, y0i = max(0, int(math.floor(x0))), max(0, int(math.floor(y0)))
-                x1i, y1i = min(w, int(math.ceil(x1))), min(h, int(math.ceil(y1)))
-                if x1i > x0i and y1i > y0i:
-                    covered = float(oc_mask[y0i:y1i, x0i:x1i].sum())
-                else:
-                    covered = 0.0
+                # L7: clip every occluder to the target box and union their areas with exact
+                # rectangle math (no per-sample h*w bool mask; M8's union semantics preserved).
+                inter = []
+                for (ox0, oy0, ox1, oy1) in oc_boxes:
+                    ix0, iy0 = max(ox0, x0), max(oy0, y0)
+                    ix1, iy1 = min(ox1, x1), min(oy1, y1)
+                    if ix1 > ix0 and iy1 > iy0:
+                        inter.append((int(math.floor(ix0)), int(math.floor(iy0)),
+                                      int(math.ceil(ix1)), int(math.ceil(iy1))))
+                covered = _union_area(inter)
                 if covered / area >= max_cover:
                     keep[i] = False
             if not keep.all():
@@ -1332,10 +1384,7 @@ class BaseDataset(Dataset):
         label["img"] = np.ascontiguousarray(out)
 
         # Keep the occluded image on the same Mosaic mix pool as every other sample (cache != 'ram')
-        if self.augment and self.cache != "ram":
-            self.buffer.append(index)
-            if 1 < len(self.buffer) >= self.max_buffer_length:
-                self.buffer.pop(0)
+        self._touch_buffer(index)
 
         # Optional save for visual inspection (occlusion_save_dir set). Annotated per
         # slice_save_annotated, capped by slice_save_max_occlusion (falls back to slice_save_max),
@@ -1448,10 +1497,7 @@ class BaseDataset(Dataset):
             label["keypoints"] = k.astype(np.float32)
 
         # Keep the ratio-padded image on the same Mosaic mix pool as every other sample (cache != 'ram')
-        if self.augment and self.cache != "ram":
-            self.buffer.append(index)
-            if 1 < len(self.buffer) >= self.max_buffer_length:
-                self.buffer.pop(0)
+        self._touch_buffer(index)
 
         # Optional save of the ratio-padded image for visual inspection (ratio_pad_save_dir set).
         # Annotated per slice_save_annotated, capped by slice_save_max_ratio (P2-3: per-branch override,
@@ -1601,10 +1647,7 @@ class BaseDataset(Dataset):
                 )
 
         # Keep the composed image on the same Mosaic mix pool as every other sample (cache != 'ram')
-        if self.augment and self.cache != "ram":
-            self.buffer.append(index)
-            if 1 < len(self.buffer) >= self.max_buffer_length:
-                self.buffer.pop(0)
+        self._touch_buffer(index)
 
         # Resize to the training size (M1: shared tail)
         return self._finalize_label(label, big)
@@ -1694,9 +1737,7 @@ class BaseDataset(Dataset):
             and self.cache != "ram"
             and (slice_t is not None or self._extended_pool_on())
         ):
-            self.buffer.append(index)
-            if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent unbounded buffer
-                self.buffer.pop(0)
+            self._touch_buffer(index)
         if slice_t is not None and self.augment and slice_ok:
             # _load_image_cached: 直接读原图 jpg + worker 内存 LRU (.npy 磁盘缓存已移除)
             im = self._load_image_cached(img_index)
@@ -1705,21 +1746,11 @@ class BaseDataset(Dataset):
                     im, label, src=img_index, count=count_slice
                 )
             )
-            h1, w1 = im.shape[:2]
-            # Resize the sliced sub-image to the training size, preserving aspect ratio (same as load_image).
-            r = self.imgsz / max(h1, w1)
-            if r != 1:
-                im = cv2.resize(im, (math.ceil(w1 * r), math.ceil(h1 * r)), interpolation=cv2.INTER_LINEAR)
-            if im.ndim == 2:
-                im = im[..., None]
-            label["img"] = np.ascontiguousarray(im)
-            label["ori_shape"] = (h1, w1)  # sliced sub-image is the new "original" for downstream transforms
-            label["resized_shape"] = im.shape[:2]
-            label["ratio_pad"] = (
-                label["resized_shape"][0] / label["ori_shape"][0],
-                label["resized_shape"][1] / label["ori_shape"][1],
-            )
-            return self.update_labels_info(label)
+            # M-3 fix: reuse the shared tail instead of a third hand-rolled resize. The sliced sub-image
+            # becomes the new "original" for downstream transforms; _finalize_label applies the exact same
+            # resize + imgsz clamp as load_image and every other online branch, so resized_shape/ratio_pad
+            # can no longer drift (the old inline resize omitted the clamp).
+            return self._finalize_label(label, im)
         # load_image indexes the ORIGINAL image files, so always use img_index (== index in the non-sliced
         # case); in emit_all mode index is the expanded (4N) sample index and would overflow.
         label["img"], label["ori_shape"], label["resized_shape"] = self.load_image(img_index)
@@ -1831,22 +1862,39 @@ class SliceValDataset(Dataset):
         counts: list[int] = []
         metas: list[list[tuple[int, int, int, int]]] = []
         self._shapes: list[tuple[int, int]] = []
+        n_sliced = n_passthrough = 0
         for i, lb in enumerate(self.labels):
             h, w = lb.get("shape", (0, 0))[:2]
             self._shapes.append((int(h), int(w)))
-            slice_it = bool(self.all_tiles) and (mask is None or bool(mask[i])) and h >= 2 and w >= 2
-            if slice_it:
+            eligible = (mask is None or bool(mask[i])) and h >= 2 and w >= 2
+            if eligible:
                 tiles = slice_geometry(w, h, self.overlap_ratio)
-                counts.append(len(tiles))
-                metas.append(tiles)
+                if self.all_tiles:
+                    counts.append(len(tiles))
+                    metas.append(tiles)
+                else:
+                    # S1 fix: 文档承诺 all_tiles=False = "每图随机1片(快速验证)", 旧实现
+                    # `bool(self.all_tiles) and ...` 使 slice_it 恒为 False -> 全部整图直通,
+                    # 切片验证收益被系统性低估且不报错。改为随机取 2x2(+overlap) 切片中的 1 片。
+                    counts.append(1)
+                    metas.append([random.choice(tiles)])
+                n_sliced += 1
             else:
                 counts.append(1)
                 metas.append([(0, 0, w, h)])
+                n_passthrough += 1
         self._counts = counts
         self._metas = metas
         self._cum = [0]
         for c in counts:
             self._cum.append(self._cum[-1] + c)
+        # S1: val_slice_ratio<1 时部分图整图直通, 加日志说明实际产出, 避免调参反馈失真。
+        if mask is not None and 0 < self.ratio < 1.0:
+            LOGGER.info(
+                f"{self.base.prefix}val-slice: {n_sliced}/{n} originals sliced "
+                f"({'all tiles' if self.all_tiles else 'random 1 tile each'}), "
+                f"{n_passthrough}/{n} passed through as full images (val_slice_ratio={self.ratio})."
+            )
 
     def __len__(self) -> int:
         """Total number of validation samples (sum of per-original tile counts)."""
@@ -1874,7 +1922,7 @@ class SliceValDataset(Dataset):
         if hasattr(self.base, "_load_image_cached"):
             im = self.base._load_image_cached(oi)
         if im is None:
-            im = cv2.imread(label["im_file"])
+            im = imread(label["im_file"])  # M1: unicode-safe imread (was plain cv2.imread)
         if im is None:
             raise FileNotFoundError(
                 f"SliceValDataset: failed to load image {label['im_file']!r} for val-slicing "

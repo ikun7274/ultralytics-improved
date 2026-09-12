@@ -728,10 +728,17 @@ class BaseTrainer:
         """True when the second (whole-image) best/last checkpoint pair should be saved."""
         return bool(getattr(self.args, "val_slice_dual_metric", False)) and bool(getattr(self.args, "val_slice_enable", False))
 
-    def _serialize_ckpt(self, metrics: dict | None, fitness: float | None) -> bytes:
-        """Serialize a checkpoint to bytes with the given (already-prefixed) metrics."""
+    def _serialize_ckpt(self, metrics: dict | None, fitness: float | None, best_fitness: float | None = None) -> bytes:
+        """Serialize a checkpoint to bytes with the given (already-prefixed) metrics.
+
+        L-5: ``best_fitness`` is explicit so the whole-image pair records its OWN best value. It used to be
+        hardcoded to ``self.best_fitness`` (the sliced-metric best), which contradicted the whole-image
+        ``train_metrics`` stored in the same file and misled any resume/analysis reading best_whole.pt.
+        """
         import io
 
+        if best_fitness is None:
+            best_fitness = self.best_fitness
         ema = unwrap_model(self.ema.ema)
         ema = deepcopy(ema).half().to(memory_format=torch.contiguous_format)
         if hasattr(ema, "criterion"):
@@ -743,7 +750,7 @@ class BaseTrainer:
         torch.save(
             {
                 "epoch": self.epoch,
-                "best_fitness": self.best_fitness,
+                "best_fitness": best_fitness,
                 "model": None,  # resume and final checkpoints derive from EMA
                 "ema": ema,
                 "updates": self.ema.updates,
@@ -769,30 +776,21 @@ class BaseTrainer:
         return buffer.getvalue()
 
     def save_model(self):
-        """Save model training checkpoints with additional metadata."""
-        import io
-
+        """Repair the live EMA, then hand serialization over to ``_serialize_ckpt``."""
         # A transient NaN/Inf permanently poisons the EMA running average (ema = decay*ema + (1-decay)*model), so
         # save_model would otherwise skip every epoch and the run would finish with no checkpoint on valid input.
-        # Resync each poisoned EMA tensor from the live model where finite; any tensor that is non-finite in both is
-        # left for the nan_to_num_ pass below, so a usable checkpoint is always written.
+        # Resync each poisoned EMA tensor from the live model where finite. This mutates the LIVE EMA in place and
+        # must stay here; the NCHW/half/criterion-strip/clamp snapshot itself lives in _serialize_ckpt.
         ema = unwrap_model(self.ema.ema)
         if not all(torch.isfinite(v).all() for v in ema.state_dict().values() if isinstance(v, torch.Tensor)):
             model_sd = unwrap_model(self.model).state_dict()
             for k, v in ema.state_dict().items():
                 if isinstance(v, torch.Tensor) and not torch.isfinite(v).all() and torch.isfinite(model_sd[k]).all():
                     v.copy_(model_sd[k])
-        # Serialize NCHW regardless of channels_last training: released versions fuse with .view(), which crashes on
-        # NHWC-strided checkpoint weights, and trainer/predictor re-apply channels_last at setup anyway.
-        ema = deepcopy(ema).half().to(memory_format=torch.contiguous_format)
-        if hasattr(ema, "criterion"):
-            ema.criterion = None  # strip training-only state from the serialization snapshot
-        # Clamp fp16 serialization overflow without mutating the live EMA.
-        for v in ema.state_dict().values():
-            if isinstance(v, torch.Tensor) and v.is_floating_point():
-                torch.nan_to_num_(v)
 
-        # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
+        # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls). The snapshot (deepcopy +
+        # half + contiguous NCHW + criterion strip + fp16 clamp) is built inside _serialize_ckpt; duplicating it
+        # here only cost a full extra model deepcopy per epoch while leaving a dead local behind.
         serialized_ckpt = self._serialize_ckpt(self.metrics, self.fitness)
 
         # Save checkpoints
@@ -802,7 +800,7 @@ class BaseTrainer:
             self.best.write_bytes(serialized_ckpt)  # save best.pt
         # Dual-metric: save the second (whole-image reference) pair with its own metrics.
         if self._dual_weights_on() and self.whole_metrics is not None and self.fitness_whole is not None:
-            serialized_whole = self._serialize_ckpt(self.whole_metrics, self.fitness_whole)
+            serialized_whole = self._serialize_ckpt(self.whole_metrics, self.fitness_whole, self.best_fitness_whole)
             self.last_whole.write_bytes(serialized_whole)  # save last_whole.pt
             if self.best_fitness_whole == self.fitness_whole:
                 self.best_whole.write_bytes(serialized_whole)  # save best_whole.pt
@@ -900,16 +898,27 @@ class BaseTrainer:
         M6 refactor: the dual-metric code used to mutate ``self.validator.args.val_slice_enable``
         and ``self.validator.dataloader`` in place and restore them manually. If a pass raised, the
         validator stayed in the mode of the failed pass and every later epoch validated with the
-        wrong mode. ``try/finally`` restores both fields no matter how the pass exits. The dataloader
-        is only reset (forcing a rebuild) when the requested mode differs from the validator's
-        current mode -- an unchanged whole-image mode keeps reusing the prebuilt loader.
+        wrong mode. ``try/finally`` restores both fields no matter how the pass exits.
+
+        P0-1 fix: a rebuild is forced not only when the mode changes, but also when sliced mode is
+        requested while the current loader is NOT a sliced dataset. The trainer's prebuilt
+        ``test_loader`` is always a whole-image ``YOLODataset`` (it is built by
+        ``DetectionTrainer.get_dataloader`` and never goes through
+        ``DetectionValidator.get_dataloader``, the only place the ``SliceValDataset`` wrap lives), so
+        the previous "mode unchanged -> reuse prebuilt loader" shortcut meant ``val_slice_enable=True``
+        silently validated on whole images and the sliced pass never ran.
         """
+        from ultralytics.data.base import SliceValDataset
+
         cur_enable = bool(getattr(self.validator.args, "val_slice_enable", False))
         prev_loader = self.validator.dataloader
+        needs_rebuild = bool(slice_enable) != cur_enable or (
+            bool(slice_enable) and not isinstance(getattr(prev_loader, "dataset", None), SliceValDataset)
+        )
         try:
-            if bool(slice_enable) != cur_enable:
+            if needs_rebuild:
                 self.validator.args.val_slice_enable = bool(slice_enable)
-                self.validator.dataloader = None  # mode change -> force rebuild in the new mode
+                self.validator.dataloader = None  # force rebuild in the requested mode
             return self.validator(self)
         finally:
             self.validator.args.val_slice_enable = cur_enable
@@ -996,15 +1005,63 @@ class BaseTrainer:
     def plot_training_labels(self):
         """Plot training labels for YOLO model."""
 
+    def _read_csv_header(self) -> list[str] | None:
+        """Return the column names of an existing results.csv, or None when it is missing or empty."""
+        try:
+            with open(self.csv, encoding="utf-8") as f:
+                first = f.readline().strip()
+        except OSError:
+            return None
+        return first.split(",") if first else None
+
+    def _realign_csv(self, old_header: list[str], new_keys: list[str]) -> None:
+        """Rewrite results.csv so its header matches ``new_keys``, remapping old rows by column name.
+
+        Data rows in results.csv are positional (no column names), so appending a row with a different metric
+        set would silently shift/overrun every value. Each old row is re-keyed through the old header and
+        written back with the new column order; columns absent from the old run are left blank.
+        """
+        new_header = ["epoch", "time", *new_keys]
+        rows = []
+        with open(self.csv, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) == len(old_header) and parts[0] == old_header[0]:
+                    continue  # the old header line
+                rows.append(parts)
+        with open(self.csv, "w", encoding="utf-8") as f:
+            f.write(",".join(new_header) + "\n")
+            for parts in rows:
+                mapped = dict(zip(old_header, parts))
+                f.write(",".join(str(mapped.get(k, "")) for k in new_header) + "\n")
+        LOGGER.warning(
+            f"results.csv metric set changed ({len(old_header) - 2} -> {len(new_keys)} columns); existing rows "
+            f"were remapped onto the new header so later epochs stay aligned."
+        )
+
     def save_metrics(self, metrics):
-        """Save training metrics to a CSV file."""
+        """Append one epoch of metrics to results.csv, keeping the header and every row aligned.
+
+        M-5: the metric set can change between runs (e.g. resuming with val_slice_dual_metric enabled appends
+        the whole_* columns while check_resume keeps the existing results.csv). The file is positional, so rows
+        written after such a change would silently out-grow the header and plot_results() would mis-read them.
+        """
         keys, vals = list(metrics.keys()), list(metrics.values())
         n = len(metrics) + 2  # number of cols
         t = time.time() - self.train_time_start
         self.csv.parent.mkdir(parents=True, exist_ok=True)  # ensure parent directory exists
-        s = "" if self.csv.exists() else ("%s," * n % ("epoch", "time", *keys)).rstrip(",") + "\n"
+        if not self.csv.exists():
+            with open(self.csv, "w", encoding="utf-8") as f:
+                f.write(("%s," * n % ("epoch", "time", *keys)).rstrip(",") + "\n")
+        else:
+            old_header = self._read_csv_header()
+            if old_header is not None and len(old_header) != n:
+                self._realign_csv(old_header, keys)
         with open(self.csv, "a", encoding="utf-8") as f:
-            f.write(s + ("%.6g," * n % (self.epoch + 1, t, *vals)).rstrip(",") + "\n")
+            f.write(("%.6g," * n % (self.epoch + 1, t, *vals)).rstrip(",") + "\n")
 
     def plot_metrics(self):
         """Plot metrics from a CSV file."""
@@ -1028,6 +1085,11 @@ class BaseTrainer:
             LOGGER.info(f"\nValidating {model}...")
             self.validator.args.plots = self.args.plots
             self.validator.args.compile = False  # disable final val compile as too slow
+            if bool(getattr(self.args, "val_slice_enable", False)):
+                # _run_val restores the trainer's prebuilt WHOLE-image loader after every pass, so the final
+                # validation would silently report whole-image metrics while training reported sliced ones.
+                # Force a rebuild so the final val matches the training-time (sliced) protocol.
+                self.validator.dataloader = None
             self.metrics = self.validator(model=model)
             self.metrics.pop("fitness", None)
             self.epoch += 1  # log best metrics at step epochs+1, not overwriting last epoch

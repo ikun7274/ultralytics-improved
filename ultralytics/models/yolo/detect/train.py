@@ -73,7 +73,11 @@ class DetectionTrainer(BaseTrainer):
             (Dataset): YOLO dataset object configured for the specified mode.
         """
         gs = max(int(unwrap_model(self.model).stride.max()), 32)
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+        # val_slice needs real per-image shapes for tile geometry and the dual-metric whole-image
+        # reference must use the same rect=False protocol as the sliced pass, so disable rect for the
+        # val split whenever sliced validation is enabled.
+        rect = mode == "val" and not bool(getattr(self.args, "val_slice_enable", False))
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=rect, stride=gs)
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
         """Construct and return dataloader for the specified mode.

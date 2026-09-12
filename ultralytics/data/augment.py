@@ -17,6 +17,7 @@ from torch.nn import functional as F
 
 from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
 from ultralytics.utils import LOGGER, IterableSimpleNamespace, colorstr, deprecation_warn
+from ultralytics.utils.patches import imwrite  # M2: unicode-safe save (cv2.imwrite silently fails on non-ASCII paths)
 from ultralytics.utils.checks import check_version
 from ultralytics.utils.instance import Instances
 from ultralytics.utils.metrics import bbox_ioa
@@ -521,10 +522,17 @@ class Mosaic(BaseMixTransform):
                     x0, y0, x1, y1 = (int(round(float(v))) for v in b)
                     cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
                     cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            except Exception:
-                pass  # annotation drawing is best-effort for verification only
+            except Exception as e:
+                # annotation drawing is best-effort for verification only; keep a debug trace
+                LOGGER.debug(f"Mosaic: annotation drawing failed while saving (best-effort): {e}")
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(self.save_dir / f"mosaic_{self._save_tag}_{self._saved:05d}_n{n_inst}.jpg"), img)
+        if not imwrite(str(self.save_dir / f"mosaic_{self._save_tag}_{self._saved:05d}_n{n_inst}.jpg"), img):
+            # M2: never consume the save_max quota (nor silently pass) when the write actually failed.
+            LOGGER.warning(
+                f"Mosaic: save failed for '{self.save_dir}' (imwrite returned False) -- check path/permissions; "
+                "save_max quota NOT consumed."
+            )
+            return
         self._saved += 1
 
     def get_indexes(self):
@@ -1063,7 +1071,13 @@ class OnlineSlice(BaseTransform):
                 cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
                 cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(self.save_dir / f"{tag}_{self._saved:05d}_n{len(boxes_px)}.jpg"), img)
+        if not imwrite(str(self.save_dir / f"{tag}_{self._saved:05d}_n{len(boxes_px)}.jpg"), img):
+            # M2: never consume the save_max quota (nor silently pass) when the write actually failed.
+            LOGGER.warning(
+                f"OnlineSlice: tile save failed for '{self.save_dir}' (imwrite returned False) -- check "
+                "path/permissions; save_max quota NOT consumed."
+            )
+            return
         self._saved += 1
         if src is not None:
             self._saved_keys.add(src)
@@ -1202,8 +1216,9 @@ class OnlineSlice(BaseTransform):
                 if count and self.save_dir is not None and (self.save_max == 0 or self._saved < self.save_max):
                     self._save_tile(sub, np.empty((0, 4), dtype=np.float32), np.empty(0), f"bg{os.getpid()}", src)
                 return sub, self._empty_label(sub, label)
-            # Background quota reached: keep the original image unchanged (mode A contract). In emit_all mode
-            # (slice_at) this fallback is cropped to an empty tile so bbox coords never mismatch the tile.
+            # Background quota reached: keep the original image unchanged (mode A contract). In emit_all
+            # mode (slice_at) this is exactly the Plan A fallback -- the ORIGINAL image is returned, never an
+            # empty tile, so the returned image and its bbox coords always match.
             return img, label
 
         if count:
@@ -3363,6 +3378,10 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     # S5 修复附带: 此前该值从未被复制到 dataset 上, base.py 的 getattr(self, "close_aug_epoch", 0)
     # 恒为 0, 时间维调度从未生效; set_epoch/_rebuild_epoch_masks 靠它判断最后 N 个 epoch 全部关增强。
     dataset.close_aug_epoch = int(getattr(hyp, "close_aug_epoch"))
+
+    # M-1 fix: mirror the LRU capacity onto the dataset so it is self-describing (base.py consumes the same
+    # hyp key directly in __init__, since this function runs too late for an eager read there).
+    dataset.slice_raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", 2) or 0)
 
     # ---- 在线切片 (slice_prob 独立开关) ----
     slice_enabled = online_aug_on and getattr(hyp, "slice_prob") > 0.0
