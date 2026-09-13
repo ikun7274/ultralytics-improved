@@ -19,6 +19,7 @@ save_period: -1 # (int) save checkpoint every N epochs; disabled if < 1
 cache: False # (bool | str) cache images in RAM (True/'ram') or on 'disk' to speed dataloading; False disables
 device: # (int | str | list) device: 0/[0,1] CUDA, 'npu:0' Ascend, 'xpu:0' Intel, 'cpu'/'mps', -1/[-1,-1] auto GPUs
 workers: 8 # (int) dataloader workers (per RANK if DDP)
+prefetch_factor: 2 # (int) 每个 worker 预取的批次数; PyTorch 默认即为 2; 在线增强开启时降到 1 可减少约一半在途内存(相比改源码, 现可直接配置)
 project: # (str, optional) project name for results root
 name: # (str, optional) experiment name or export hardware target
 exist_ok: False # (bool) overwrite existing 'project/name' if True
@@ -132,8 +133,11 @@ mosaic: 1.0 # (float) mosaic augmentation probability
 slice_prob: 0.0 # (float) 在线切片概率 [0,1]; 0=关闭切片; 纯放大时建议配合 mosaic=0
 slice_ratio: 1.0 # (float) 每个 epoch 随机选 round(x*N) 张原图走在线切片(原图级: 同一原图 4 片同生共死), 其余整图进池;
                  # 1.0=纯切片(默认), <1.0 精确混入整图(缓解过拟合+降内存), 0=全整图(等效关闭切片); 每 epoch 重新随机
-slice_transform: # (str, 可选) 切片后接的额外变换名 (如 "hsv_h", "blur"); 与 pytools/sahi_*.py 中的同名变换一一对应, 便于复用离线调好的参数; 空=不附加
-slice_raw_cache_size: 2 # (int) 在线增强 worker 内原图 LRU 缓存大小 (以原图数计); 0=关闭; 切片+原图+比例+模糊+合成会让同一张原图被 imread 多达 8~9 次, LRU 把解码降到 ~1 次/原图
+slice_raw_cache_size: 2 # (int) 在线增强 worker 内原图 LRU 缓存大小 (以原图数计); 0=关闭; 切片+原图+比例+模糊+合成会让同一张原图被 imread 多达 8~9 次, LRU 把解码降到 ~1 次/原图; 实际下限为 4 (合成分支一次要读 4 张原图)
+slice_grouped_sampler: True # (bool) 分组采样: 同一张原图的子样本连续(单元内轮转)采样, 让上面的 LRU 真正命中; False=上游全局 shuffle
+                            # 关闭后同图子样本在池中平均相隔约 6.5N 个样本, 远超 LRU 容量 -> 几乎全 miss, 每张原图被重复解码 8~9 次(实测 4000x3000 单次解码 203ms vs 命中拷贝 21ms)
+                            # 代价: mosaic 的"近期样本池"收窄为当前单元(<=4 张原图) -> 每个 mosaic 仍是 4 张不同原图, 但同一单元内组合会重复; 需完全恢复上游 mosaic 随机性时设 False
+                            # 命中率每个 epoch 打印一次(LOG "raw-image LRU ... hit on N reads last epoch"), 便于确认是否生效
 slice_overlap_ratio: 0.2 # (float) 相邻切片重叠比例 [0,1); 例: 原图4000x3000、重叠0.2 -> 切片2400x1800
 slice_min_tile_area_ratio: 0.005 # (float) 切片块面积下界 [0,1]: 切片面积 < 原图x该值 的切片丢弃 (过小切片信息量低)
 slice_min_box_retain_ratio: 0.4 # (float) 目标框保留下界 [0,1]: 被边界切到的目标, 其在切片内可见面积占原框比例 < 该值则丢弃
@@ -151,7 +155,7 @@ slice_save_dir: # (str) 切片图保存目录; 空=不保存
 slice_save_max: 0 # (int) 默认保存限额: 同时作用于 [切片, ratio, blur, compose] 四类; 0=不限. 单独细调见 slice_save_max_{tile,ratio,blur,compose}
 slice_save_annotated: True # (bool) 保存时是否在图上画标注框+类别
 slice_save_exist_ok: True # (bool) 目录已存在时是否允许继续写入; False=抛错防覆盖
-# P2-3: 各分支独立保存限流 — 单独覆盖某分支时不互相挤占预算;
+# 各分支独立保存限流 — 单独覆盖某分支时不互相挤占预算;
 #       设了具体值即生效(0=不限), 未设置(None)回退到 slice_save_max.
 slice_save_max_tile: # (int, optional) 切片图保存上限; 0=不限; 未设=回退 slice_save_max
 slice_save_max_blur: # (int, optional) 模糊图保存上限; 0=不限; 未设=回退 slice_save_max
@@ -163,20 +167,34 @@ slice_keep_origin: False # (bool, 独立开关, 需 slice_all_tiles=True) 每张
 # ---------- 验证侧在线切片评估 (val_slice_*): 验证集按 2x2 重叠子图推理 + 坐标还原 + NMS 融合 ----------
 # 训练侧已在线切片, 验证侧整图直推会因小目标被降采样而低估切片训练的收益. 开启后验证阶段把验证图切成
 # 与训练一致的子图, 每子图独立推理, 子图框还原到原图坐标, 跨切片重复框 NMS 融合后与原图 GT 算 mAP (SAHI 评估).
-# val_slice_dual_metric=True 时另跑一遍整图验证, 输出 whole_* 参考指标, 并额外保存 best_whole.pt/last_whole.pt.
-val_slice_enable: True # (bool, 总开关) 验证侧切片评估; False=回归原生整图验证 (完全等价原版)
-val_slice_all_tiles: True # (bool) True=每张验证图全部 2x2 子图都推理 (与训练侧 slice_all_tiles 对齐); False=每图随机 1 片 (快速验证)
+# 默认全关 = 验证完全等价原生整图验证, 指标与上游/论文/其它工具链同口径.
+# !! 开启后 metrics/mAP* 变为"切片推理口径"(由它驱动 fitness/早停/best.pt), 与整图口径不可直接比较 !!
+# 成本: all_tiles=True 时每张验证图为 5 次 imgsz 前向(4 片 + 双口径整图), 验证耗时约 ×5.
+val_slice_enable: False # (bool, 总开关) 验证侧切片评估; False=回归原生整图验证 (完全等价原版, 默认)
+val_slice_all_tiles: False # (bool) True=每张验证图全部 2x2 子图都推理 (与训练侧 slice_all_tiles 对齐); False=每图随机 1 片 (快速验证)
 val_slice_ratio: 1.0 # (float) 每轮验证随机选 round(x*N_val) 张验证图走切片, 其余整图直通(1片=整图); 1.0=全部切片; 0=全部整图(等效关闭)
 val_slice_overlap_ratio: 0.2 # (float) 验证侧切片重叠比例 [0,1), 建议与训练侧 slice_overlap_ratio 一致
 val_slice_nms_iou: 0.5 # (float) 跨切片重复框 NMS 融合 IoU 阈值
-val_slice_dual_metric: True # (bool) 双口径: 先跑切片验证(主, 驱动 fitness/早停/best.pt), 再跑整图验证(参考), 输出 whole_* 指标并保存 best_whole.pt/last_whole.pt
+val_slice_dual_metric: False # (bool) 双口径: 先跑切片验证(主, 驱动 fitness/早停/best.pt), 再跑整图验证(参考), 输出 whole_* 指标并保存 best_whole.pt/last_whole.pt
+
+# ---------- 在线增强共享参数 (blur / weather / occlusion / ratio_pad) ----------
+# degrade_max_side: 退化分支的"工作分辨率上限". 这四类算子都是像素级操作(O(像素数)), 而样本随后
+#   立刻被缩放到 imgsz, 在原始传感器分辨率上执行纯属浪费 —— 4000x3000 帧实测三类算子合计 11.5x 可避免
+#   开销(单次 weather=noise 峰值达 824MB). 先降到该上限再退化, 并按比例缩放像素型参数(PSF 长度/失焦σ/雨线长度),
+#   缩放到 imgsz 后的结果近似等价(实测 mean|diff|=2.11, corr=0.9982).
+#   0=自动=2×imgsz (保留 2 倍过采样, 保证缩放时仍是降采样); >0=手动上限(像素, 长边); <0=关闭(原始分辨率退化, 旧行为).
+#   切片分支不受影响: 切片必须在原分辨率上执行(小目标放大是语义要求, 而非浪费).
+degrade_max_side: 0 # (int, 0=自动=2×imgsz, 默认开启) 退化分支最长边像素上限; >0=手动; <0=关闭
 
 # ---------- 在线合成 (compose_*): 每 4 张原图拼 1 张 2x2 大图, 提供更大范围多目标上下文 ----------
 compose_keep: False # (bool, 独立开关, 不依赖切片/keep_origin) 每 4 张原图额外合成 1 张 2x2 拼接大图进样本池 -> 样本池 +ceil(N/4)
 compose_ratio: 1.0 # (float, 需 compose_keep) 每 epoch 随机选 round(x*ceil(N/4)) 组做合成(组级), 未选中组退回组内第 1 张原图(整图直通, len 恒定); 1.0=全量合成
 compose_save: False # (bool, 默认关闭=不保存中间图) 需 compose_keep + 指定目录(compose_save_dir, 或回退 slice_save_dir/compose/): 保存合成大图供人工检查 (按 slice_save_annotated 画框, slice_save_max 限数量)
 compose_save_dir: "" # (str, 可选, 需 compose_keep + compose_save) 合成大图自定义保存目录 (独立于 slice_save_dir); 空=默认 slice_save_dir/compose/
-compose_max_side: 0 # (int, 0=自动=2×imgsz, 默认开启) 合成2x2大图拼后降采样的最长边上限(像素); 降低内存与后续处理开销, 标签为归一化坐标不受缩放影响; >0=手动指定上限(如 2560)
+compose_max_side: 0 # (int, 0=自动=2×imgsz, 默认开启) 合成 2x2 大图的最长边像素上限; 语义与 degrade_max_side 对齐: 0=自动=2×imgsz, >0=手动上限(如 2560), <0=关闭(全分辨率拼接)
+                    # 限幅在"拼接前": 每张原图先降到 上限/2 再分配画布, 因此画布本身不超过该上限。旧实现是"按原始分辨率拼完再整体降采样",
+                    # 实测 4 张 4000x3000(imgsz=640) 下耗时 92.6ms→11.9ms(7.8×)、峰值内存 141MB→7MB(20×); 标签为归一化坐标, 与像素缩放无关。
+                    # 注意: 该分支的限幅用 INTER_LINEAR 而非退化分支的 INTER_AREA —— 6.25 倍非整数抽样下后者走通用加权盒路径, 实测 40ms/张 vs 1.7ms/张。
 
 # ---------- 在线比例调整 (ratio_pad_*): 在线加边框统一宽高比 (change_image_resolution 工具在线版) ----------
 ratio_pad_keep: False # (bool, 独立开关, 不依赖切片/keep_origin) 每张原图额外生成 1 张"加边框对齐宽高比"的图进样本池 -> 样本池 +N

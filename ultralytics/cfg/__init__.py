@@ -251,9 +251,9 @@ CFG_FRACTION_KEYS = frozenset(
         "mosaic",
         "slice_prob",
         "slice_ratio",
-    "compose_ratio",
-    "ratio_pad_ratio",
-    "blur_ratio",
+        "compose_ratio",
+        "ratio_pad_ratio",
+        "blur_ratio",
         "slice_overlap_ratio",
         "slice_min_tile_area_ratio",
         "slice_min_box_retain_ratio",
@@ -266,7 +266,8 @@ CFG_FRACTION_KEYS = frozenset(
         "val_slice_ratio",
         "val_slice_overlap_ratio",
         "val_slice_nms_iou",
-        "mixup",        "cutmix",
+        "mixup",
+        "cutmix",
         "copy_paste",
         "erasing",
         "conf",
@@ -282,10 +283,12 @@ CFG_INT_KEYS = frozenset(
         "patience",
         "resume_extend_epochs",
         "compose_max_side",
+        "degrade_max_side",
         "slice_save_max_weather",
         "slice_save_max_occlusion",
         "occlusion_blocks",
         "workers",
+        "prefetch_factor",
         "seed",
         "close_mosaic",
         "close_aug_epoch",
@@ -350,6 +353,7 @@ CFG_BOOL_KEYS = frozenset(
         "compose_save",
         "slice_all_tiles",
         "slice_keep_origin",
+        "slice_grouped_sampler",
         "compose_keep",
         "ratio_pad_keep",
         "blur_keep",
@@ -365,11 +369,26 @@ CFG_BOOL_KEYS = frozenset(
         "mosaic_save_exist_ok",
     }
 )
-CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment", "slice_save_dir",
-                          "compose_save_dir", "ratio_pad_save_dir", "blur_save_dir",
-                          "ratio_pad_target", "ratio_pad_color", "mosaic_save_dir",
-                          "weather_types", "weather_save_dir",
-                          "occlusion_types", "occlusion_color", "occlusion_save_dir"})
+CFG_STR_KEYS = frozenset(
+    {  # string-only arguments
+        "optimizer",
+        "split",
+        "copy_paste_mode",
+        "auto_augment",
+        "slice_save_dir",
+        "compose_save_dir",
+        "ratio_pad_save_dir",
+        "blur_save_dir",
+        "ratio_pad_target",
+        "ratio_pad_color",
+        "mosaic_save_dir",
+        "weather_types",
+        "weather_save_dir",
+        "occlusion_types",
+        "occlusion_color",
+        "occlusion_save_dir",
+    }
+)
 
 
 def cfg2dict(cfg: str | Path | dict | SimpleNamespace) -> dict:

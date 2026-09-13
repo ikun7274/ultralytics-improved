@@ -1,25 +1,25 @@
 import os
+import sys
 import argparse
 import shutil
 from pathlib import Path
+
+# 共享的路径安全护栏（同目录 _safe_io.py）：直接运行 `python pytools/<脚本>.py` 时
+# 该目录已在 sys.path 上，这里再兜底一次以兼容 `python -m pytools.<脚本>` 的调用方式。
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from _safe_io import safe_rmtree, validate_io_dirs  # noqa: E402
+
 from PIL import Image
 from tqdm import tqdm
 import math
 
-# P1-10: Pillow >= 10 removed ``Image.LANCZOS`` (use ``Image.Resampling.LANCZOS``); keep a fallback
+# Pillow >= 10 removed ``Image.LANCZOS`` (use ``Image.Resampling.LANCZOS``); keep a fallback
 # so this script still runs against older Pillow too.
 _LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS", getattr(Image, "LANCZOS", None))
 if _LANCZOS is None:
     raise RuntimeError("Pillow 不再提供 LANCZOS resampling filter; 请升级 Pillow 或回退 low-level 调用.")
-
-
-def safe_rmtree(path, description="目录"):
-    p = Path(path).resolve()
-    if p == p.root or p == Path.home().resolve():
-        raise RuntimeError(f"拒绝删除 {description}：{p} 疑似系统关键路径")
-    if p.exists():
-        print(f"将删除 {description}：{p}")
-        shutil.rmtree(p)
 
 
 def parse_yolo_label(txt_path):
@@ -167,10 +167,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="统一图片宽高比(加黑边)并同步转换YOLO标签: auto双向(4:3<->16:9)或指定目标比例统一所有图"
     )
-    parser.add_argument("--input_dir", type=str, default="",
-                        help="输入目录, 应包含 images/ 和 labels/ 子目录 (必传; 例: D:/datasets/base_0_0)")
-    parser.add_argument("--output_dir", type=str, default="",
-                        help="输出目录, 将自动创建 images/ 和 labels/ (必传; 例: D:/datasets/base_0_1)")
+    parser.add_argument("--input_dir", type=str, required=True,
+                        help="输入目录（必传），应包含 images/ 和 labels/ 子目录 (例: D:/datasets/base_0_0)")
+    parser.add_argument("--output_dir", type=str, required=True,
+                        help="输出目录（必传），将自动创建 images/ 和 labels/ (例: D:/datasets/base_0_1)")
     parser.add_argument("--target_ratio", type=str, default="auto",
                         choices=["auto", "4:3", "16:9"],
                         help="目标比例: auto=仅4:3<->16:9双向(其他复制); 4:3/16:9=所有图统一到该比例")
@@ -178,25 +178,23 @@ def main():
                         help="黑边颜色: black/gray/white")
     parser.add_argument("--max_side", type=int, default=0,
                         help="输出图片最大边长(px), 0=不缩放")
-    parser.add_argument("--overwrite", action="store_true", default=True,
-                        help="覆盖已有输出目录")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="覆盖已存在的输出目录（默认关闭：输出目录已存在时报错退出，避免误删数据）")
     args = parser.parse_args()
 
-    input_path = Path(args.input_dir)
-    if not input_path.exists():
-        raise FileNotFoundError(f"输入目录不存在: {input_path}")
+    # 目录校验：必传 + 拒绝 cwd/系统关键路径 + 输入≠输出，全部在删除动作之前完成
+    input_path, output_path = validate_io_dirs(args.input_dir, args.output_dir)
 
     img_dir = input_path / "images"
     label_dir = input_path / "labels"
     if not img_dir.exists():
         raise FileNotFoundError(f"未找到 images 子目录: {img_dir}")
 
-    output_path = Path(args.output_dir)
     if output_path.exists():
         if args.overwrite:
             safe_rmtree(output_path, description="输出目录")
         else:
-            raise FileExistsError(f"输出目录已存在, 请使用 --overwrite 覆盖")
+            raise FileExistsError(f"输出目录已存在: {output_path}；确认要覆盖请显式加 --overwrite")
 
     out_img_dir = output_path / "images"
     out_label_dir = output_path / "labels"

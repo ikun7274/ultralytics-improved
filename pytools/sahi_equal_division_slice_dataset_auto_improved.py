@@ -1,10 +1,19 @@
 import os
+import sys
 import logging
 import argparse
 import json
 import shutil
 import random
 from pathlib import Path
+
+# 共享的路径安全护栏（同目录 _safe_io.py）：直接运行 `python pytools/<脚本>.py` 时
+# 该目录已在 sys.path 上，这里再兜底一次以兼容 `python -m pytools.<脚本>` 的调用方式。
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from _safe_io import assert_deletable, require_nonempty, safe_rmtree  # noqa: E402
+
 from tqdm import tqdm
 from PIL import Image
 import cv2
@@ -27,17 +36,6 @@ COLOR_PALETTE = [
     (0, 128, 128),  # 深青
     (128, 128, 0),  # 橄榄
 ]
-
-
-def safe_rmtree(path, description="目录"):
-    """安全删除目录，防止误删关键路径"""
-    p = Path(path).resolve()
-    if p == p.root or p == Path.home().resolve():
-        raise RuntimeError(f"拒绝删除 {description}：{p} 疑似系统关键路径")
-    if p.exists():
-        item_count = len(list(p.iterdir()))
-        print(f"将删除 {description}：{p}（包含 {item_count} 个项目）")
-        shutil.rmtree(p)
 
 
 def clear_dir(path):
@@ -109,7 +107,15 @@ def validate_args(args):
         raise ValueError(f"workers 必须 >= 1，当前值：{args.workers}")
 
     orig_resolved = Path(args.orig_root).resolve()
+    # 空值/None 会退化成 Path(".") == cwd，必须先挡掉，否则后续 rmtree 会删掉工作目录
+    require_nonempty({
+        "原始数据集目录 --orig_root": args.orig_root,
+        "临时 COCO 目录 --coco_tmp": args.coco_tmp,
+        "切片输出目录 --slice_coco_dir": args.slice_coco_dir,
+        "最终输出目录 --final_yolo_dir": args.final_yolo_dir,
+    })
     for output_dir in [args.coco_tmp, args.slice_coco_dir, args.final_yolo_dir]:
+        assert_deletable(output_dir, description="输出目录")
         out_resolved = Path(output_dir).resolve()
         if orig_resolved == out_resolved:
             raise ValueError(f"输入目录与输出目录相同：{output_dir}，会导致原始数据被删除！")
@@ -700,18 +706,14 @@ def visualize_random_samples(
 def main():
     parser = argparse.ArgumentParser(description="YOLO 数据集固定2x2网格切片工具（支持重叠、双重面积过滤）")
     # 目录
-    parser.add_argument("--orig_root", type=str,
-                        default="",
-                        help="原始 YOLO 数据集根目录 (必传; 例: D:/datasets/base_0_0)")
-    parser.add_argument("--coco_tmp", type=str,
-                        default="",
-                        help="临时 COCO 存放目录 (必传; 例: D:/datasets/coco_temp)")
-    parser.add_argument("--slice_coco_dir", type=str,
-                        default="",
-                        help="切片输出目录 (必传; 例: D:/datasets/slice_coco_output)")
-    parser.add_argument("--final_yolo_dir", type=str,
-                        default="",
-                        help="最终 YOLO 切片数据集输出目录 (必传; 例: D:/datasets/base_0_1)")
+    parser.add_argument("--orig_root", type=str, required=True,
+                        help="原始 YOLO 数据集根目录（必传; 例: D:/datasets/base_0_0）")
+    parser.add_argument("--coco_tmp", type=str, required=True,
+                        help="临时 COCO 存放目录（必传; 例: D:/datasets/coco_temp）")
+    parser.add_argument("--slice_coco_dir", type=str, required=True,
+                        help="切片输出目录（必传; 例: D:/datasets/slice_coco_output）")
+    parser.add_argument("--final_yolo_dir", type=str, required=True,
+                        help="最终 YOLO 切片数据集输出目录（必传; 例: D:/datasets/base_0_1）")
     # 格式导出
     parser.add_argument("--export_json", action="store_true", default=True,
                         help="是否导出 X-AnyLabeling 格式的 JSON")

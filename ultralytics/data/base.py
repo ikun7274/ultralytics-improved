@@ -9,314 +9,139 @@ import multiprocessing
 import os
 import random
 import zlib
+from collections import OrderedDict, deque
 from copy import deepcopy
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Iterator, NamedTuple
 
 import cv2
 import numpy as np
-from torch.utils.data import Dataset
+import torch
+from torch.utils.data import Dataset, Sampler
 
+# NOTE: `_WEATHER_TYPES` / `_OCCLUSION_TYPES` are deliberately NOT imported here. This module never
+# uses them; their only consumer is `augment.v8_transforms`, which imports them straight from
+# `online_degrade`. Importing them here purely to re-export makes them dead names to any linter, and
+# since the module does not otherwise need them, a routine `ruff --fix` (F401) or an IDE "optimise
+# imports" deletes the lines -- which silently disables the construction-time `weather_types` /
+# `occlusion_types` whitelist, so a typo degrades to the runtime random fallback instead of raising.
+from ultralytics.data.online_degrade import (
+    _RATIO_PAD_COLORS,
+    _apply_motion_blur,
+    _apply_occlusion,
+    _apply_weather,
+    _ratio_pad_params,
+    _union_area,
+)
+from ultralytics.data.online_io import _ensure_dir, _imwrite, _save_cap
 from ultralytics.data.utils import FORMATS_HELP_MSG, HELP_URL, IMG_FORMATS, check_file_speeds, get_split_fraction
 from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER, NUM_THREADS, TQDM
-from ultralytics.utils.patches import imread, imwrite
+from ultralytics.utils.patches import imread
 
-
-# --- Online aspect-ratio pad helpers (in-memory port of pytools/change_image_resolution_slice_dataset_auto_improved.py) ---
-_RATIO_REL_TOL = 0.02
-_RATIO_43 = 4.0 / 3.0
-_RATIO_169 = 16.0 / 9.0
-_RATIO_PAD_COLORS = {"black": (0, 0, 0), "gray": (114, 114, 114), "white": (255, 255, 255)}
-
-
-def _ratio_pad_params(w: int, h: int, target_ratio: str, auto: bool):
-    """Compute border-padding to reach a target aspect ratio (in-memory port of the offline tool).
-
-    - ratio < target (portrait-ish): keep height, widen with left/right symmetric borders
-    - ratio > target (landscape-ish): keep width, heighten with top/bottom symmetric borders
-    - already close to the target: return None (no pad needed -> copy / use original)
-    - auto: 4:3 <-> 16:9 bidirectional; any other ratio goes to its NEAREST of 4:3 or 16:9
-    Returns (new_w, new_h, pad_left, pad_top) or None.
-    """
-    ratio = w / h
-    if auto:
-        if math.isclose(ratio, _RATIO_43, rel_tol=_RATIO_REL_TOL):
-            target = _RATIO_169  # 4:3 -> 16:9
-        elif math.isclose(ratio, _RATIO_169, rel_tol=_RATIO_REL_TOL):
-            target = _RATIO_43  # 16:9 -> 4:3
-        else:
-            target = _RATIO_43 if abs(ratio - _RATIO_43) <= abs(ratio - _RATIO_169) else _RATIO_169
-    else:
-        target = _RATIO_43 if target_ratio == "4:3" else _RATIO_169
-        if math.isclose(ratio, target, rel_tol=_RATIO_REL_TOL):
-            return None
-    if ratio < target:  # widen
-        new_w = max(1, int(round(h * target)))
-        new_h = h
-        pad_left = (new_w - w) // 2
-        pad_top = 0
-    else:  # heighten
-        new_w = w
-        new_h = max(1, int(round(w / target)))
-        pad_left = 0
-        pad_top = (new_h - h) // 2
-    return new_w, new_h, pad_left, pad_top
-
-
-def _motion_blur_kernel(length: float, angle: float) -> np.ndarray:
-    """Build a line-segment PSF motion-blur kernel (in-memory port of the offline motion_blur tool).
-
-    0 deg = horizontal-right; kernel is squared with an odd size (>=3); the segment is drawn anti-aliased
-    and normalized to sum = 1 (keeps brightness unchanged after convolution).
-    """
-    rad = np.deg2rad(angle)
-    # ceil (not int()) so the half-length from the center never gets truncated by the border: int() would
-    # silently shorten the effective blur for fractional lengths (e.g. 9.5 -> size 9, only 8px of blur).
-    # `| 1` forces an odd size so the center pixel is well defined. Matches the offline tool's `ceil|1`.
-    size = max(3, math.ceil(length) | 1)
-    kernel = np.zeros((size, size), dtype=np.float32)
-    center = size // 2
-    dx = np.cos(rad)
-    dy = np.sin(rad)
-    length_scaled = length / 2.0
-    x1 = center - dx * length_scaled
-    y1 = center - dy * length_scaled
-    x2 = center + dx * length_scaled
-    y2 = center + dy * length_scaled
-    cv2.line(kernel, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))),
-             1.0, thickness=1, lineType=cv2.LINE_AA)
-    # Guard against a zero/degenerate kernel (e.g. blur_*_len_*: 0 -> a single point may not be rasterized).
-    # Dividing by 0 would produce NaN pixels -> NaN loss, and train.py's blanket `filterwarnings('ignore')`
-    # hides the RuntimeWarning, so the failure would surface only as a silently ruined run.
-    ksum = float(kernel.sum())
-    if not ksum > 0:
-        kernel[:] = 0.0
-        kernel[size // 2, size // 2] = 1.0  # degenerate to an identity (no-op) kernel
-    else:
-        kernel /= ksum
-    return kernel
-
-
-def _apply_motion_blur(img: np.ndarray, length: float = 15.0, angle: float = 30.0,
-                       defocus_sigma: float = 0.0) -> np.ndarray:
-    """Apply motion blur (and optional defocus) to a BGR/grayscale image (in-memory port of the offline tool)."""
-    kernel = _motion_blur_kernel(length, angle)
-    blurred = cv2.filter2D(img, -1, kernel)
-    if defocus_sigma > 0:
-        ksize = int(6 * defocus_sigma) | 1  # odd kernel size
-        blurred = cv2.GaussianBlur(blurred, (ksize, ksize), defocus_sigma)
-    return blurred
-
-
-def _apply_weather(img: np.ndarray, wtype: str, rain_density: float = 0.15, rain_length: float = 15.0,
-                   haze_beta: float = 0.4, noise_std: float = 15.0) -> np.ndarray:
-    """Apply one weather degradation (rain / haze / Gaussian noise) to a BGR image, in memory.
-
-    Labels are UNCHANGED (degradation never moves targets). Intensities are sampled randomly per
-    call so the model does not overfit to a single degradation level:
-      - rain:  ~density*max(h,w) semi-transparent streaks at a fixed 20-degree slant; alpha 0.2-0.6.
-      - haze:  atmospheric-scattering model I = J*t + A*(1-t), t = 1-beta, A = gray atmosphere (200).
-      - noise: additive Gaussian noise (RGB independent), sensor/low-light simulation.
-    `wtype` is one of "rain" / "haze" / "noise" (caller picks randomly from `weather_types`).
-    """
-    if wtype == "rain":
-        h, w = img.shape[:2]
-        n = max(1, int(rain_density * max(h, w)))
-        ang = math.radians(20.0)
-        dx, dy = math.sin(ang), math.cos(ang)
-        # L1 fix: 向量化生成 n 条线段端点, 按厚度分两批 cv2.polylines 一次画完。
-        # 旧实现逐根 cv2.line (大图 density=0.15*4000px ≈ 600 次 Python->C 调用/样本,
-        # 比向量化的 haze/noise 慢 1-2 个量级)。线段数量/位置/长度/厚度分布语义不变。
-        x0s = np.random.uniform(0.0, float(w), size=n)
-        y0s = np.random.uniform(0.0, float(h), size=n)
-        lens = rain_length * np.random.uniform(0.5, 1.0, size=n)
-        x1s = np.clip(x0s - dx * lens, 0.0, float(w))
-        y1s = np.clip(y0s - dy * lens, 0.0, float(h))
-        pts = np.stack([np.stack([x0s, y0s], axis=1), np.stack([x1s, y1s], axis=1)], axis=1).astype(np.int32)
-        thick2 = np.random.rand(n) < 0.5  # ~一半厚度 2, 一半厚度 1 (与原 random.choice((1,2)) 一致)
-        overlay = img.copy()
-        for t in (1, 2):
-            batch = pts[thick2] if t == 2 else pts[~thick2]
-            if len(batch):
-                cv2.polylines(overlay, [p for p in batch], isClosed=False, color=(205, 205, 225),
-                              thickness=t, lineType=cv2.LINE_AA)
-        alpha = np.random.uniform(0.2, 0.6)  # single RNG family (np.random) with the rain lines
-        return cv2.addWeighted(img, 1.0 - alpha, overlay, alpha, 0)
-    if wtype == "haze":
-        t = max(0.0, min(1.0, 1.0 - haze_beta))
-        atm = np.full_like(img, 200, dtype=np.float32)
-        return np.clip(img.astype(np.float32) * t + atm * (1.0 - t), 0, 255).astype(np.uint8)
-    # noise
-    noise = np.random.normal(0.0, max(0.0, float(noise_std)), img.shape)
-    return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-
-def _union_area(rects: list[tuple[int, int, int, int]]) -> float:
-    """Exact area of the union of axis-aligned integer rectangles (x-sweep + y-interval merge).
-
-    Replaces the full-image bool mask (h*w bytes per occluded sample -- 4000x3000 ~ 12 MB)
-    with an exact small computation: occluder counts are 1~3 per sample, so the sweep is O(k^2 log k).
-    Integer pixel semantics match the old mask exactly: a rect [x0, x1) x [y0, y1) covers
-    (x1-x0) * (y1-y0) pixels.
-    """
-    if not rects:
-        return 0.0
-    xs = sorted({x0 for x0, _, _, _ in rects} | {x1 for _, _, x1, _ in rects})
-    total = 0.0
-    for a, b in zip(xs, xs[1:]):
-        if b <= a:
-            continue
-        ys = sorted((y0, y1) for x0, y0, x1, y1 in rects if x0 <= a and b <= x1)
-        if not ys:
-            continue
-        cur0, cur1 = ys[0]
-        span = 0.0
-        for y0, y1 in ys:
-            if y0 <= cur1:
-                cur1 = max(cur1, y1)
-            else:
-                span += cur1 - cur0
-                cur0, cur1 = y0, y1
-        span += cur1 - cur0  # last merged interval
-        total += span * (b - a)
-    return total
-
-
-def _apply_occlusion(
-    img: np.ndarray,
-    otype: str,
-    blocks: int = 1,
-    size_ratio: float = 0.1,
-    color: str = "auto",
-) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
-    """Draw semantic occlusion blocks (rect / stripe) on a BGR image, in memory.
-
-    Simulates real drone-view occluders -- tree crowns, shadows, power lines, cloud edges. Labels
-    are NOT moved by the drawing itself (the caller decides max_cover-based removal); returns the
-    occluded image plus the pixel ``(x0, y0, x1, y1)`` boxes of every block so the caller can
-    compute per-target covered ratios.
-
-    - ``rect``: random rectangle, side in [0.5, 1.0] * base (base = sqrt(size_ratio * area)).
-    - ``stripe``: thin band (width ~2% of the short side, length 0.5-1.0 of the long side),
-      near-horizontal or near-vertical (models power lines / branches / cloud edges).
-    - ``color='auto'``: sample the image's dark-quartile mean so the block blends into the scene
-      instead of being a stark black blob; ``black`` / ``gray`` are fixed alternatives.
-    """
-    h, w = img.shape[:2]
-    out = img.copy()
-    base = max(2.0, math.sqrt(max(1.0, size_ratio) * h * w))
-    oc_color = "auto"
-    # auto color: mean of the darkest ~25% pixels (per-channel), a plausible tree/shadow tone
-    if color == "auto":
-        # L2 fix: 旧实现 reshape 全图(1200万像素)后 np.quantile 全量排序, 大图每样本约 1-2s 纯浪费;
-        # 改为大步长均匀采样 (步长 37 为素数, 与图像行宽互质, 覆盖全图任意偏移), ~32 万像素足够稳定估计 25 分位。
-        flat = img.reshape(-1, img.shape[2])[::37]
-        q = np.quantile(flat, 0.25, axis=0)
-        oc_color = tuple(int(round(float(v))) for v in q)
-    elif color == "black":
-        oc_color = (0, 0, 0)
-    else:  # gray
-        oc_color = (128, 128, 128)
-    boxes = []
-    for _ in range(max(1, int(blocks))):
-        if otype == "stripe":
-            thick = max(2, int(0.02 * min(h, w)))
-            length = int(max(h, w) * random.uniform(0.5, 1.0))
-            vertical = random.random() < 0.5
-            if vertical:
-                cx = random.uniform(0.0, float(w))
-                cy = random.uniform(0.0, float(h))
-                x0, x1 = max(0, int(cx - thick // 2)), min(w, int(cx + thick // 2) + 1)
-                y0, y1 = max(0, int(cy - length // 2)), min(h, int(cy + length // 2) + 1)
-                cv2.rectangle(out, (x0, y0), (x1, y1), oc_color, -1)
-                boxes.append((x0, y0, x1, y1))
-            else:
-                cx = random.uniform(0.0, float(w))
-                cy = random.uniform(0.0, float(h))
-                x0, x1 = max(0, int(cx - length // 2)), min(w, int(cx + length // 2) + 1)
-                y0, y1 = max(0, int(cy - thick // 2)), min(h, int(cy + thick // 2) + 1)
-                cv2.rectangle(out, (x0, y0), (x1, y1), oc_color, -1)
-                boxes.append((x0, y0, x1, y1))
-        else:  # rect
-            side = base * random.uniform(0.5, 1.0)
-            bw, bh = int(side * random.uniform(0.7, 1.3)), int(side * random.uniform(0.7, 1.3))
-            x0 = random.uniform(0.0, max(1.0, float(w - bw)))
-            y0 = random.uniform(0.0, max(1.0, float(h - bh)))
-            x0i, y0i = int(x0), int(y0)
-            x1i, y1i = min(w, x0i + bw), min(h, y0i + bh)
-            cv2.rectangle(out, (x0i, y0i), (x1i, y1i), oc_color, -1)
-            boxes.append((x0i, y0i, x1i, y1i))
-    return np.ascontiguousarray(out), boxes
-
-
-# Directories already created in this process (see _ensure_dir).
-_MKDIR_DONE: set[str] = set()
-
-
-def _ensure_dir(path) -> None:
-    """Create ``path`` (with parents) once per process; later calls are a no-op.
-
-    The save branches used to call ``mkdir(parents=True, exist_ok=True)`` before *every* write, i.e. once
-    per sample per worker -- a pointless syscall storm on spinning disks, and a lock convoy on network
-    storage when 8 workers race on the same directory.
-    """
-    key = str(path)
-    if key in _MKDIR_DONE:
-        return
-    Path(path).mkdir(parents=True, exist_ok=True)
-    _MKDIR_DONE.add(key)
-
-
-def _imwrite(path, img) -> bool:
-    """Write an image using Ultralytics' unicode-safe ``imwrite`` and warn when it fails.
-
-    OpenCV's own ``cv2.imwrite`` silently fails on non-ASCII paths -- verified in this very project, where
-    it *returned True* while the file never appeared on disk. Never ignore the return value.
-    """
-    ok = bool(imwrite(str(path), img))
-    if not ok:
-        LOGGER.warning(f"{img.shape} save failed: imwrite returned False for '{path}' (check path/permissions).")
-    return ok
-
-
-def _save_cap(dataset, branch: str) -> int:
-    """Return the per-branch save cap (P2-3 decoupling).
-
-    Each branch (tile/ratio/blur/compose) used to share the legacy ``slice_save_max`` budget, so enabling
-    compose_save would silently cap tile/ratio/blur to the same total and vice versa. The new params
-    ``slice_save_max_{tile,ratio,blur,compose}`` -- if set -- override the global cap per branch. A None
-    or missing attribute falls back to ``slice_save_max``. ``0`` means unlimited in either case.
-
-    Args:
-        dataset: BaseDataset instance (read attribute from ``self``).
-        branch (str): One of "tile", "ratio", "blur", "compose" -- picks the override attribute name.
-    """
-    attr = f"slice_save_max_{branch}"
-    val = getattr(dataset, attr, None)
-    if val is None:
-        val = getattr(dataset, "slice_save_max", 0) or 0
-    return int(val)
-
-
-# M2/M3: epoch 级比例参数的默认值唯一事实源。default.yaml 是训练侧的权威默认; 这里只在
-# dataset 脱离 v8_transforms 直接构造时兜底, 任何一处改动都必须与 default.yaml 同步。
-_RATIO_DEFAULTS: dict[str, float] = {
+# Single source of truth for the online-augmentation defaults used when the dataset was NOT assembled
+# by ``v8_transforms`` (direct construction, tests, offline reuse). ``default.yaml`` remains the
+# authoritative user-facing default; this table exists only so the fallbacks cannot drift between the
+# 20+ ``getattr(self, <online key>, <literal>)`` call sites below, and the values here MUST equal the
+# matching ``DEFAULT_CFG`` entries -- ``tests/test_online_augment.py`` asserts exactly that.
+_ONLINE_DEFAULTS: dict[str, Any] = {
+    # epoch-level branch ratios (rebuilt per epoch by set_epoch; see _mask_specs)
     "slice_ratio": 1.0,
     "ratio_pad_ratio": 1.0,
     "blur_ratio": 1.0,
     "compose_ratio": 1.0,
     "weather_ratio": 0.5,
     "occlusion_ratio": 0.5,
+    # independent branch switches
+    "slice_all_tiles": False,
+    "slice_keep_origin": False,
+    "ratio_pad_keep": False,
+    "blur_keep": False,
+    "compose_keep": False,
+    "weather_keep": False,
+    "occlusion_keep": False,
+    # motion blur
+    "blur_short_len_min": 5,
+    "blur_short_len_max": 12,
+    "blur_long_len_min": 20,
+    "blur_long_len_max": 35,
+    "blur_long_defocus_sigma": 1.0,
+    # weather
+    "weather_types": "rain,haze,noise",
+    "weather_rain_density": 0.15,
+    "weather_rain_length": 15.0,
+    "weather_haze_beta": 0.4,
+    "weather_noise_std": 15.0,
+    # occlusion
+    "occlusion_types": "rect,stripe",
+    "occlusion_blocks": 1,
+    "occlusion_size_ratio": 0.1,
+    "occlusion_color": "auto",
+    "occlusion_max_cover": 0.95,
+    # aspect-ratio padding
+    "ratio_pad_target": "auto",
+    "ratio_pad_color": "black",
+    # working-resolution caps (0 = auto)
+    "compose_max_side": 0,
+    "degrade_max_side": 0,
+    # sampling / caching
+    "slice_grouped_sampler": True,
+    # annotated saves
+    "slice_save_annotated": True,
+    "slice_save_max": 0,
+    "slice_save_dir": None,
+    "compose_save_dir": "",
+    "ratio_pad_save_dir": "",
+    "blur_save_dir": "",
+    "weather_save_dir": "",
+    "occlusion_save_dir": "",
 }
 
-# M4: weather/occlusion 类型的合法集合 (与 _apply_weather / _apply_occlusion 的分派一致)。
-_WEATHER_TYPES: frozenset[str] = frozenset({"rain", "haze", "noise"})
-_OCCLUSION_TYPES: frozenset[str] = frozenset({"rect", "stripe"})
+
+def _online_default(key: str) -> Any:
+    """Return the online-augmentation fallback for ``key`` (see ``_ONLINE_DEFAULTS``)."""
+    return _ONLINE_DEFAULTS[key]
+
+
+def _cap_long_side(im: np.ndarray, cap: float, interp: int = cv2.INTER_AREA) -> tuple[np.ndarray, float]:
+    """Downscale ``im`` so its long side is at most ``cap`` pixels, with an explicit ``interp`` kernel.
+
+    Single implementation of the online pipeline's "working resolution" rule, shared by the
+    degradation branches (via ``BaseDataset._degrade_frame``) and by compose. ``cap <= 0`` disables
+    the cap.
+
+    Returns ``(img, scale)`` where ``scale`` is the factor actually applied, so pixel-typed
+    parameters (PSF length, defocus sigma, rain-line length) can be scaled with it and keep the
+    post-resize result near-identical to the uncapped path.
+
+    ``interp`` is exposed because the right kernel depends on the consumer. ``INTER_AREA`` (the
+    default, used by the degradation branches) is the better anti-aliasing filter, but for a
+    NON-INTEGER decimation ratio it falls back to OpenCV's general weighted-box path, which measured
+    40 ms per 4000x3000 source against 1.7 ms for ``INTER_LINEAR`` in the same 6.25x decimation --
+    a 24x difference that dwarfs everything else compose does. compose therefore asks for
+    ``INTER_LINEAR``, which is also what the pre-fix canvas downscale used, so its resampling
+    quality is unchanged.
+
+    NOTE: when no downscale is needed the SAME object is returned (``scale == 1.0``), so callers
+    that get an uncapped frame must not mutate it in place if it may alias a shared cache buffer.
+    """
+    if cap <= 0:
+        return im, 1.0
+    h, w = im.shape[:2]
+    longest = max(h, w)
+    if longest <= cap:
+        return im, 1.0
+    s = cap / longest
+    return cv2.resize(im, (max(1, round(w * s)), max(1, round(h * s))), interpolation=interp), s
+
+
+# Branches allowed to use BaseDataset._save_annotated. Whitelisted so a mistyped branch name fails
+# loudly instead of silently creating a fresh, empty save counter.
+_SAVE_BRANCHES: frozenset[str] = frozenset({"tile", "ratio", "blur", "compose", "weather", "occlusion"})
 
 
 class SegmentBases(NamedTuple):
-    """Mixed-pool segment boundaries (M5 refactor: named fields instead of a bare 8-tuple).
+    """Mixed-pool segment boundaries: named fields instead of a bare 8-tuple.
 
     Field order equals the legacy tuple order, so position-unpacking call sites remain valid;
     new code should prefer the named fields to avoid mis-ordering bugs.
@@ -330,6 +155,77 @@ class SegmentBases(NamedTuple):
     weather: int
     occlusion: int
     total: int
+
+
+class GroupedImageSampler(Sampler[int]):
+    """Shuffle the sample pool while keeping every sub-sample of one source image together.
+
+    Why this exists
+    ---------------
+    ``BaseDataset._raw_cache`` is a per-worker LRU of ORIGINAL-resolution frames whose capacity is
+    ``max(4, slice_raw_cache_size)``. It can only pay off if the sub-samples of one source image are
+    visited while that image is still resident. The pool's index layout does cluster them
+    (``index // n_per`` in the base segment, contiguous runs in the other segments), but the trainer
+    shuffles the pool globally, so with N images a sub-sample's siblings sit ~``6.5 * N`` samples away
+    -- the LRU misses on nearly every call and each sub-sample re-decodes its original JPEG (measured
+    203 ms for a 4000x3000 frame vs 21 ms for a cached-frame copy).
+
+    Ordering rule
+    -------------
+    Consumes the "units" produced by :meth:`BaseDataset.grouped_sample_units`: a unit is a group of at
+    most four source images, holding each image's pool indices as its own block. Units are visited in
+    random order and each unit is consumed ROUND-ROBIN over its blocks, so all of the unit's source
+    images stay inside the LRU for the whole unit and each is decoded once instead of once per
+    sub-sample.
+
+    Trade-off (deliberate, and why it is a config switch)
+    -----------------------------------------------------
+    Mosaic draws its 3 partner images from ``dataset.buffer`` -- the most recent ``max_buffer_length``
+    samples. Under grouped sampling that window is the current unit rather than several hundred
+    unrelated images: every mosaic still stitches four DIFFERENT scenes, but the same four recur
+    within a unit, and so does the batch composition. Set ``slice_grouped_sampler=False`` to restore
+    upstream Mosaic randomness at the cost of re-decoding each original once per sub-sample.
+
+    Not used for DDP (``rank != -1`` keeps ``DistributedSampler`` for shard balance) and not used when
+    :meth:`BaseDataset.grouped_sample_units` reports that grouping cannot pay off.
+    """
+
+    def __init__(self, units: list[list[list[int]]], seed: int = 0):
+        self.units = units
+        self._total = sum(len(block) for unit in units for block in unit)
+        self._generator = torch.Generator()
+        # Seeded like the other samplers in build_dataloader (off torch.initial_seed() so a run stays
+        # reproducible). The state advances on every __iter__, which is what gives each epoch a fresh
+        # permutation -- InfiniteDataLoader reuses one sampler object for the whole run.
+        self._generator.manual_seed(int(seed) % (1 << 63))
+
+    @classmethod
+    def from_dataset(cls, dataset, seed: int = 0) -> "GroupedImageSampler | None":
+        """Build a sampler for ``dataset``, or return ``None`` when grouping cannot pay off.
+
+        ``None`` means the caller should fall back to the plain shuffle, so this must stay cheap and
+        side-effect free for datasets that are not the online-augmented training set.
+        """
+        if not bool(getattr(dataset, "slice_grouped_sampler", _online_default("slice_grouped_sampler"))):
+            return None
+        build_units = getattr(dataset, "grouped_sample_units", None)
+        units = build_units() if callable(build_units) else None
+        return cls(units, seed=seed) if units else None
+
+    def __len__(self) -> int:
+        """Total pool size; always equal to ``len(dataset)``."""
+        return self._total
+
+    def __iter__(self) -> Iterator[int]:
+        """Yield every pool index exactly once, grouped so the raw LRU can absorb the re-reads."""
+        for unit in (self.units[i] for i in torch.randperm(len(self.units), generator=self._generator).tolist()):
+            blocks = unit
+            if len(blocks) > 1:  # vary which image is consumed first without breaking the round-robin
+                blocks = [blocks[j] for j in torch.randperm(len(blocks), generator=self._generator).tolist()]
+            for k in range(max(len(block) for block in blocks)):
+                for block in blocks:
+                    if k < len(block):
+                        yield block[k]
 
 
 
@@ -386,7 +282,13 @@ class BaseDataset(Dataset):
         """Store images in one contiguous array to preserve copy-on-write sharing between workers."""
 
         def __init__(self, images: list[np.ndarray]):
-            """Pack images and their layouts into contiguous NumPy arrays."""
+            """Pack images and their layouts into contiguous NumPy arrays.
+
+            SIDE EFFECT: every element of the CALLER's ``images`` list is set to ``None`` after being
+            packed, so the caller must not read that list again. ``cache_images`` is the only caller
+            and relies on this only to drop its references; the list itself is additionally replaced
+            by this object at the end of ``cache_images``.
+            """
             self.shapes = np.array([im.shape for im in images])
             self.dtypes = np.array([im.dtype.str for im in images])
             self.offsets = np.concatenate(([0], np.cumsum([im.nbytes for im in images])))
@@ -399,6 +301,13 @@ class BaseDataset(Dataset):
             """Return an image view by index."""
             i = range(len(self.shapes))[i]
             return self.buffer[self.offsets[i] : self.offsets[i + 1]].view(self.dtypes[i]).reshape(self.shapes[i])
+
+    # Raw-image LRU counters, declared at class level so ``_load_image_cached`` also works on objects
+    # built without ``__init__`` (tests, direct/standalone reuse). ``__init__`` re-sets them per
+    # instance; ``_publish_raw_cache_stats`` flushes them into shared memory.
+    _raw_hits: int = 0
+    _raw_misses: int = 0
+    _raw_cache_size: int = 0  # 0 = raw-image LRU off, so no cache and no counters (see __init__)
 
     def __init__(
         self,
@@ -458,23 +367,39 @@ class BaseDataset(Dataset):
             self.set_rectangle()
 
         # Buffer thread for mosaic images
-        self.buffer = []  # buffer size = batch size
         self.max_buffer_length = min((self.ni, self.batch_size * 8, 1000)) if self.augment else 0
+        # Mosaic buffer: a deque with an explicit maxlen gives O(1) eviction. The old list + pop(0)
+        # shifted up to 999 pointers on every sample (measured 3.7x slower than deque over 20k
+        # operations). The capacity reproduces the legacy steady state exactly: the old
+        # append-then-pop kept `max_buffer_length - 1` entries alive.
+        self.buffer = deque(maxlen=max(1, self.max_buffer_length - 1)) if self.augment else []
+        # Whole-image `self.ims` cache bookkeeping -- see `_remember_ims`. The mosaic buffer cannot
+        # bound `self.ims` once the extended pool is on, because the buffer then holds EXPANDED
+        # indices while `ims` is keyed by ORIGINAL index; `_ims_keys` is an independent
+        # insertion-ordered FIFO that keeps the cache bounded in every mode.
+        self._ims_keys: dict[int, None] = {}
+        # Bounded by the same working set as the mosaic buffer, which is the legacy steady-state cap
+        # (min(ni, batch_size * 8, 1000) - 1 imgsz-sized frames per worker).
+        self._ims_cap = max(1, self.max_buffer_length - 1) if self.augment else 0
 
-        # P0-4: per-worker LRU cache of ORIGINAL-resolution images. Without it one source image is
+        # Per-worker LRU cache of ORIGINAL-resolution images. Without it one source image is
         # decoded once per sub-sample (4 tiles + 1 origin + 1 ratio + 2 blur + weather/occlusion, plus
         # 4 compose reads) -- measured at 9.0x on the reference dataset. Sub-samples of the same image
         # live at CONSECUTIVE DATASET INDICES (`index // n_per == img_index`), so a capacity >= n_per
-        # absorbs nearly all of that WHEN the sampler visits them together. M-2 note: data/build.py has
+        # absorbs nearly all of that WHEN the sampler visits them together. Note: data/build.py has
         # no grouped sampler (RandomSampler permutes globally under shuffle=True), so the sampling ORDER
         # is not guaranteed adjacent and the LRU hit rate is lower than the index layout suggests.
-        # Keyed by original image index.
-        self._raw_cache = {}
-        # M-1 fix: read the capacity from ``hyp`` (the same source v8_transforms reads), NOT from ``self``.
-        # v8_transforms copies hyp's keys onto the dataset only AFTER __init__ returns, so the previous
-        # `getattr(self, "slice_raw_cache_size", 2)` always fell back to 2 -- the documented knob (and its
-        # "0 = off" semantics, and the raise-it-to-speed-up hint at the cache='ram' warning below) was dead.
-        self._raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", 2) or 0)
+        # Keyed by original image index; OrderedDict gives an explicit LRU order (see _load_image_cached).
+        self._raw_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        # Read the capacity from ``hyp`` (the same source v8_transforms reads), NOT from ``self``.
+        # v8_transforms copies hyp's keys onto the dataset only AFTER __init__ returns, so reading
+        # ``getattr(self, "slice_raw_cache_size", 2)`` here would always fall back to the default.
+        # ``slice_raw_cache_size=0`` still means "cache off"; any positive value is raised to 4
+        # because ``_build_compose_sample`` reads FOUR distinct originals within a single sample -- a smaller
+        # cache evicts them before the fourth read, which is exactly what the old default of 2 did.
+        _raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", 2) or 0)
+        self._raw_cache_size = max(4, _raw_cache_size) if _raw_cache_size > 0 else 0
+
         # Per-epoch slice mask (slice_ratio exact ratio, original-level). None = pure slicing or
         # slicing off. Rebuilt by set_epoch(epoch) at every epoch start; see get_image_and_label.
         self._slice_mask = None
@@ -485,7 +410,7 @@ class BaseDataset(Dataset):
         self._weather_mask = None
         self._occlusion_mask = None
         self._compose_mask = None
-        # S5 fix: cross-process epoch channel for DataLoader workers. InfiniteDataLoader spawns its
+        # Cross-process epoch channel for DataLoader workers. InfiniteDataLoader spawns its
         # workers ONCE at loader construction -- BEFORE any set_epoch -- and reuses them for the
         # whole run (reset() fires only at the close_mosaic epoch), so worker-side dataset copies
         # never see main-process mask rebuilds, on Windows spawn AND Linux fork alike. The trainer's
@@ -500,17 +425,57 @@ class BaseDataset(Dataset):
             self._mp_epochs = None
         # Epoch stamp of the masks/counters currently built in THIS process (-1 = none built yet).
         self._mask_stamp = -1
+        # the shared epoch is polled once every `_sync_every` samples instead of on EVERY sample.
+        # A locked multiprocessing.Value read per sample is measurable at 8 workers x tens of
+        # thousands of samples per epoch, while an epoch boundary only affects <= num_workers samples.
+        self._sync_every = 16
+        self._sync_tick = 0
         # Per-epoch mask RNG seed: derived from the file list only (stable across processes, runs
         # and PYTHONHASHSEED), so every process rebuilding masks for the same epoch derives
         # IDENTICAL masks without transporting them (see _rebuild_epoch_masks).
         self._mask_seed = zlib.crc32("\n".join(self.im_files).encode("utf-8", "ignore"))
+
+        # Lazily created state, declared here so the object shape is fixed after __init__ (IDE
+        # completion + static checking) instead of materialising on first use.
+        self._seg_cache: SegmentBases | None = None
+        self._compose_warned = False
+        # Per-branch annotated-save counters: {branch: [n_saved, {dedup keys}]}.
+        self._save_state: dict[str, list] = {}
+
+        # DataLoader prefetch depth, consumed by data/build.py's build_dataloader. PyTorch's own default
+        # is 2; exposing it in the config makes the documented memory guidance (halve the in-flight
+        # batches when online augmentation is on) applicable without editing build.py. Clamped to >= 1
+        # because PyTorch rejects 0, and build_dataloader drops it when num_workers == 0.
+        self.prefetch_factor = max(1, int(getattr(hyp, "prefetch_factor", 2) or 2))
+
+        # Grouped sampling: visit all sub-samples of one source image adjacently so the raw LRU above
+        # actually hits. Consumed by build.py's build_dataloader (see GroupedImageSampler for the
+        # ordering rule and the Mosaic trade-off); read from ``hyp`` for the same reason as above --
+        # v8_transforms copies hyp's keys onto the dataset only AFTER __init__ returns.
+        self.slice_grouped_sampler = bool(
+            getattr(hyp, "slice_grouped_sampler", _online_default("slice_grouped_sampler"))
+        )
+        # Raw-LRU hit/miss counters. Local ints (free to bump per read); DataLoader workers flush them
+        # into shared ints every ``_sync_every`` samples (see _publish_raw_cache_stats), because the
+        # whole point of the LRU is worker-local and its hit rate is otherwise unobservable -- the
+        # grouped sampler exists to raise it, so a silent regression must not be possible.
+        self._raw_hits = 0
+        self._raw_misses = 0
+        try:
+            self._mp_raw_hits = multiprocessing.Value("q", 0)
+            self._mp_raw_misses = multiprocessing.Value("q", 0)
+        except Exception:
+            self._mp_raw_hits = None
+            self._mp_raw_misses = None
+        # Last (hits, misses) already reported by this process, so set_epoch logs per-epoch deltas.
+        self._raw_reported = (0, 0)
 
         # Cache images (options are cache = True, False, None, "ram", "disk")
         self.ims, self.im_hw0, self.im_hw = [None] * self.ni, [None] * self.ni, [None] * self.ni
         # .npy 磁盘缓存已移除(实测无收益): npy_files 仅保留原生 cache='disk' 的默认位置(与 jpg 同目录)
         self.npy_files = [Path(f).with_suffix(".npy") for f in self.im_files]
         self.cache = cache.lower() if isinstance(cache, str) else "ram" if cache is True else None
-        # P0-3: the online branches (slice / blur / ratio / compose) need the ORIGINAL-resolution image, but
+        # the online branches (slice / blur / ratio / compose) need the ORIGINAL-resolution image, but
         # cache='ram' stores the image ALREADY resized to imgsz, so it can never serve them. It would just
         # eat tens of GB and -- via Mosaic.buffer_enabled = (cache != "ram") -- silently switch mosaic from
         # buffer sampling to uniform sampling. Degrade loudly instead of pretending to help.
@@ -544,12 +509,12 @@ class BaseDataset(Dataset):
             _n_origin = self.ni
             _parts = []
             if getattr(self, "slice_transform", None) is not None:
-                _parts.append("4 slices" if bool(getattr(self, "slice_all_tiles", False)) else "random 1 slice")
+                _parts.append("4 slices" if bool(getattr(self, "slice_all_tiles", _online_default("slice_all_tiles"))) else "random 1 slice")
             if self._keep_origin_on():
                 _parts.append("1 origin")
-            if bool(getattr(self, "ratio_pad_keep", False)):
+            if bool(getattr(self, "ratio_pad_keep", _online_default("ratio_pad_keep"))):
                 _parts.append("1 ratio")
-            if bool(getattr(self, "blur_keep", False)):
+            if bool(getattr(self, "blur_keep", _online_default("blur_keep"))):
                 _parts.append("2 blur")
             if self._compose_on():
                 _parts.append("N/4 compose")
@@ -683,21 +648,22 @@ class BaseDataset(Dataset):
             # Add to buffer if training with augmentations
             if self.augment and self.cache != "ram":
                 if getattr(self, "slice_transform", None) is None:
-                    # Without slicing, load_image's index is the dataset index, so buffer + ims cache are managed here.
+                    # Without slicing, load_image's index is the dataset index, so the ims cache and
+                    # the mosaic buffer are both managed here. The ims entry is ALWAYS bounded by
+                    # _remember_ims: without that bound this branch grew to one frame per image in
+                    # the dataset (~29 GB/worker for 8520 images at imgsz=1280) whenever the
+                    # extended pool was on, because the only eviction used to sit behind the
+                    # `not self._extended_pool_on` guard below.
                     self.ims[i], self.im_hw0[i], self.im_hw[i] = im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
+                    self._remember_ims(i)
                     if not self._extended_pool_on():
                         # Pure-ultralytics mode (no slicing, no project extension): the buffer can only
-                        # contain original-image indices, so self-managed append/pop/clear is safe.
+                        # contain original-image indices, so self-managed append is safe -- the deque
+                        # maxlen evicts the oldest entry in O(1).
                         self.buffer.append(i)
-                        if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent empty buffer
-                            j = self.buffer.pop(0)
-                            if self.cache != "ram":
-                                self.ims[j], self.im_hw0[j], self.im_hw[j] = None, None, None
                     # Extended pool on: the buffer is bookkept centrally by get_image_and_label with
-                    # EXPANDED indices; load_image must not pop/clear ims with them (j >= n would
-                    # overflow ims) -- e.g. slicing off + compose/blur/ratio/keep_origin on. The ims
-                    # cache above stays safe (i is an original index) and avoids re-reading disk on
-                    # the full-image path.
+                    # EXPANDED indices; load_image must not feed it original indices, or the buffer
+                    # would mix two index spaces -- e.g. slicing off + compose/blur/ratio/keep_origin on.
                 # With slicing: do NOT cache in self.ims here. get_image_and_label centrally manages the buffer
                 # with expanded indices; caching origin-indexed images here would leak memory (never released).
 
@@ -844,6 +810,7 @@ class BaseDataset(Dataset):
                 self._mp_epochs.value = int(epochs) if epochs is not None else -1
             except Exception as e:  # e.g. called inside a worker process; workers rebuild via _sync instead
                 LOGGER.debug(f"set_epoch: shared-memory epoch update skipped in this process: {e}")
+        self._log_raw_cache_stats()
         self._rebuild_epoch_masks(epoch, epochs)
 
     def _rebuild_epoch_masks(self, epoch: int, epochs: int | None = None) -> None:
@@ -852,18 +819,17 @@ class BaseDataset(Dataset):
         Deterministic per (dataset, epoch, epochs): masks are drawn from an RNG seeded ONLY by
         ``(_mask_seed, epoch, epochs)`` -- NOT from the global ``random`` stream -- so the main
         process and every DataLoader worker rebuilding the same epoch derive IDENTICAL masks with no
-        cross-process mask transport (S5). A worker that missed epochs and rebuilds late therefore
+        cross-process mask transport . A worker that missed epochs and rebuilds late therefore
         still produces exactly the masks of the current epoch. ``_mask_stamp`` is bumped first: the
         rebuild is idempotent for a given (epoch, epochs) pair.
         """
         self._mask_stamp = int(epoch)
         rng = random.Random(f"{self._mask_seed}:{int(epoch)}:{-1 if epochs is None else int(epochs)}")
-        # P3 fix (comment corrected by S5): reset OnlineSlice's positive/background counters every
-        # epoch so the neg_ratio background quota restarts per epoch instead of accumulating
-        # monotonically. The reset used to claim it "propagates to workers via fork inheritance" --
-        # it does not: InfiniteDataLoader forks/spawns workers once at construction, BEFORE any
-        # set_epoch. The reset now runs in EVERY process that rebuilds (main via set_epoch, each
-        # worker via _sync_epoch_masks).
+        # Reset OnlineSlice's positive/background counters every epoch so the neg_ratio background
+        # quota restarts per epoch instead of accumulating monotonically. The reset must NOT assume
+        # it "propagates to workers via fork inheritance" -- it does not: InfiniteDataLoader
+        # forks/spawns workers once at construction, BEFORE any set_epoch. The reset therefore runs
+        # in EVERY process that rebuilds (main via set_epoch, each worker via _sync_epoch_masks).
         st = getattr(self, "slice_transform", None)
         if st is not None and hasattr(st, "reset_counters"):
             st.reset_counters()
@@ -879,11 +845,11 @@ class BaseDataset(Dataset):
             self._occlusion_mask = np.zeros(n, dtype=bool)
             self._compose_mask = np.zeros((n + 3) // 4, dtype=bool)
             return
-        # --- 表驱动 (M2): 六条增强分支共享同构的"掩码 = round(x*count) 个随机位"逻辑。
+        # --- 表驱动 : 六条增强分支共享同构的"掩码 = round(x*count) 个随机位"逻辑。
         # 差异点只有: 开关谓词 / 比例属性 / 样本数 (compose 是组级 (n+3)//4, 其余原图级 n)。
         # 未选中位保留区段位置但回退原图 (len 恒定); 分支关闭或比例 >=1 时掩码为 None (全增强)。
         for attr, ratio_attr, on_fn, count in self._mask_specs(n):
-            x = float(getattr(self, ratio_attr, _RATIO_DEFAULTS[ratio_attr]))
+            x = float(getattr(self, ratio_attr, _online_default(ratio_attr)))
             mask = None
             if aug_on and on_fn() and 0.0 <= x < 1.0:
                 mask = np.zeros(count, dtype=bool)
@@ -892,17 +858,17 @@ class BaseDataset(Dataset):
             setattr(self, f"_{attr}_mask", mask)
 
     def _mask_specs(self, n: int) -> list[tuple[str, str, Callable[[], bool], int]]:
-        """Table-driven per-epoch mask construction (M2 refactor).
+        """Table-driven per-epoch mask construction (refactor).
 
         Each row: (mask attr suffix, ratio attr, branch-on predicate, sample count). compose is
         GROUP-level -- ``ceil(N/4)`` groups -- while every other branch is original-level (``N``).
-        Ratios fall back to ``_RATIO_DEFAULTS`` only when the dataset was built without
+        Ratios fall back to ``_ONLINE_DEFAULTS`` only when the dataset was built without
         ``v8_transforms`` (training always copies them from default.yaml).
         """
         return [
             ("slice", "slice_ratio", lambda: getattr(self, "slice_transform", None) is not None, n),
-            ("ratio", "ratio_pad_ratio", lambda: bool(getattr(self, "ratio_pad_keep", False)), n),
-            ("blur", "blur_ratio", lambda: bool(getattr(self, "blur_keep", False)), n),
+            ("ratio", "ratio_pad_ratio", lambda: bool(getattr(self, "ratio_pad_keep", _online_default("ratio_pad_keep"))), n),
+            ("blur", "blur_ratio", lambda: bool(getattr(self, "blur_keep", _online_default("blur_keep"))), n),
             ("compose", "compose_ratio", self._compose_on, (n + 3) // 4),
             ("weather", "weather_ratio", self._weather_on, n),
             ("occlusion", "occlusion_ratio", self._occlusion_on, n),
@@ -911,15 +877,28 @@ class BaseDataset(Dataset):
     def _sync_epoch_masks(self) -> None:
         """Rebuild this process's masks when the trainer published a NEW epoch through shared memory.
 
-        This is what makes ``set_epoch`` effective inside DataLoader workers at all (S5 fix):
+        This is what makes ``set_epoch`` effective inside DataLoader workers at all (fix):
         InfiniteDataLoader spawns workers once at loader construction -- before any set_epoch -- and
         reuses them for the whole run, so they can never observe the trainer's main-process calls.
-        Each worker polls the shared epoch on every ``__getitem__`` (one locked int read) and
-        rebuilds only on change; the rebuild is deterministic per epoch, so the worker's masks always
-        match the main process's. Same-process callers (workers=0 / direct iteration) pay the int
-        read and never rebuild here because ``set_epoch`` already rebuilt them.
+        Each worker polls the shared epoch periodically and rebuilds only on change; the rebuild is
+        deterministic per epoch, so the worker's masks always match the main process's. Same-process
+        callers (workers=0 / direct iteration) pay the int read and never rebuild here because
+        ``set_epoch`` already rebuilt them.
+
+        The poll runs once every ``_sync_every`` samples rather than on every sample: the read takes
+        a lock on a ``multiprocessing.Value``, which is not free at 8 workers x tens of thousands of
+        samples per epoch, while an epoch boundary only concerns the handful of samples a worker
+        draws right after it. At most ``_sync_every - 1`` samples therefore use the previous epoch's
+        masks, and this process's masks would otherwise already be stale by up to ``num_workers``.
         """
         v = self._mp_epoch
+        self._sync_tick += 1
+        if self._sync_tick % self._sync_every:
+            return
+        # Same amortization as the epoch poll below: the raw-LRU counters are worker-local, so they can
+        # only be observed if they are flushed, but a locked add per read would be worse than the
+        # misses it reports.
+        self._publish_raw_cache_stats()
         if v is None or not self.augment:
             return
         try:
@@ -949,7 +928,7 @@ class BaseDataset(Dataset):
         places; adding a new online branch and missing one of them desynchronises __len__ from the
         decodable index range and drops samples with no error at all.
         """
-        if not (bool(getattr(self, "slice_all_tiles", False)) and getattr(self, "slice_transform", None) is not None):
+        if not (bool(getattr(self, "slice_all_tiles", _online_default("slice_all_tiles"))) and getattr(self, "slice_transform", None) is not None):
             return 1
         return 4
 
@@ -963,46 +942,69 @@ class BaseDataset(Dataset):
         the slicing pipeline is off.
         """
         return (
-            bool(getattr(self, "slice_keep_origin", False))
-            and bool(getattr(self, "slice_all_tiles", False))
+            bool(getattr(self, "slice_keep_origin", _online_default("slice_keep_origin")))
+            and bool(getattr(self, "slice_all_tiles", _online_default("slice_all_tiles")))
             and getattr(self, "slice_transform", None) is not None
         )
 
     def _touch_buffer(self, index: int) -> None:
         """Record ``index`` in the mosaic-buffer FIFO, evicting the oldest entry past capacity.
 
-        Single home for the append/pop bookkeeping that used to be copy-pasted across every pool
-        branch (M3): the buffer strategy (capacity rule, eviction) now changes in one place.
+        Single home for the buffer bookkeeping that used to be copy-pasted across every pool
+        branch: the capacity rule and the eviction now change in one place. ``self.buffer`` is a
+        ``deque(maxlen=...)``, so the append itself evicts the oldest entry in O(1) -- the old
+        explicit ``pop(0)`` on a list was O(n).
         """
         if self.augment and self.cache != "ram":
             self.buffer.append(index)
-            if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent empty buffer
-                self.buffer.pop(0)
+
+    def _remember_ims(self, i: int) -> None:
+        """Record original index ``i`` in the ``self.ims`` FIFO, evicting the oldest entries.
+
+        ``self.ims`` is keyed by ORIGINAL index, but was historically evicted by the mosaic buffer,
+        which only holds original indices in pure-ultralytics mode. With the extended pool on the
+        buffer holds EXPANDED indices, so it could no longer release anything and the cache grew
+        without bound -- one imgsz-sized frame per image in the dataset, i.e. ~29 GB per worker for
+        8520 images at imgsz=1280, with no error and no warning. This FIFO restores the legacy bound
+        (``_ims_cap``) in every mode.
+
+        Only ever called for a freshly decoded frame (``cache == "ram"`` is excluded by the caller),
+        so a key that is already resident is left in place instead of being re-ordered: the set of
+        resident keys is what matters here, not strict LRU order.
+        """
+        if self._ims_cap <= 0 or i in self._ims_keys:
+            return
+        self._ims_keys[i] = None
+        while len(self._ims_keys) > self._ims_cap:
+            j = next(iter(self._ims_keys))
+            del self._ims_keys[j]
+            self.ims[j], self.im_hw0[j], self.im_hw[j] = None, None, None
 
     def _weather_on(self) -> bool:
         """True when the weather branch allocates samples (weather_keep independent switch)."""
-        return bool(getattr(self, "weather_keep", False))
+        return bool(getattr(self, "weather_keep", _online_default("weather_keep")))
 
     def _occlusion_on(self) -> bool:
         """True when the occlusion branch allocates samples (occlusion_keep independent switch)."""
-        return bool(getattr(self, "occlusion_keep", False))
+        return bool(getattr(self, "occlusion_keep", _online_default("occlusion_keep")))
 
-    def _save_annotated(self, branch: str, cdir, img: np.ndarray, boxes, cls, fname_body: str,
+    def _save_annotated(self, branch: str, branch_dir, img: np.ndarray, boxes, cls, file_stem: str,
                         key: tuple, save_annotated: bool) -> None:
-        """Shared annotated-save block for the online branches (M1 refactor).
+        """Shared annotated-save block for the online branches.
 
         Draws green boxes + class labels when ``save_annotated`` and boxes exist, then writes
-        ``<cdir>/<fname_body>_{seq:05d}_n{len(boxes)}.jpg``. Deduplicated per ``key`` across
-        epochs and capped by the per-branch save cap (``_save_cap``). Counter state lives on
-        ``self._{branch}_saved`` / ``self._{branch}_saved_keys`` (lazily created on first call).
-        The counter advances only when the write actually succeeds.
+        ``<branch_dir>/<file_stem>_{seq:05d}_n{len(boxes)}.jpg``. Deduplicated per ``key`` across epochs
+        and capped by the per-branch save cap (``_save_cap``). The counter advances only when the
+        write actually succeeds.
+
+        Counter state lives in ``self._save_state[branch]`` -- an explicit dict rather than
+        ``getattr(self, f"_{branch}_saved")``, which silently created a brand-new counter (and thus
+        a broken cap) on a misspelled ``branch`` instead of failing.
         """
-        cnt = getattr(self, f"_{branch}_saved", None)
-        if cnt is None:
-            cnt = 0
-            setattr(self, f"_{branch}_saved", cnt)
-            setattr(self, f"_{branch}_saved_keys", set())
-        keys = getattr(self, f"_{branch}_saved_keys")
+        if branch not in _SAVE_BRANCHES:
+            raise ValueError(f"_save_annotated: unknown branch {branch!r}; expected one of {sorted(_SAVE_BRANCHES)}.")
+        state = self._save_state.setdefault(branch, [0, set()])  # [n_saved, dedup keys]
+        cnt, keys = state
         save_cap = _save_cap(self, branch)
         if key in keys or (save_cap != 0 and cnt >= save_cap):
             return
@@ -1021,21 +1023,21 @@ class BaseDataset(Dataset):
                 cv2.rectangle(out, (x0, y0), (x1, y1), (0, 255, 0), 2)
                 cv2.putText(out, f"cls{int(c)}", (x0, max(0, y0 - 4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        _ensure_dir(cdir)
-        if _imwrite(cdir / f"{fname_body}_{cnt:05d}_n{len(boxes_arr)}.jpg", out):
-            setattr(self, f"_{branch}_saved", cnt + 1)
+        _ensure_dir(branch_dir)
+        if _imwrite(branch_dir / f"{file_stem}_{cnt:05d}_n{len(boxes_arr)}.jpg", out):
+            state[0] = cnt + 1
             keys.add(key)
 
     def _finalize_label(self, label: dict[str, Any], img: np.ndarray) -> dict[str, Any]:
         """Resize ``img`` to the training size and attach ori_shape / resized_shape / ratio_pad.
 
         Shared tail of every online-augmentation branch (blur / weather / occlusion / ratio /
-        compose). Kept in one place so resizing semantics cannot drift between branches (M1).
+        compose). Kept in one place so resizing semantics cannot drift between branches .
         """
         h1, w1 = img.shape[:2]
         r = self.imgsz / max(h1, w1)
         if r != 1:
-            # M6: clamp to imgsz exactly like load_image does -- float error could otherwise
+            # clamp to imgsz exactly like load_image does -- float error could otherwise
             # produce resized_shape == imgsz+1 and diverge from the vanilla-path semantics.
             img = cv2.resize(img, (min(math.ceil(w1 * r), self.imgsz), min(math.ceil(h1 * r), self.imgsz)),
                              interpolation=cv2.INTER_LINEAR)
@@ -1076,14 +1078,14 @@ class BaseDataset(Dataset):
         Returns a :class:`SegmentBases` named tuple (base, origin, ratio, blur, compose, weather,
         occlusion, total). ``total`` is derived from the SAME per-segment lengths as the
         boundaries, and ``__len__`` returns it verbatim -- the pool length and the decodable
-        index range therefore share one source of truth and can never drift apart. (M5)
+        index range therefore share one source of truth and can never drift apart. 
         """
         n = len(self.labels)
         base_len = n * self._n_per()  # base segment: the slicing pipeline's samples
         seg_lens = [
             n if self._keep_origin_on() else 0,  # origin
-            n if bool(getattr(self, "ratio_pad_keep", False)) else 0,  # ratio
-            2 * n if bool(getattr(self, "blur_keep", False)) else 0,  # blur (short + long)
+            n if bool(getattr(self, "ratio_pad_keep", _online_default("ratio_pad_keep"))) else 0,  # ratio
+            2 * n if bool(getattr(self, "blur_keep", _online_default("blur_keep"))) else 0,  # blur (short + long)
             (n + 3) // 4 if self._compose_on() else 0,  # compose (groups of 4)
             n if self._weather_on() else 0,  # weather
             n if self._occlusion_on() else 0,  # occlusion
@@ -1094,7 +1096,161 @@ class BaseDataset(Dataset):
         *boundaries, total = bases
         return SegmentBases(base_len, *boundaries, total)
 
-    def _origin_at(self, index: int, img_index: int) -> dict[str, Any]:
+    def grouped_sample_units(self) -> list[list[list[int]]] | None:
+        """Lay the sample pool out as "units of <= 4 source images" for decode-locality sampling.
+
+        The pool ALREADY clusters sub-samples of one image in the index dimension (``index // n_per``
+        in the base segment, contiguous runs in the other segments), but the trainer's global shuffle
+        destroys that adjacency: with N images the siblings of a sub-sample end up ~``6.5 * N``
+        samples away, far beyond the raw LRU's capacity of 4, so every sub-sample re-decodes its
+        original JPEG. This method rebuilds the adjacency in the ORDER dimension: it returns units
+        where ``units[u][j]`` is the list of pool indices that decode one source image, so a sampler
+        walking a unit round-robin keeps all of its source images resident.
+
+        Layout rules -- these MUST mirror ``_segment_bases`` / ``get_image_and_label`` (the returned
+        layout is validated against ``total`` below, and the guard turns a mismatch into a warning
+        instead of silently dropping samples):
+            base      ``n_per`` consecutive indices per image
+            origin    one index per image
+            ratio     one index per image
+            blur      two indices per image (short, long)
+            weather   one index per image
+            occlusion one index per image
+            compose   ONE index per GROUP of four images; it reads all four, so it is emitted first
+                      inside its unit and thereby primes the LRU for the whole unit
+
+        Units are consecutive blocks of four images, which is also the compose group size, so a compose
+        sample never straddles a unit boundary and every image owns exactly one block.
+
+        Returns ``None`` when grouping cannot pay off, in which case the caller keeps the plain
+        shuffle:
+            * the dataset is not augmenting, or the raw LRU is off -- there is nothing to reuse;
+            * ``n_per == 1`` and no extended segment -- every image maps to exactly ONE pool index, so
+              there is no repeated decode to absorb, and a block-ordered stream would only narrow
+              Mosaic's recent-sample window for no gain.
+
+        Grouping is a pure reordering: the multiset of indices is unchanged, which the final check
+        enforces.
+        """
+        if not self.augment or self._raw_cache_size <= 0:
+            return None
+        n = len(self.labels)
+        n_per = self._n_per()
+        if n < 1 or (n_per <= 1 and not self._extended_pool_on()):
+            return None
+        segment_bases = self._segment_bases()
+        # Only worth it when an original is re-read at least as often as the LRU capacity: below that
+        # the saved decodes do not pay for narrowing Mosaic's recent-sample window (e.g. ratio_pad_keep
+        # alone = 2 pool samples per image, where the 127-deep ``ims`` cache already absorbs the reuse).
+        if segment_bases.total < 4 * n:
+            return None
+        per_image: list[list[int]] = [[] for _ in range(n)]
+        for index in range(segment_bases.origin):  # base segment: [0, base_len) == n * n_per
+            per_image[index // n_per].append(index)
+        if self._keep_origin_on():
+            for i in range(n):
+                per_image[i].append(segment_bases.origin + i)
+        if bool(getattr(self, "ratio_pad_keep", _online_default("ratio_pad_keep"))):
+            for i in range(n):
+                per_image[i].append(segment_bases.ratio + i)
+        if bool(getattr(self, "blur_keep", _online_default("blur_keep"))):
+            for i in range(n):
+                per_image[i].extend((segment_bases.blur + 2 * i, segment_bases.blur + 2 * i + 1))
+        if self._weather_on():
+            for i in range(n):
+                per_image[i].append(segment_bases.weather + i)
+        if self._occlusion_on():
+            for i in range(n):
+                per_image[i].append(segment_bases.occlusion + i)
+
+        units: list[list[list[int]]] = []
+        # Units are ALWAYS consecutive blocks of four images, so every image owns exactly one block
+        # (no index can be emitted twice -- the check below enforces that).
+        compose_base = segment_bases.compose
+        n_compose = segment_bases.weather - compose_base  # ceil(n / 4) compose samples, one per group
+        for start in range(0, n, 4):
+            blocks = [per_image[i] for i in range(start, min(start + 4, n))]
+            group = start // 4
+            if group < n_compose:
+                # The compose sample reads its whole group at once, so it is emitted FIRST inside the
+                # unit that owns image ``start``: for a complete group its four decodes are exactly
+                # this unit's images and prime the LRU for every block here (an unselected compose
+                # group -- compose_ratio < 1 -- falls back to the single image ``start``). The tail
+                # group wraps around to earlier images, which is harmless: it costs those decodes once
+                # per epoch and the unit it belongs to only holds the images that are left.
+                blocks[0] = [compose_base + group, *blocks[0]]
+            units.append(blocks)
+
+        flat = sorted(index for unit in units for block in unit for index in block)
+        if flat != list(range(segment_bases.total)):
+            # Falling back to the plain shuffle is always CORRECT (it still visits every index once),
+            # it only loses the decode-locality win -- so degrade loudly instead of crashing a run.
+            LOGGER.warning(
+                f"{self.prefix}grouped_sample_units produced {len(flat)} indices but the pool holds "
+                f"{segment_bases.total}: the pool layout and the grouping rules have drifted apart. "
+                f"Falling back to the plain shuffle; fix the grouping rules in base.py."
+            )
+            return None
+        return units
+
+    def raw_cache_stats(self) -> tuple[int, int]:
+        """Return cumulative ``(hits, misses)`` of the worker-local raw-image LRU.
+
+        Workers flush their counters into shared memory every ``_sync_every`` samples
+        (see ``_publish_raw_cache_stats``), so in the main process this reports the aggregate of all
+        workers, up to the last flush. ``(0, 0)`` when the LRU is disabled or shared memory is
+        unavailable.
+        """
+        if getattr(self, "_raw_cache_size", 0) <= 0 or getattr(self, "_mp_raw_hits", None) is None:
+            return (0, 0)
+        try:
+            return (int(self._mp_raw_hits.value), int(self._mp_raw_misses.value))
+        except Exception:  # shared memory already closed (e.g. loader torn down)
+            return (0, 0)
+
+    def _publish_raw_cache_stats(self) -> None:
+        """Add this process's pending LRU counters into the shared totals (worker-side, amortized).
+
+        Called from ``_sync_epoch_masks`` on the same ``_sync_every`` tick as the epoch poll, so the
+        cost is two locked adds per ``_sync_every`` samples rather than two per read -- the same
+        reasoning that keeps the epoch poll out of the per-sample path.
+        """
+        shared = getattr(self, "_mp_raw_hits", None)
+        if shared is None or not (self._raw_hits or self._raw_misses):
+            return
+        try:
+            with shared.get_lock():
+                shared.value += self._raw_hits
+            with self._mp_raw_misses.get_lock():
+                self._mp_raw_misses.value += self._raw_misses
+        except Exception:
+            return
+        self._raw_hits = 0
+        self._raw_misses = 0
+
+    def _log_raw_cache_stats(self) -> None:
+        """Log the previous epoch's raw-image LRU hit rate (main process, once per epoch).
+
+        This is the regression alarm for the sampling order: the LRU's capacity cannot cover a global
+        shuffle, so a hit rate that collapses toward 0 means the grouped sampler is off, was disabled
+        by a guard, or the pool layout changed underneath it. Logged as a per-epoch delta so the
+        effect of ``close_mosaic`` / branch ratios (which change the read mix) stays visible.
+        """
+        if getattr(self, "_raw_cache_size", 0) <= 0 or not getattr(self, "augment", False):
+            return
+        stats = self.raw_cache_stats()
+        reads = (stats[0] - self._raw_reported[0]) + (stats[1] - self._raw_reported[1])
+        if reads <= 0:
+            return
+        hits = stats[0] - self._raw_reported[0]
+        self._raw_reported = stats
+        order = "grouped" if self.slice_grouped_sampler else "globally shuffled"
+        LOGGER.info(
+            f"{self.prefix}raw-image LRU (slice_raw_cache_size={self._raw_cache_size}, {order} sampler): "
+            f"{hits / reads:.1%} hit on {reads} reads last epoch"
+        )
+
+    def _build_origin_sample(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one un-sliced ORIGINAL-resolution sample (slice_keep_origin independent segment).
 
         The origin segment is laid out right after the base slicing segment (see _segment_bases) and
@@ -1112,8 +1268,12 @@ class BaseDataset(Dataset):
             label["resized_shape"][0] / label["ori_shape"][0],
             label["resized_shape"][1] / label["ori_shape"][1],
         )  # for evaluation
+        # ``self.batch`` is indexed by IMAGE index (0..ni-1) and yields a batch id, so the ORIGINAL
+        # index is the correct key here -- passing the expanded mixed-pool index would read past the
+        # end of ``self.batch`` (and pick the wrong batch) as soon as online augmentation and rect
+        # were ever allowed to coexist.
         if self.rect:
-            label["rect_shape"] = self.batch_shapes[self.batch[index]]
+            label["rect_shape"] = self.batch_shapes[self.batch[img_index]]
         # Keep the original on the same Mosaic mix pool as every other sample (cache != 'ram')
         self._touch_buffer(index)
         return self.update_labels_info(label)
@@ -1125,7 +1285,7 @@ class BaseDataset(Dataset):
         duplicating its targets and skewing the label distribution, so compose is switched off
         entirely in that case.
         """
-        return bool(getattr(self, "compose_keep", False)) and len(self.labels) >= 4
+        return bool(getattr(self, "compose_keep", _online_default("compose_keep"))) and len(self.labels) >= 4
 
     def _extended_pool_on(self) -> bool:
         """True when any project extension allocates samples beyond plain originals.
@@ -1138,14 +1298,14 @@ class BaseDataset(Dataset):
         """
         return (
             self._keep_origin_on()
-            or bool(getattr(self, "ratio_pad_keep", False))
-            or bool(getattr(self, "blur_keep", False))
+            or bool(getattr(self, "ratio_pad_keep", _online_default("ratio_pad_keep")))
+            or bool(getattr(self, "blur_keep", _online_default("blur_keep")))
             or self._weather_on()
             or self._occlusion_on()
             or self._compose_on()
         )
 
-    def _load_image_cached(self, img_index: int) -> np.ndarray:
+    def _load_image_cached(self, img_index: int, *, copy: bool = True) -> np.ndarray:
         """Load original-resolution image, with a tiny per-worker memory LRU (no .npy disk cache).
 
         Unified read path used by all online-augmentation branches (slice / blur / ratio /
@@ -1156,24 +1316,29 @@ class BaseDataset(Dataset):
         Returns the image as a contiguous uint8 array with at least 3 dims (H, W, C); grayscale
         is expanded to (H, W, 1).
 
-        Caching: a hit returns a COPY, not the cached array. Callers legitimately take ownership of the
-        result (e.g. ``_ratio_at`` keeps ``big = im`` when no padding is needed, and downstream affine /
-        mosaic transforms write in place), so handing out the cached buffer would corrupt it for the next
-        sub-sample of the same image. A memcpy is still ~10-30x cheaper than decoding a large JPEG.
+        Caching: by default a hit returns a COPY, not the cached array. Callers legitimately take
+        ownership of the result (e.g. ``_build_ratio_sample`` keeps ``big = im`` when no padding is
+        needed, and downstream affine / mosaic transforms write in place), so handing out the cached
+        buffer would corrupt it for the next sub-sample of the same image. A memcpy is still
+        ~10-30x cheaper than decoding a large JPEG.
+
+        ``copy=False`` opts out and may return the shared LRU buffer itself (a full-resolution
+        memcpy is ~20 ms on a 4000x3000 frame, so it is worth skipping when it is provably safe).
+        The contract: the caller must only READ the returned array -- never write into it, never
+        hand it to something that writes. compose uses this, because it only copies its sources
+        into a freshly allocated canvas.
         """
         # Per-worker LRU lookup (see __init__). Disabled when slice_raw_cache_size <= 0.
-        size = int(getattr(self, "_raw_cache_size", 2) or 0)
-        cache = getattr(self, "_raw_cache", None)
-        if cache is None:
-            cache = self._raw_cache = {}
+        size = self._raw_cache_size
+        cache = self._raw_cache
         if size > 0:
             hit = cache.get(img_index)
             if hit is not None:
-                # P4 fix: refresh the insertion order on hit (true LRU, not FIFO). The dict entry
-                # previously stayed in its original slot on a hit, so hot entries were evicted by
-                # the "drop oldest half" sweep purely by first-load time.
-                cache[img_index] = cache.pop(img_index)
-                return hit.copy()
+                # Refresh the order on hit, so hot entries are not evicted purely by first-load time
+                # (a plain dict hit used to leave the entry in its original slot).
+                cache.move_to_end(img_index)
+                self._raw_hits += 1
+                return hit.copy() if copy else hit
 
         f = self.im_files[img_index]
         im = imread(f, flags=self.cv2_flag)
@@ -1183,15 +1348,49 @@ class BaseDataset(Dataset):
             im = im[..., None]
 
         if size > 0:
-            if len(cache) >= size:
-                # dicts preserve insertion order: drop the oldest half to make room.
-                for k in list(cache)[: max(1, len(cache) // 2)]:
-                    cache.pop(k, None)
+            self._raw_misses += 1
+            # Evict one entry at a time from the LRU end; no key-list materialisation per miss.
+            while len(cache) >= size:
+                cache.popitem(last=False)
             cache[img_index] = im
-            return im.copy()
+            return im.copy() if copy else im
         return im
 
-    def _blur_at(self, index: int, img_index: int, long: bool = False) -> dict[str, Any]:
+    def _degrade_max_side(self) -> float:
+        """Pixel cap applied to the degradation branches before they run.
+
+        ``degrade_max_side`` semantics:
+            0 (default) -> auto: ``2 * imgsz`` (a 2x oversampled working resolution, so the final
+                           resize to ``imgsz`` still downsamples instead of upsampling);
+            > 0         -> that many pixels on the long side;
+            < 0         -> disabled: degrade at the original resolution (legacy behaviour).
+        """
+        v = float(getattr(self, "degrade_max_side", _online_default("degrade_max_side")) or 0)
+        if v < 0:
+            return 0.0
+        # 640 = BaseDataset.__init__'s own default, so the fallback cannot disagree with the class.
+        return v if v > 0 else 2.0 * float(getattr(self, "imgsz", 640))
+
+    def _degrade_frame(self, img_index: int) -> tuple[np.ndarray, float]:
+        """Load an original frame for a degradation branch, downscaled to ``degrade_max_side``.
+
+        blur / weather / occlusion are pixel-scale operations whose cost is O(pixels), yet the
+        sample is resized to ``imgsz`` immediately afterwards -- running them at full sensor
+        resolution is therefore pure waste (measured 11.5x across the three branches on a
+        4000x3000 frame) and inflates each kernel's transient allocation (824 MB for weather noise
+        at that size). Slicing keeps running at the original resolution: there it is a genuine
+        semantic requirement (small objects must be enlarged, not shrunk).
+
+        Returns ``(img, scale)`` where ``scale`` is the factor actually applied to the long side, so
+        pixel-typed parameters (PSF length, defocus sigma, rain-line length) can be scaled with it.
+        Scaling those parameters keeps the post-resize result near-identical to the uncapped path
+        (measured mean|diff| = 2.11 / corr = 0.9982), because the final resize preserves the
+        RELATIVE scale of the degradation; ``scale == 1.0`` means the frame was left untouched.
+        """
+        # The cap itself lives in _cap_long_side so compose can apply the same rule (see S-3).
+        return _cap_long_side(self._load_image_cached(img_index), self._degrade_max_side())
+
+    def _build_blur_sample(self, index: int, img_index: int, long: bool = False) -> dict[str, Any]:
         """Build one in-memory motion-blurred image from a single original image (online port of the offline
         motion_blur tool).
 
@@ -1206,25 +1405,26 @@ class BaseDataset(Dataset):
         ``img_index`` is the ORIGINAL image index this blurred sample derives from.
         """
         f = self.im_files[img_index]
-        im = self._load_image_cached(img_index)
-        h, w = im.shape[:2]
+        # Degrade at the capped resolution (_degrade_frame), scaling the PSF with it so the result
+        # after the resize to imgsz matches the original-resolution path (see _degrade_frame).
+        im, scale = self._degrade_frame(img_index)
         if long:
-            lo = float(getattr(self, "blur_long_len_min", 20))
-            hi = float(getattr(self, "blur_long_len_max", 35))
-            sigma = float(getattr(self, "blur_long_defocus_sigma", 1.0))
+            lo = float(getattr(self, "blur_long_len_min", _online_default("blur_long_len_min")))
+            hi = float(getattr(self, "blur_long_len_max", _online_default("blur_long_len_max")))
+            sigma = float(getattr(self, "blur_long_defocus_sigma", _online_default("blur_long_defocus_sigma")))
             tier = "long"
         else:
-            lo = float(getattr(self, "blur_short_len_min", 5))
-            hi = float(getattr(self, "blur_short_len_max", 12))
+            lo = float(getattr(self, "blur_short_len_min", _online_default("blur_short_len_min")))
+            hi = float(getattr(self, "blur_short_len_max", _online_default("blur_short_len_max")))
             sigma = 0.0
             tier = "short"
         # blur_ratio: 未选中原图跳过模糊, 整图直通 (位保留, len 恒定); 短+长同命运
         if self._blur_mask is not None and not self._blur_mask[img_index]:
             blur = im
         else:
-            length = random.uniform(lo, hi)
+            length = random.uniform(lo, hi) * scale
             angle = random.uniform(0.0, 180.0)
-            blur = _apply_motion_blur(im, length=length, angle=angle, defocus_sigma=sigma)
+            blur = _apply_motion_blur(im, length=length, angle=angle, defocus_sigma=sigma * scale)
 
         label = deepcopy(self.labels[img_index])
         label.pop("shape", None)
@@ -1235,24 +1435,24 @@ class BaseDataset(Dataset):
         self._touch_buffer(index)
 
         # Optional save for visual inspection (blur_save_dir set). Annotated per
-        # slice_save_annotated, capped by slice_save_max_blur (P2-3: per-branch override; falls back to
+        # slice_save_annotated, capped by slice_save_max_blur (per-branch override; falls back to
         # slice_save_max when the per-branch cap is not set), deduplicated per (image, tier) across epochs.
-        sdir = str(getattr(self, "blur_save_dir", "") or "")
-        if sdir:
-            cdir = Path(sdir)
+        save_dir = str(getattr(self, "blur_save_dir", _online_default("blur_save_dir")) or "")
+        if save_dir:
+            branch_dir = Path(save_dir)
             key = ("blur", tier, index)
-            # M1: 画框/去重/限额/命名抽到 _save_annotated; 计数仅在写入成功时前进。
+            # 画框/去重/限额/命名抽到 _save_annotated; 计数仅在写入成功时前进。
             self._save_annotated(
-                "blur", cdir, blur,
+                "blur", branch_dir, blur,
                 label.get("bboxes", np.empty((0, 4))), label.get("cls", np.empty((0, 1))),
                 f"blur_{tier}_p{os.getpid()}_img{img_index}", key,
-                bool(getattr(self, "slice_save_annotated", True)),
+                bool(getattr(self, "slice_save_annotated", _online_default("slice_save_annotated"))),
             )
 
-        # Resize to the training size (M1: shared tail)
+        # Resize to the training size (shared tail)
         return self._finalize_label(label, blur)
 
-    def _weather_at(self, index: int, img_index: int) -> dict[str, Any]:
+    def _build_weather_sample(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one in-memory weather-degraded image (rain / haze / Gaussian noise) from an original.
 
         Online port of the weather-degradation proposal: each sample picks ONE type randomly from
@@ -1267,22 +1467,23 @@ class BaseDataset(Dataset):
         ``img_index`` is the ORIGINAL image index this sample derives from.
         """
         f = self.im_files[img_index]
-        im = self._load_image_cached(img_index)
-        h, w = im.shape[:2]
+        # Degrade at the capped resolution; only the PIXEL-typed rain-line length scales with it
+        # (haze_beta / noise_std are intensity quantities and therefore resolution-independent).
+        im, scale = self._degrade_frame(img_index)
         # weather_ratio: 未选中原图整图直通 (位保留, len 恒定)
         if self._weather_mask is not None and not self._weather_mask[img_index]:
             out = im
-            wtype = "none"
+            weather_type = "none"
         else:
-            types = [t.strip() for t in str(getattr(self, "weather_types", "rain,haze,noise")).split(",") if t.strip()]
-            wtype = random.choice(types) if types else "haze"
+            types = [t.strip() for t in str(getattr(self, "weather_types", _online_default("weather_types"))).split(",") if t.strip()]
+            weather_type = random.choice(types) if types else "haze"
             out = _apply_weather(
                 im,
-                wtype,
-                rain_density=float(getattr(self, "weather_rain_density", 0.15)),
-                rain_length=float(getattr(self, "weather_rain_length", 15.0)),
-                haze_beta=float(getattr(self, "weather_haze_beta", 0.4)),
-                noise_std=float(getattr(self, "weather_noise_std", 15.0)),
+                weather_type,
+                rain_density=float(getattr(self, "weather_rain_density", _online_default("weather_rain_density"))),
+                rain_length=float(getattr(self, "weather_rain_length", _online_default("weather_rain_length"))) * scale,
+                haze_beta=float(getattr(self, "weather_haze_beta", _online_default("weather_haze_beta"))),
+                noise_std=float(getattr(self, "weather_noise_std", _online_default("weather_noise_std"))),
             )
 
         label = deepcopy(self.labels[img_index])
@@ -1295,25 +1496,25 @@ class BaseDataset(Dataset):
 
         # Optional save for visual inspection (weather_save_dir set). Annotated per
         # slice_save_annotated, capped by slice_save_max_weather (falls back to slice_save_max),
-        # deduplicated per (image, wtype) across epochs. Saving does NOT depend on the slicing
+        # deduplicated per (image, weather_type) across epochs. Saving does NOT depend on the slicing
         # pipeline (slice_transform may be None when slice_prob=0): weather_save_dir alone enables it.
-        sdir = str(getattr(self, "weather_save_dir", "") or "")
-        if sdir:
-            cdir = Path(sdir)
-            key = ("weather", wtype, index)
-            # M1: 画框/去重/限额/命名抽到 _save_annotated。保存不依赖切片管线
+        save_dir = str(getattr(self, "weather_save_dir", _online_default("weather_save_dir")) or "")
+        if save_dir:
+            branch_dir = Path(save_dir)
+            key = ("weather", weather_type, index)
+            # 画框/去重/限额/命名抽到 _save_annotated。保存不依赖切片管线
             # (slice_transform 可能为 None), save_annotated 此时按 True 兜底。
             self._save_annotated(
-                "weather", cdir, out,
+                "weather", branch_dir, out,
                 label.get("bboxes", np.empty((0, 4))), label.get("cls", np.empty((0, 1))),
-                f"weather_{wtype}_p{os.getpid()}_img{img_index}", key,
-                bool(getattr(self, "slice_save_annotated", True)),
+                f"weather_{weather_type}_p{os.getpid()}_img{img_index}", key,
+                bool(getattr(self, "slice_save_annotated", _online_default("slice_save_annotated"))),
             )
 
-        # Resize to the training size (M1: shared tail)
+        # Resize to the training size (shared tail)
         return self._finalize_label(label, out)
 
-    def _occlusion_at(self, index: int, img_index: int) -> dict[str, Any]:
+    def _build_occlusion_sample(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one in-memory occluded image (rect / stripe blocks) from an original.
 
         Online port of the occlusion proposal: each selected original gets ``occlusion_blocks``
@@ -1328,44 +1529,48 @@ class BaseDataset(Dataset):
         ``index`` is the EXPANDED mixed-pool index; ``img_index`` is the ORIGINAL image index.
         """
         f = self.im_files[img_index]
-        im = self._load_image_cached(img_index)
+        # Degrade at the capped resolution. occlusion_size_ratio is a FRACTION of the image, so the
+        # parameters need no rescaling -- the occluders keep their relative size, and the boxes
+        # returned in pixel space stay consistent because the coverage maths below uses this frame's
+        # h/w.
+        im = self._degrade_frame(img_index)[0]
         h, w = im.shape[:2]
         # occlusion_ratio: 未选中原图整图直通 (位保留, len 恒定)
         if self._occlusion_mask is not None and not self._occlusion_mask[img_index]:
             out = im
-            oc_boxes = []
-            otype = "none"  # defensive: keep the name defined on every path
+            occluder_boxes = []
+            occlusion_type = "none"  # defensive: keep the name defined on every path
         else:
-            types = [t.strip() for t in str(getattr(self, "occlusion_types", "rect,stripe")).split(",") if t.strip()]
-            otype = random.choice(types) if types else "rect"
-            out, oc_boxes = _apply_occlusion(
+            types = [t.strip() for t in str(getattr(self, "occlusion_types", _online_default("occlusion_types"))).split(",") if t.strip()]
+            occlusion_type = random.choice(types) if types else "rect"
+            out, occluder_boxes = _apply_occlusion(
                 im,
-                otype,
-                blocks=int(getattr(self, "occlusion_blocks", 1) or 1),
-                size_ratio=float(getattr(self, "occlusion_size_ratio", 0.1)),
-                color=str(getattr(self, "occlusion_color", "auto") or "auto"),
+                occlusion_type,
+                blocks=int(getattr(self, "occlusion_blocks", _online_default("occlusion_blocks")) or 1),
+                size_ratio=float(getattr(self, "occlusion_size_ratio", _online_default("occlusion_size_ratio"))),
+                color=str(getattr(self, "occlusion_color", _online_default("occlusion_color")) or "auto"),
             )
 
         label = deepcopy(self.labels[img_index])
         label.pop("shape", None)
         label["im_file"] = f
         # max_cover: 目标被遮挡面积占比超过阈值 -> 从标签剔除 (完全被盖住的目标=纯噪声)
-        max_cover = float(getattr(self, "occlusion_max_cover", 0.95))
-        if oc_boxes and len(label.get("bboxes", [])):
+        max_cover = float(getattr(self, "occlusion_max_cover", _online_default("occlusion_max_cover")))
+        if occluder_boxes and len(label.get("bboxes", [])):
             boxes = np.asarray(label["bboxes"], dtype=np.float64).copy()  # normalized xywh
-            # M8 fix: covered 改为"块与目标框交集的并集面积"。旧实现逐块累加交叉面积,
+            # covered 改为"块与目标框交集的并集面积"。旧实现逐块累加交叉面积,
             # 多个遮挡块相互重叠时重叠区被重复计入, 覆盖率虚高, 目标可能被提前按 max_cover
             # 误剔除。块数通常 1~3 且只对含目标的图执行, 布尔掩码开销可忽略。
-            # (M7: 顺带删除从未被使用的 oc_area_sum 死代码)
+            # (顺带删除从未被使用的 oc_area_sum 死代码)
             keep = np.ones(len(boxes), dtype=bool)
-            for i, b in enumerate(boxes):
+            for bi, b in enumerate(boxes):
                 cx, cy, bw, bh = b[0] * w, b[1] * h, b[2] * w, b[3] * h
                 x0, y0, x1, y1 = cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2
                 area = max(1.0, (x1 - x0) * (y1 - y0))
-                # L7: clip every occluder to the target box and union their areas with exact
-                # rectangle math (no per-sample h*w bool mask; M8's union semantics preserved).
+                # clip every occluder to the target box and union their areas with exact
+                # rectangle math (no per-sample h*w bool mask; union semantics preserved).
                 inter = []
-                for (ox0, oy0, ox1, oy1) in oc_boxes:
+                for (ox0, oy0, ox1, oy1) in occluder_boxes:
                     ix0, iy0 = max(ox0, x0), max(oy0, y0)
                     ix1, iy1 = min(ox1, x1), min(oy1, y1)
                     if ix1 > ix0 and iy1 > iy0:
@@ -1373,13 +1578,25 @@ class BaseDataset(Dataset):
                                       int(math.ceil(ix1)), int(math.ceil(iy1))))
                 covered = _union_area(inter)
                 if covered / area >= max_cover:
-                    keep[i] = False
+                    keep[bi] = False
             if not keep.all():
                 label["bboxes"] = boxes[keep].astype(np.float32)
                 cls = np.asarray(label.get("cls", np.empty((0, 1))))
                 label["cls"] = np.asarray(cls).reshape(-1, 1)[keep].astype(np.float32) if len(cls) else cls
-                if label.get("segments"):
-                    label["segments"] = [s for k, s in zip(keep, label["segments"]) if k]
+                segs = label.get("segments")
+                if segs:
+                    # Index the segments with the SAME boolean mask as the boxes. The previous
+                    # ``zip(keep, segments)`` silently truncated whenever the two lengths differed
+                    # (malformed labels, or any future filter touching only one of them), producing
+                    # boxes-without-segments misalignment and no error anywhere -- while the cls
+                    # path right above already used an explicit mask. Warn instead of raising: one
+                    # bad annotation should not abort a multi-hour run, but it must not be silent.
+                    if len(segs) != len(keep):
+                        LOGGER.warning(
+                            f"occlusion: {len(segs)} segments vs {len(keep)} boxes for '{f}' -- "
+                            "aligning by position and keeping only mask-true entries."
+                        )
+                    label["segments"] = [s for s, k in zip(segs, keep) if k]
 
         label["img"] = np.ascontiguousarray(out)
 
@@ -1388,23 +1605,23 @@ class BaseDataset(Dataset):
 
         # Optional save for visual inspection (occlusion_save_dir set). Annotated per
         # slice_save_annotated, capped by slice_save_max_occlusion (falls back to slice_save_max),
-        # deduplicated per (image, otype) across epochs.
-        sdir = str(getattr(self, "occlusion_save_dir", "") or "")
-        if sdir:
-            cdir = Path(sdir)
-            key = ("occlusion", otype if oc_boxes else "none", index)
-            # M1: 画框/去重/限额/命名抽到 _save_annotated; 保存不依赖切片管线。
+        # deduplicated per (image, occlusion_type) across epochs.
+        save_dir = str(getattr(self, "occlusion_save_dir", _online_default("occlusion_save_dir")) or "")
+        if save_dir:
+            branch_dir = Path(save_dir)
+            key = ("occlusion", occlusion_type if occluder_boxes else "none", index)
+            # 画框/去重/限额/命名抽到 _save_annotated; 保存不依赖切片管线。
             self._save_annotated(
-                "occlusion", cdir, out,
+                "occlusion", branch_dir, out,
                 label.get("bboxes", np.empty((0, 4))), label.get("cls", np.empty((0, 1))),
-                f"occlusion_{otype if oc_boxes else 'none'}_p{os.getpid()}_img{img_index}", key,
-                bool(getattr(self, "slice_save_annotated", True)),
+                f"occlusion_{occlusion_type if occluder_boxes else 'none'}_p{os.getpid()}_img{img_index}", key,
+                bool(getattr(self, "slice_save_annotated", _online_default("slice_save_annotated"))),
             )
 
-        # Resize to the training size (M1: shared tail)
+        # Resize to the training size (shared tail)
         return self._finalize_label(label, out)
 
-    def _ratio_at(self, index: int, img_index: int) -> dict[str, Any]:
+    def _build_ratio_sample(self, index: int, img_index: int) -> dict[str, Any]:
         """Build one in-memory aspect-ratio-padded image from a single original image (online port of the
         offline change_image_resolution tool).
 
@@ -1420,13 +1637,18 @@ class BaseDataset(Dataset):
         ``img_index`` is the ORIGINAL image index this padded sample derives from.
         """
         f = self.im_files[img_index]
-        im = self._load_image_cached(img_index)
+        # Cap the working resolution BEFORE padding. ``_ratio_pad_params`` can otherwise inflate the
+        # canvas enormously (an 8000x1000 frame aligned to 16:9 becomes 8000x4500, 4.5x the original
+        # pixel count and a 108 MB allocation) only for the result to be resized straight back down
+        # to imgsz by ``_finalize_label``. All the pad maths is normalised, and the pad offset is
+        # derived from this frame's w/h below, so padding a capped frame is equivalent.
+        im = self._degrade_frame(img_index)[0]
         h, w = im.shape[:2]
         # ratio_pad_ratio: 未选中原图跳过加框, 整图直通 (位保留, len 恒定)
         skip_pad = self._ratio_mask is not None and not self._ratio_mask[img_index]
-        target = str(getattr(self, "ratio_pad_target", "auto") or "auto")
-        color_key = str(getattr(self, "ratio_pad_color", "black") or "black")
-        # P1-7: validate up front. Previously an unknown color raised a bare KeyError halfway through
+        target = str(getattr(self, "ratio_pad_target", _online_default("ratio_pad_target")) or "auto")
+        color_key = str(getattr(self, "ratio_pad_color", _online_default("ratio_pad_color")) or "black")
+        # validate up front. Previously an unknown color raised a bare KeyError halfway through
         # training, and an unknown target silently fell back to 16:9 (any non-"4:3" string did).
         if color_key not in _RATIO_PAD_COLORS:
             raise ValueError(f"ratio_pad_color must be one of {sorted(_RATIO_PAD_COLORS)}, got '{color_key}'.")
@@ -1446,10 +1668,10 @@ class BaseDataset(Dataset):
 
         lb = self.labels[img_index]
         boxes = np.asarray(lb.get("bboxes", np.empty((0, 4))), dtype=np.float64).copy()
-        # P1-3: explicit .copy(). np.asarray() returns the SAME array when the dtype already matches, so this
+        # explicit .copy. np.asarray returns the SAME array when the dtype already matches, so this
         # used to hand out a live view of self.labels[i]["cls"] -- and augment._update_label_text writes
         # label["cls"] in place, which would permanently corrupt the cached label for all later epochs.
-        # _blur_at and the main path already deepcopy; this branch and _compose_at did not.
+        # _build_blur_sample and the main path already deepcopy; this branch and _build_compose_sample did not.
         cls = np.asarray(lb.get("cls", np.empty((0, 1))), dtype=np.float32).copy()
         keep = None
         if len(boxes) and (pad_left or pad_top):
@@ -1467,7 +1689,7 @@ class BaseDataset(Dataset):
         # segments: normalized polys remapped by the pad offset (no clipping needed: padding only enlarges)
         segs = []
         for si, s in enumerate(lb.get("segments", []) or []):
-            # P1-4: apply the same `keep` mask as the boxes. Padding never drops anything today, so this is
+            # apply the same `keep` mask as the boxes. Padding never drops anything today, so this is
             # dormant -- but the moment any box is filtered, len(bboxes) != len(segments) would silently
             # mislabel every seg/pose task with no error anywhere.
             if keep is not None and not (si < len(keep) and bool(keep[si])):
@@ -1493,32 +1715,32 @@ class BaseDataset(Dataset):
                 k[..., 0] = (k[..., 0] * w + pad_left) / new_w
                 k[..., 1] = (k[..., 1] * h + pad_top) / new_h
             if keep is not None and k.shape[0] == len(keep):
-                k = k[keep]  # P1-4: keep keypoints aligned with the filtered boxes
+                k = k[keep]  # keep keypoints aligned with the filtered boxes
             label["keypoints"] = k.astype(np.float32)
 
         # Keep the ratio-padded image on the same Mosaic mix pool as every other sample (cache != 'ram')
         self._touch_buffer(index)
 
         # Optional save of the ratio-padded image for visual inspection (ratio_pad_save_dir set).
-        # Annotated per slice_save_annotated, capped by slice_save_max_ratio (P2-3: per-branch override,
+        # Annotated per slice_save_annotated, capped by slice_save_max_ratio (per-branch override,
         # falls back to slice_save_max), deduplicated per (image) across epochs/mix visits.
         # Disabled by default (empty dir).
-        sdir = str(getattr(self, "ratio_pad_save_dir", "") or "")
-        if sdir:
-            cdir = Path(sdir)
+        save_dir = str(getattr(self, "ratio_pad_save_dir", _online_default("ratio_pad_save_dir")) or "")
+        if save_dir:
+            branch_dir = Path(save_dir)
             key = ("ratio", index)
-            # M1: 画框/去重/限额/命名抽到 _save_annotated。
+            # 画框/去重/限额/命名抽到 _save_annotated。
             self._save_annotated(
-                "ratio", cdir, big,
+                "ratio", branch_dir, big,
                 label.get("bboxes", np.empty((0, 4))), label.get("cls", np.empty((0, 1))),
                 f"ratio_p{os.getpid()}_img{img_index}", key,
-                bool(getattr(self, "slice_save_annotated", True)),
+                bool(getattr(self, "slice_save_annotated", _online_default("slice_save_annotated"))),
             )
 
-        # Resize to the training size (M1: shared tail)
+        # Resize to the training size (shared tail)
         return self._finalize_label(label, big)
 
-    def _compose_at(self, index: int) -> dict[str, Any]:
+    def _build_compose_sample(self, index: int) -> dict[str, Any]:
         """Build a 2x2 composed image from 4 original images (online port of the offline compose tool).
 
         Each group of 4 original images (``[group*4, group*4+3]``, wrapped for the tail group) is stitched
@@ -1527,14 +1749,17 @@ class BaseDataset(Dataset):
         ``xc' = (xc + col) / 2, yc' = (yc + row) / 2, w' = w / 2, h' = h / 2`` (col/row = 0/1). The composed
         image is then resized to the training size like the other branches. It enters the Mosaic mix pool
         (dataset.buffer) so it participates in mosaic stitching. Nothing is written to disk.
+
+        Each source is capped to half of ``compose_max_side`` BEFORE the canvas is allocated (see the
+        comment in the body), so the canvas itself is bounded by ``compose_max_side``.
         """
         n_origin = len(self.labels)
         # The compose segment starts right after the base + ratio + blur segments (_segment_bases);
-        # group = index - compose_base selects the group of 4 originals. (M5: named access)
-        sb = self._segment_bases()
-        group = index - sb.compose
+        # group = index - compose_base selects the group of 4 originals. (named access)
+        segment_bases = self._segment_bases()
+        group = index - segment_bases.compose
         base = group * 4
-        # P1-2: with fewer than 4 originals the modulo wrap would put the SAME image in 2+ quadrants,
+        # with fewer than 4 originals the modulo wrap would put the SAME image in 2+ quadrants,
         # duplicating its targets and skewing the label distribution. _compose_on() never allocates
         # compose indices in that case, so this is a defensive guard for direct calls only.
         if n_origin < 4:
@@ -1545,12 +1770,32 @@ class BaseDataset(Dataset):
         idxs = [(base + j) % n_origin for j in range(4)]  # wrap the tail group to always have 4 images
         # compose_ratio: 未选中组退回组内第 1 张原图整图 (位保留, len 恒定)
         if self._compose_mask is not None and not self._compose_mask[group]:
-            return self._origin_at(index, base)
+            return self._build_origin_sample(index, base)
+        # Working-resolution cap, the same rule the degradation branches apply through
+        # _degrade_frame: bring every source down to at most HALF the compose canvas side BEFORE the
+        # canvas is allocated. compose labels are normalized coords that only depend on the relative
+        # 2x2 geometry, so capping the pixels does not touch the labels -- and it replaces the old
+        # "allocate the canvas at full sensor resolution, fill it, then downscale the whole thing",
+        # measured at 5.6x the time and 8.7x the peak memory on 4x 4000x3000 sources.
+        # compose_max_side semantics now mirror degrade_max_side:
+        #   0 -> auto: 2 * imgsz      > 0 -> that many pixels on the long side      < 0 -> disabled
+        max_side = getattr(self, "compose_max_side", _online_default("compose_max_side"))
+        max_side = int(max_side) if max_side is not None else 0
+        if max_side == 0:
+            max_side = 2 * int(getattr(self, "imgsz", 640))
+        half = max_side / 2.0 if max_side > 0 else 0.0  # <= 0 disables the cap (see _cap_long_side)
         imgs = []
         for i in idxs:
-            im = self._load_image_cached(i)
+            # copy=False: each source is only READ here (it is memcpy'd into a canvas slice, or handed
+            # to cv2.resize which returns a new array), so the worker-local LRU buffer it may alias is
+            # never written to. This drops 4 full-resolution memcpys (~20 ms each at 4000x3000).
+            # INTER_LINEAR (not the degradation branches' INTER_AREA): see _cap_long_side -- the box
+            # path costs 40 ms/source here against 1.7 ms, and the pre-fix code was bilinear too.
+            im, _ = _cap_long_side(self._load_image_cached(i, copy=False), half, interp=cv2.INTER_LINEAR)
             imgs.append(im)
-        # Unify sub-image size to the max in this group (stretching preserves normalized coords linearly)
+        # Unify sub-image size to the max in this group (stretching preserves normalized coords
+        # linearly). W/H are the max over the ALREADY CAPPED group, so 2*W and 2*H are within
+        # max_side by construction and the composed image never needs a post-hoc downscale.
         W = max(im.shape[1] for im in imgs)
         H = max(im.shape[0] for im in imgs)
         # Allocate the composed image ONCE and fill each 2x2 sub-block in place (memory-friendly: avoids the
@@ -1560,27 +1805,18 @@ class BaseDataset(Dataset):
         for j, im in enumerate(imgs):
             r, c = divmod(j, 2)
             if im.shape[1] != W or im.shape[0] != H:
+                # never a downscale (W/H are the group max), so INTER_LINEAR is the right kernel here
                 im = cv2.resize(im, (W, H), interpolation=cv2.INTER_LINEAR)
             big[r * H:(r + 1) * H, c * W:(c + 1) * W] = im
-            imgs[j] = None  # P2-9: free each source the moment it is copied, instead of holding all 4
+            imgs[j] = None  # free each source the moment it is copied, instead of holding all 4
         del imgs  # release the 4 source images as early as possible
-
-        # 拼后降采样到最长边 = compose_max_side (0=自动=2×imgsz), 降低内存与后续处理开销。
-        # bbox/segment/keypoint 均为归一化坐标, 只缩放像素不影响标签; 保存/再resize 均用降采样后的图。
-        max_side = int(getattr(self, "compose_max_side", 0) or 0)
-        if max_side <= 0:
-            max_side = 2 * int(getattr(self, "imgsz", 1280))
-        _H, _W = big.shape[:2]
-        if max(_H, _W) > max_side:
-            _r = max_side / max(_H, _W)
-            big = cv2.resize(big, (math.ceil(_W * _r), math.ceil(_H * _r)), interpolation=cv2.INTER_LINEAR)
 
         boxes_all, cls_all, segs_all, kpts_all, has_kpts = [], [], [], [], False
         for j, i in enumerate(idxs):
             row, col = divmod(j, 2)
             lb = self.labels[i]
             boxes = np.asarray(lb.get("bboxes", np.empty((0, 4))), dtype=np.float64).copy()
-            # P1-3: explicit .copy() (np.asarray is a no-op view when the dtype already matches), otherwise
+            # explicit .copy (np.asarray is a no-op view when the dtype already matches), otherwise
             # the composed label shares cls storage with self.labels and in-place text updates corrupt it.
             cls = np.asarray(lb.get("cls", np.empty((0, 1))), dtype=np.float32).copy()
             if len(boxes):
@@ -1621,14 +1857,14 @@ class BaseDataset(Dataset):
 
         # Optional save of the composed 2x2 image for visual inspection (compose_save=True).
         # Save dir: compose_save_dir (custom) if set, else slice_save_dir/compose/. Annotated per
-        # slice_save_annotated, capped by slice_save_max_compose (P2-3: per-branch override, falls back to
+        # slice_save_annotated, capped by slice_save_max_compose (per-branch override, falls back to
         # slice_save_max), deduplicated per (group) across epochs/mix visits.
         st = getattr(self, "slice_transform", None)
         if getattr(self, "compose_save", False):
             comp_dir = str(getattr(self, "compose_save_dir", "") or "")
-            cdir = Path(comp_dir) if comp_dir else (st.save_dir / "compose" if st is not None and st.save_dir is not None else None)
-            if cdir is None and not getattr(self, "_compose_warned", False):
-                # P2-4: args.yaml ships compose_save=True with an empty compose_save_dir and no
+            branch_dir = Path(comp_dir) if comp_dir else (st.save_dir / "compose" if st is not None and st.save_dir is not None else None)
+            if branch_dir is None and not getattr(self, "_compose_warned", False):
+                # args.yaml ships compose_save=True with an empty compose_save_dir and no
                 # slice_save_dir -> nothing was ever written and nothing said why.
                 self._compose_warned = True
                 LOGGER.warning(
@@ -1636,20 +1872,20 @@ class BaseDataset(Dataset):
                     f"compose_save_dir, or slice_save_dir (images then go to <slice_save_dir>/compose). "
                     f"Skipping compose save."
                 )
-            if cdir is not None:
+            if branch_dir is not None:
                 key = ("compose", group)
-                # M1: 画框/去重/限额/命名抽到 _save_annotated (成功写盘才计数)。
+                # 画框/去重/限额/命名抽到 _save_annotated (成功写盘才计数)。
                 self._save_annotated(
-                    "compose", cdir, big,
+                    "compose", branch_dir, big,
                     bboxes, cls,
                     f"compose_p{os.getpid()}_g{group}", key,
-                    bool(getattr(self, "slice_save_annotated", True)),
+                    bool(getattr(self, "slice_save_annotated", _online_default("slice_save_annotated"))),
                 )
 
         # Keep the composed image on the same Mosaic mix pool as every other sample (cache != 'ram')
         self._touch_buffer(index)
 
-        # Resize to the training size (M1: shared tail)
+        # Resize to the training size (shared tail)
         return self._finalize_label(label, big)
 
     def get_image_and_label(self, index: int, count_slice: bool = True) -> dict[str, Any]:
@@ -1661,7 +1897,7 @@ class BaseDataset(Dataset):
                 Auxiliary "mix" samples requested by Mosaic/CutMix/MixUp pass ``False`` so they slice normally
                 but do not inflate the ``neg_ratio`` quota or duplicate saved slices.
         """
-        # S5: pick up the trainer's latest set_epoch() publish. No-op (one locked int read) in the
+        # pick up the trainer's latest set_epoch publish. No-op (one locked int read) in the
         # main process and whenever the epoch is unchanged; in a DataLoader worker with a stale mask
         # set this deterministically rebuilds the masks for the published epoch.
         self._sync_epoch_masks()
@@ -1670,32 +1906,31 @@ class BaseDataset(Dataset):
         # switches -- origin (1 un-sliced original per image, keep_origin), ratio (1 per image),
         # blur (2 per image), compose (1 per 4 images), weather (1 per image), occlusion (1 per
         # image). None of them requires slicing or keep_origin.
-        emit_all = getattr(self, "slice_all_tiles", False)
+        emit_all = getattr(self, "slice_all_tiles", _online_default("slice_all_tiles"))
         origin_on = self._keep_origin_on()
-        ratio_on = bool(getattr(self, "ratio_pad_keep", False))
-        blur_on = bool(getattr(self, "blur_keep", False))
+        ratio_on = bool(getattr(self, "ratio_pad_keep", _online_default("ratio_pad_keep")))
+        blur_on = bool(getattr(self, "blur_keep", _online_default("blur_keep")))
         compose_on = self._compose_on()
         weather_on = self._weather_on()
         occlusion_on = self._occlusion_on()
-        # M5: named access instead of a bare 8-tuple unpack.
-        sb = self._segment_bases()
-        base_len, o_base, r_base, b_base, c_base, w_base, oc_base = (
-            sb.base, sb.origin, sb.ratio, sb.blur, sb.compose, sb.weather, sb.occlusion,
-        )
+        # Named field access: keep the SegmentBases object and read ``segment_bases.origin`` / ``segment_bases.ratio`` ...
+        # Unpacking it into seven positional locals (base_len, o_base, r_base, ...) would throw away
+        # exactly the readability the NamedTuple was introduced for.
+        segment_bases = self._segment_bases()
 
-        if occlusion_on and index >= oc_base:
-            return self._occlusion_at(index, index - oc_base)  # origin index = offset inside the occlusion segment
-        if weather_on and index >= w_base:
-            return self._weather_at(index, index - w_base)  # origin index = offset inside the weather segment
-        if compose_on and index >= c_base:
-            return self._compose_at(index)  # composed 2x2 sample from 4 original images
-        if blur_on and index >= b_base:
-            j = index - b_base  # 0..2N-1: even -> short tier, odd -> long tier
-            return self._blur_at(index, j // 2, long=(j % 2 == 1))
-        if ratio_on and index >= r_base:
-            return self._ratio_at(index, index - r_base)  # origin index = offset inside the ratio segment
-        if origin_on and index >= o_base:
-            return self._origin_at(index, index - o_base)  # un-sliced original (keep_origin segment)
+        if occlusion_on and index >= segment_bases.occlusion:
+            return self._build_occlusion_sample(index, index - segment_bases.occlusion)  # origin index = offset in the occlusion segment
+        if weather_on and index >= segment_bases.weather:
+            return self._build_weather_sample(index, index - segment_bases.weather)  # origin index = offset in the weather segment
+        if compose_on and index >= segment_bases.compose:
+            return self._build_compose_sample(index)  # composed 2x2 sample from 4 original images
+        if blur_on and index >= segment_bases.blur:
+            j = index - segment_bases.blur  # 0..2N-1: even -> short tier, odd -> long tier
+            return self._build_blur_sample(index, j // 2, long=(j % 2 == 1))
+        if ratio_on and index >= segment_bases.ratio:
+            return self._build_ratio_sample(index, index - segment_bases.ratio)  # origin index = offset in the ratio segment
+        if origin_on and index >= segment_bases.origin:
+            return self._build_origin_sample(index, index - segment_bases.origin)  # un-sliced original (keep_origin segment)
 
         # ---- base segment (slicing pipeline) ----
         n_per = self._n_per()
@@ -1712,7 +1947,7 @@ class BaseDataset(Dataset):
         # slice_ratio: each epoch set_epoch() rebuilds a mask that picks exactly round(slice_ratio*N)
         # ORIGINAL images to slice (original-level decision: with emit_all all 4 tiles share one fate);
         # the rest are fed as un-sliced full images. Mask None = pure slicing (default) or slicing off.
-        # The un-sliced originals live in their own independent segment (_origin_at) and never slice.
+        # The un-sliced originals live in their own independent segment (_build_origin_sample) and never slice.
         slice_t = getattr(self, "slice_transform", None)
         # Lazy init (standalone / direct-iteration use, no trainer ever calling set_epoch): rebuild
         # once on first access so 0 <= *_ratio < 1 still works. MAIN process only -- DataLoader
@@ -1723,7 +1958,7 @@ class BaseDataset(Dataset):
         # to re-run the whole rebuild on every single sample).
         if (
             self._mask_stamp < 0
-            and 0.0 <= float(getattr(self, "slice_ratio", 1.0)) < 1.0
+            and 0.0 <= float(getattr(self, "slice_ratio", _online_default("slice_ratio"))) < 1.0
             and multiprocessing.parent_process() is None
         ):
             self._rebuild_epoch_masks(int(getattr(self, "epoch", 0)))
@@ -1746,7 +1981,7 @@ class BaseDataset(Dataset):
                     im, label, src=img_index, count=count_slice
                 )
             )
-            # M-3 fix: reuse the shared tail instead of a third hand-rolled resize. The sliced sub-image
+            # reuse the shared tail instead of a third hand-rolled resize. The sliced sub-image
             # becomes the new "original" for downstream transforms; _finalize_label applies the exact same
             # resize + imgsz clamp as load_image and every other online branch, so resized_shape/ratio_pad
             # can no longer drift (the old inline resize omitted the clamp).
@@ -1759,7 +1994,13 @@ class BaseDataset(Dataset):
             label["resized_shape"][1] / label["ori_shape"][1],
         )  # for evaluation
         if self.rect:
-            label["rect_shape"] = self.batch_shapes[self.batch[index]]
+            # ``self.batch`` is keyed by IMAGE index (see _build_origin_sample); `index` may be an expanded
+            # mixed-pool index here (emit_all with this original not selected for slicing), which
+            # would overflow ``self.batch``. rect and online augmentation are mutually exclusive
+            # today (v8_transforms disables the online path when rect is on), but relying on that
+            # cross-file invariant without a key that is correct on its own is how this project got
+            # its earlier buffer-accounting bugs.
+            label["rect_shape"] = self.batch_shapes[self.batch[img_index]]
         return self.update_labels_info(label)
 
     def __len__(self) -> int:
@@ -1769,7 +2010,7 @@ class BaseDataset(Dataset):
         (keep_origin), +N ratio, +2N blur, +ceil(N/4) compose, +N weather, +N occlusion -- each
         present only when its own switch is on.
 
-        Single source of truth (S4 fix): the total comes from ``_segment_bases()``, which derives
+        Single source of truth (fix): the total comes from ``_segment_bases``, which derives
         it from the same per-segment lengths as every boundary. The accumulation used to be
         re-implemented here; adding a new branch and missing this copy would desynchronise
         ``len(dataset)`` from the decodable index range and silently drop samples.
@@ -1857,7 +2098,14 @@ class SliceValDataset(Dataset):
         if 0.0 <= self.ratio < 1.0:
             mask = np.zeros(n, dtype=bool)
             if self.ratio > 0:
-                mask[random.sample(range(n), int(round(self.ratio * n)))] = True
+                # Deterministic subset. An unseeded random.sample redrew the sliced subset on every
+                # validation round (the wrapper is rebuilt each round), so mAP moved between epochs
+                # partly because a DIFFERENT set of images was sliced -- and that jitter feeds
+                # best.pt / early stopping. Seeding from the file list (like the training-side mask
+                # seed) makes every round score the same subset. The random tile choice below stays
+                # random on purpose: with all_tiles=False that spreads tile coverage across epochs.
+                seed = zlib.crc32("\n".join(str(lb.get("im_file", "")) for lb in self.labels).encode("utf-8", "ignore"))
+                mask[random.Random(seed).sample(range(n), int(round(self.ratio * n)))] = True
         self._mask = mask
         counts: list[int] = []
         metas: list[list[tuple[int, int, int, int]]] = []
@@ -1873,7 +2121,7 @@ class SliceValDataset(Dataset):
                     counts.append(len(tiles))
                     metas.append(tiles)
                 else:
-                    # S1 fix: 文档承诺 all_tiles=False = "每图随机1片(快速验证)", 旧实现
+                    # 文档承诺 all_tiles=False = "每图随机1片(快速验证)", 旧实现
                     # `bool(self.all_tiles) and ...` 使 slice_it 恒为 False -> 全部整图直通,
                     # 切片验证收益被系统性低估且不报错。改为随机取 2x2(+overlap) 切片中的 1 片。
                     counts.append(1)
@@ -1888,7 +2136,7 @@ class SliceValDataset(Dataset):
         self._cum = [0]
         for c in counts:
             self._cum.append(self._cum[-1] + c)
-        # S1: val_slice_ratio<1 时部分图整图直通, 加日志说明实际产出, 避免调参反馈失真。
+        # val_slice_ratio<1 时部分图整图直通, 加日志说明实际产出, 避免调参反馈失真。
         if mask is not None and 0 < self.ratio < 1.0:
             LOGGER.info(
                 f"{self.base.prefix}val-slice: {n_sliced}/{n} originals sliced "
@@ -1914,15 +2162,18 @@ class SliceValDataset(Dataset):
         label = deepcopy(self.labels[oi])
         label.pop("shape", None)  # shape is for rect, remove it
         # Load the ORIGINAL-resolution image (worker LRU cache when available).
-        # M9 fix: _load_image_cached 可能返回 None (缓存未命中且读盘失败), 旧实现随后用同一
-        # 路径再 imread 一次 —— 与缓存通道的失败同源, 必然再次失败, 最终以 None 切片
-        # im[y0:y1, x0:x1] 抛难以定位的 TypeError。现在缓存失败走独立 imread 通道重试,
-        # 再失败则带路径明确报错。
-        im = None
-        if hasattr(self.base, "_load_image_cached"):
+        # The LRU helper raises on a failed read (the training path wants a hard error there), so the
+        # retry has to be driven by an exception, not by a None return: the previous
+        # `if im is None: im = imread(...)` fallback was unreachable and the documented independent
+        # retry channel never ran. A failed cached read now genuinely retries via the unicode-safe
+        # imread path, and only a second failure is fatal.
+        try:
             im = self.base._load_image_cached(oi)
-        if im is None:
-            im = imread(label["im_file"])  # M1: unicode-safe imread (was plain cv2.imread)
+        except Exception as e:  # noqa: BLE001 - deliberate fallback to the independent read channel
+            LOGGER.warning(
+                f"SliceValDataset: cached read of {label['im_file']!r} failed ({e}); falling back to a direct imread."
+            )
+            im = imread(label["im_file"])
         if im is None:
             raise FileNotFoundError(
                 f"SliceValDataset: failed to load image {label['im_file']!r} for val-slicing "

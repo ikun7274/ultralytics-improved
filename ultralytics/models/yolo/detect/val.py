@@ -62,14 +62,14 @@ class DetectionValidator(BaseValidator):
         self.niou = self.iouv.numel()
         self.metrics = DetMetrics()
         # --- validation-side online slicing (SAHI-style eval): sub-tile inference + remap + NMS fusion ---
-        # M-4 fix: no cached val_slice_on flag. The trainer toggles args.val_slice_enable between the sliced
+        # no cached val_slice_on flag. The trainer toggles args.val_slice_enable between the sliced
         # pass and the whole-image reference pass, so a value captured here goes stale; every decision reads
         # _val_slice_active() instead (single source of truth).
         self.val_slice_overlap_ratio = float(
             args.get("val_slice_overlap_ratio", 0.2) if isinstance(args, dict) else getattr(args, "val_slice_overlap_ratio", 0.2)
         )
         self.val_slice_all_tiles = bool(
-            args.get("val_slice_all_tiles", True) if isinstance(args, dict) else getattr(args, "val_slice_all_tiles", True)
+            args.get("val_slice_all_tiles", False) if isinstance(args, dict) else getattr(args, "val_slice_all_tiles", False)
         )
         self.val_slice_ratio = float(
             args.get("val_slice_ratio", 1.0) if isinstance(args, dict) else getattr(args, "val_slice_ratio", 1.0)
@@ -79,6 +79,11 @@ class DetectionValidator(BaseValidator):
         )
         self._slice_acc: dict[int, dict] = {}  # per-original accumulation of sub-tile predictions
         self._slice_base_labels: list[dict] | None = None  # original (whole-image) val labels for GT
+        # Whole-image GT in original pixels, memoised by image name. The validator lives for the whole
+        # run (the trainer builds it once in _setup_train), while the label dicts are rebuilt on every
+        # validation pass -- so an image-name key is what makes the cache survive the per-pass dataset
+        # rebuild. NOT cleared in init_metrics: the GT of a validation image never changes mid-run.
+        self._gt_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def _val_slice_active(self) -> bool:
         """Dynamically read val_slice_enable (the trainer toggles it for the dual-metric whole-image pass)."""
@@ -325,7 +330,7 @@ class DetectionValidator(BaseValidator):
         are fused with class-wise NMS and evaluated against the whole-image GT (``_finalize_sliced_orig``).
         """
         if self._slice_base_labels is None:
-            # L-2: only get_dataloader() sets this. A prebuilt sliced DataLoader handed to the constructor
+            # only get_dataloader sets this. A prebuilt sliced DataLoader handed to the constructor
             # would otherwise crash later with an opaque "NoneType is not subscriptable" in _finalize_sliced_orig.
             raise RuntimeError(
                 "val_slice: sub-tile batches arrived but the whole-image GT (_slice_base_labels) is unset. "
@@ -334,7 +339,7 @@ class DetectionValidator(BaseValidator):
             )
         _b, _c, h_img, w_img = batch["img"].shape
         if h_img != w_img:
-            # L-3: remap uses a single scale factor / centered pad, so a non-square canvas would silently
+            # remap uses a single scale factor / centered pad, so a non-square canvas would silently
             # produce wrong original-image coordinates. Fail loudly instead.
             raise RuntimeError(
                 f"val_slice assumes a square validation canvas, got {h_img}x{w_img}. Use a square imgsz "
@@ -377,19 +382,37 @@ class DetectionValidator(BaseValidator):
 
     @staticmethod
     def _class_wise_nms(boxes: torch.Tensor, conf: torch.Tensor, cls: torch.Tensor, iou_thres: float) -> torch.Tensor:
-        """Class-aware NMS used to fuse duplicate detections across overlapping sub-tiles (SAHI fusion)."""
+        """Class-aware NMS used to fuse duplicate detections across overlapping sub-tiles (SAHI fusion).
+
+        A single ``batched_nms`` call replaces the previous Python loop over ``torch.unique(cls)``,
+        which launched one NMS kernel and built one O(N) boolean mask PER CLASS for every original
+        image of every validation epoch. ``batched_nms`` folds the class index into the coordinates,
+        so cross-class boxes cannot suppress each other (the same trick used by
+        ``ultralytics.utils.nms.TorchNMS.batched_nms``). ``cls`` arrives as float32 and must be
+        integral for the coordinate offset to be meaningful.
+
+        The torchvision import stays deferred on purpose: it matches this codebase's convention
+        (see ``engine/validator.py``) so that ``import ultralytics`` does not pay torchvision's
+        import cost, and after the first call it is a plain ``sys.modules`` lookup.
+        """
         import torchvision
 
-        keep = []
-        order = torch.arange(len(cls), device=cls.device)
-        for c in torch.unique(cls):
-            idx = order[cls == c]
-            k = torchvision.ops.nms(boxes[idx], conf[idx], iou_thres)
-            keep.append(idx[k])
-        return torch.cat(keep) if keep else torch.empty(0, dtype=torch.long, device=cls.device)
+        return torchvision.ops.batched_nms(boxes, conf, cls.long(), iou_thres)
 
     def _gt_orig_pixels(self, lb: dict, h: int, w: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Whole-image GT in original pixels: (cls tensor, xyxy tensor) on self.device."""
+        """Whole-image GT in original pixels: (cls tensor, xyxy tensor) on self.device.
+
+        Memoised by image name. The whole-image GT is constant for the entire run, yet it used to be
+        rebuilt -- numpy normalised->pixel conversion plus a CPU->GPU copy -- for every original
+        image of every validation pass (``N_val x epochs`` times). The device tensors are small
+        (4 bytes per box per coordinate, a few MB for a large val split), and the cache key is the
+        image name rather than the original index because the per-pass dataset rebuild renumbers
+        the indices.
+        """
+        key = lb["im_file"]
+        hit = self._gt_cache.get(key)
+        if hit is not None:
+            return hit
         boxes = np.asarray(lb["bboxes"], dtype=np.float64)
         cls = np.asarray(lb["cls"]).reshape(-1)
         cls_t = torch.as_tensor(cls, dtype=torch.float32, device=self.device)
@@ -399,6 +422,7 @@ class DetectionValidator(BaseValidator):
             boxes_t = torch.as_tensor(xyxy, dtype=torch.float32, device=self.device)
         else:
             boxes_t = torch.empty((0, 4), dtype=torch.float32, device=self.device)
+        self._gt_cache[key] = (cls_t, boxes_t)
         return cls_t, boxes_t
 
     def _finalize_sliced_orig(self, oi: int, acc: dict) -> None:
@@ -444,7 +468,7 @@ class DetectionValidator(BaseValidator):
     def finalize_metrics(self) -> None:
         """Set final values for metrics speed and confusion matrix."""
         if self._slice_acc:
-            # L-4: an entry survives only if some original never saw all of its sub-tiles (dropped tail batch,
+            # an entry survives only if some original never saw all of its sub-tiles (dropped tail batch,
             # a mid-pass mask change, ...). Those images are missing from the metrics denominator -- say so.
             unfinished = len(self._slice_acc)
             LOGGER.warning(
@@ -609,7 +633,7 @@ class DetectionValidator(BaseValidator):
             self.args.workers,
             shuffle=False,
             rank=-1,
-            # L-4: dropping the tail batch would leave some originals unfinished (done < n_tiles); they are
+            # dropping the tail batch would leave some originals unfinished (done < n_tiles); they are
             # never scored, silently shrinking the metric denominator. Never drop in sliced mode.
             drop_last=self.args.compile and not sliced,
             pin_memory=self.training,

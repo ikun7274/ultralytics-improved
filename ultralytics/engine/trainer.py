@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import gc
+import io
 import math
 import os
 import subprocess
@@ -728,17 +729,20 @@ class BaseTrainer:
         """True when the second (whole-image) best/last checkpoint pair should be saved."""
         return bool(getattr(self.args, "val_slice_dual_metric", False)) and bool(getattr(self.args, "val_slice_enable", False))
 
-    def _serialize_ckpt(self, metrics: dict | None, fitness: float | None, best_fitness: float | None = None) -> bytes:
-        """Serialize a checkpoint to bytes with the given (already-prefixed) metrics.
+    def _build_ckpt_payload(self) -> dict:
+        """Build the expensive, metric-independent part of a checkpoint ONCE per epoch.
 
-        L-5: ``best_fitness`` is explicit so the whole-image pair records its OWN best value. It used to be
-        hardcoded to ``self.best_fitness`` (the sliced-metric best), which contradicted the whole-image
-        ``train_metrics`` stored in the same file and misled any resume/analysis reading best_whole.pt.
+        The EMA snapshot (deepcopy + half + contiguous NCHW + criterion strip + fp16 clamp), the fp16
+        optimizer state (another deepcopy) and the results-CSV parse are IDENTICAL for every
+        checkpoint written in an epoch, yet ``save_model`` used to rebuild all of them twice: once
+        for the main pair and again for the whole-image pair, whose only real difference is
+        ``best_fitness`` / ``train_metrics``. That doubled the largest non-GPU blocking cost of an
+        epoch whenever ``val_slice_dual_metric`` was on (and it is now off by default, but the double
+        cost was paid unconditionally before this split).
+
+        ``deepcopy`` itself is NOT optional: ``convert_optimizer_state_dict_to_fp16`` rewrites the
+        optimizer state in place, so handing it the live dict would corrupt ongoing training.
         """
-        import io
-
-        if best_fitness is None:
-            best_fitness = self.best_fitness
         ema = unwrap_model(self.ema.ema)
         ema = deepcopy(ema).half().to(memory_format=torch.contiguous_format)
         if hasattr(ema, "criterion"):
@@ -746,41 +750,55 @@ class BaseTrainer:
         for v in ema.state_dict().values():
             if isinstance(v, torch.Tensor) and v.is_floating_point():
                 torch.nan_to_num_(v)
+        return {
+            "epoch": self.epoch,
+            "model": None,  # resume and final checkpoints derive from EMA
+            "ema": ema,
+            "updates": self.ema.updates,
+            "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
+            "scaler": self.scaler.state_dict(),
+            "train_args": vars(self.args),  # save as dict
+            "train_results": self.read_results_csv(),
+            "date": datetime.now().astimezone().isoformat(),
+            "version": __version__,
+            "git": {
+                "root": str(GIT.root),
+                "branch": GIT.branch,
+                "commit": GIT.commit,
+                "message": GIT.message,
+                "origin": GIT.origin,
+            },
+            "license": "AGPL-3.0 (https://ultralytics.com/license)",
+            "docs": "https://docs.ultralytics.com",
+        }
+
+    def _dump_ckpt(self, payload: dict, metrics: dict | None, fitness: float | None,
+                   best_fitness: float | None = None) -> bytes:
+        """Serialize ``payload`` with one metric set. Never mutates ``payload``.
+
+        Because ``torch.save`` only reads its input, the whole-image pair reuses the main payload
+        verbatim -- only ``best_fitness`` and ``train_metrics`` differ. ``best_fitness`` is explicit
+        (not hardcoded to ``self.best_fitness``) so the whole-image pair records its OWN best value
+        instead of the sliced-metric best, which would contradict the ``train_metrics`` stored in
+        the same file and mislead any resume/analysis reading ``best_whole.pt``.
+        """
         buffer = io.BytesIO()
         torch.save(
             {
-                "epoch": self.epoch,
-                "best_fitness": best_fitness,
-                "model": None,  # resume and final checkpoints derive from EMA
-                "ema": ema,
-                "updates": self.ema.updates,
-                "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
-                "scaler": self.scaler.state_dict(),
-                "train_args": vars(self.args),  # save as dict
+                **payload,
+                "best_fitness": self.best_fitness if best_fitness is None else best_fitness,
                 "train_metrics": {**(metrics or {}), "fitness": fitness},
-                "train_results": self.read_results_csv(),
-                "date": datetime.now().astimezone().isoformat(),
-                "version": __version__,
-                "git": {
-                    "root": str(GIT.root),
-                    "branch": GIT.branch,
-                    "commit": GIT.commit,
-                    "message": GIT.message,
-                    "origin": GIT.origin,
-                },
-                "license": "AGPL-3.0 (https://ultralytics.com/license)",
-                "docs": "https://docs.ultralytics.com",
             },
             buffer,
         )
         return buffer.getvalue()
 
     def save_model(self):
-        """Repair the live EMA, then hand serialization over to ``_serialize_ckpt``."""
+        """Repair the live EMA, then serialize every checkpoint this epoch from ONE shared payload."""
         # A transient NaN/Inf permanently poisons the EMA running average (ema = decay*ema + (1-decay)*model), so
         # save_model would otherwise skip every epoch and the run would finish with no checkpoint on valid input.
         # Resync each poisoned EMA tensor from the live model where finite. This mutates the LIVE EMA in place and
-        # must stay here; the NCHW/half/criterion-strip/clamp snapshot itself lives in _serialize_ckpt.
+        # must stay here, before the snapshot is taken.
         ema = unwrap_model(self.ema.ema)
         if not all(torch.isfinite(v).all() for v in ema.state_dict().values() if isinstance(v, torch.Tensor)):
             model_sd = unwrap_model(self.model).state_dict()
@@ -788,10 +806,12 @@ class BaseTrainer:
                 if isinstance(v, torch.Tensor) and not torch.isfinite(v).all() and torch.isfinite(model_sd[k]).all():
                     v.copy_(model_sd[k])
 
-        # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls). The snapshot (deepcopy +
-        # half + contiguous NCHW + criterion strip + fp16 clamp) is built inside _serialize_ckpt; duplicating it
-        # here only cost a full extra model deepcopy per epoch while leaving a dead local behind.
-        serialized_ckpt = self._serialize_ckpt(self.metrics, self.fitness)
+        # Build the expensive payload (EMA snapshot + fp16 optimizer + results CSV) exactly once,
+        # then serialize each checkpoint from it. Serializing to a byte buffer beats repeated
+        # torch.save calls, and the dual-metric pair now costs one extra dump instead of one extra
+        # full model deepcopy + optimizer deepcopy + nan_to_num_ sweep.
+        payload = self._build_ckpt_payload()
+        serialized_ckpt = self._dump_ckpt(payload, self.metrics, self.fitness)
 
         # Save checkpoints
         self.wdir.mkdir(parents=True, exist_ok=True)  # ensure weights directory exists
@@ -800,7 +820,7 @@ class BaseTrainer:
             self.best.write_bytes(serialized_ckpt)  # save best.pt
         # Dual-metric: save the second (whole-image reference) pair with its own metrics.
         if self._dual_weights_on() and self.whole_metrics is not None and self.fitness_whole is not None:
-            serialized_whole = self._serialize_ckpt(self.whole_metrics, self.fitness_whole, self.best_fitness_whole)
+            serialized_whole = self._dump_ckpt(payload, self.whole_metrics, self.fitness_whole, self.best_fitness_whole)
             self.last_whole.write_bytes(serialized_whole)  # save last_whole.pt
             if self.best_fitness_whole == self.fitness_whole:
                 self.best_whole.write_bytes(serialized_whole)  # save best_whole.pt
@@ -900,7 +920,7 @@ class BaseTrainer:
         validator stayed in the mode of the failed pass and every later epoch validated with the
         wrong mode. ``try/finally`` restores both fields no matter how the pass exits.
 
-        P0-1 fix: a rebuild is forced not only when the mode changes, but also when sliced mode is
+        A rebuild is forced not only when the mode changes, but also when sliced mode is
         requested while the current loader is NOT a sliced dataset. The trainer's prebuilt
         ``test_loader`` is always a whole-image ``YOLODataset`` (it is built by
         ``DetectionTrainer.get_dataloader`` and never goes through
@@ -939,7 +959,7 @@ class BaseTrainer:
         # Main validation pass: when val_slice_enable is on, _run_val switches the validator into
         # sliced mode (and forces a rebuild -- the trainer's prebuilt test_loader is a whole-image
         # loader and would bypass the val_slice wrap, which only exists in
-        # DetectionValidator.get_dataloader). M6: validator state is restored afterwards.
+        # DetectionValidator.get_dataloader). Validator state is restored afterwards.
         slice_on = bool(getattr(self.args, "val_slice_enable", False))
         metrics = self._run_val(slice_on)
         if metrics is None:
@@ -1195,7 +1215,7 @@ class BaseTrainer:
         """Resume YOLO training from a given checkpoint."""
         if ckpt is None or not self.resume:
             return
-        # P2-8: 在加载路径条目化告警 — ultralytics 用 weights_only=False 加载完整 ckpt
+        # 在加载路径条目化告警 — ultralytics 用 weights_only=False 加载完整 ckpt
         # (需保留 optimizer/scheduler/EMA 等对象), 任意代码执行风险随文件来源走。
         # 此处只显式确认来源 + 提示核查; 不强制改 upstream 行为以免破坏既有 ckpt 兼容性。
         try:

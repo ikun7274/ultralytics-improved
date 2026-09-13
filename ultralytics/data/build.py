@@ -18,6 +18,7 @@ from PIL import Image
 from torch.utils.data import Dataset, dataloader, distributed
 
 from ultralytics.cfg import IterableSimpleNamespace
+from ultralytics.data.base import GroupedImageSampler
 from ultralytics.data.dataset import (
     DepthDataset,
     GroundingDataset,
@@ -350,13 +351,20 @@ def build_dataloader(
     dataset_len = len(dataset)
     batch = min(batch, dataset_len)
     seed = torch.initial_seed() - RANK - 1
-    sampler = (
-        None
-        if rank == -1
-        else distributed.DistributedSampler(dataset, shuffle=shuffle, seed=seed)
-        if shuffle
-        else ContiguousDistributedSampler(dataset)
-    )
+    if rank != -1:  # DDP keeps DistributedSampler so every rank gets a balanced, disjoint shard
+        sampler = (
+            distributed.DistributedSampler(dataset, shuffle=shuffle, seed=seed)
+            if shuffle
+            else ContiguousDistributedSampler(dataset)
+        )
+    elif shuffle:
+        # Single-process training: keep every sub-sample of one source image adjacent so the
+        # worker-local raw-image LRU decodes each original once instead of once per sub-sample.
+        # from_dataset() returns None when the dataset cannot benefit (no slicing/extension, LRU
+        # disabled, or the user turned it off), and the loader then falls back to its own global shuffle.
+        sampler = GroupedImageSampler.from_dataset(dataset, seed=seed)
+    else:
+        sampler = None
     samples = len(sampler) if sampler is not None else dataset_len
     drop_last = drop_last and bool(batch) and dataset_len % batch != 0
     batches = (samples // batch if drop_last else math.ceil(samples / batch)) if batch else 0
@@ -371,13 +379,19 @@ def build_dataloader(
     pin_memory_device = (
         device_type if pin_memory and device_type in {"npu", "xpu"} and TORCH_1_13 and not TORCH_2_7 else None
     )
+    # Prefetch depth per worker. PyTorch's own default is 2, so the old comment ("increase over
+    # default 2") was simply wrong; it is exposed as a config key because the memory guidance in
+    # 项目说明.md recommends lowering it to 1 to halve the in-flight batches when online
+    # augmentation is on -- which previously required editing this file. ``None`` when there are
+    # no workers, because PyTorch rejects prefetch_factor together with num_workers=0.
+    prefetch_factor = max(1, int(getattr(dataset, "prefetch_factor", 2) or 2))
     return InfiniteDataLoader(
         dataset=dataset,
         batch_size=batch,
         shuffle=shuffle and sampler is None,
         num_workers=nw,
         sampler=sampler,
-        prefetch_factor=2 if nw > 0 else None,  # increase over default 2
+        prefetch_factor=prefetch_factor if nw > 0 else None,
         pin_memory=pin_memory,
         collate_fn=getattr(dataset, "collate_fn", None),
         worker_init_fn=seed_worker,

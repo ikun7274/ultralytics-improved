@@ -1,25 +1,24 @@
 import os
+import sys
 import argparse
-import shutil
 import random
 from pathlib import Path
+
+# 共享的路径安全护栏（同目录 _safe_io.py）：直接运行 `python pytools/<脚本>.py` 时
+# 该目录已在 sys.path 上，这里再兜底一次以兼容 `python -m pytools.<脚本>` 的调用方式。
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from _safe_io import safe_rmtree, validate_io_dirs  # noqa: E402
+
 from PIL import Image
 from tqdm import tqdm
 import math
 
-# P1-10: Pillow >= 10 移除了 Image.LANCZOS, 改用 Image.Resampling.LANCZOS (旧版回退)
+# Pillow >= 10 移除了 Image.LANCZOS, 改用 Image.Resampling.LANCZOS (旧版回退)
 _LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS", getattr(Image, "LANCZOS", None))
 if _LANCZOS is None:
     raise RuntimeError("Pillow 不再提供 LANCZOS resampling filter; 请升级 Pillow 或回退低层调用.")
-
-
-def safe_rmtree(path, description="目录"):
-    p = Path(path).resolve()
-    if p == p.root or p == Path.home().resolve():
-        raise RuntimeError(f"拒绝删除 {description}：{p} 疑似系统关键路径")
-    if p.exists():
-        print(f"将删除 {description}：{p}")
-        shutil.rmtree(p)
 
 
 def parse_yolo_label(txt_path):
@@ -187,14 +186,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="按顺序将 images 目录中的图片每 group_size 张合成一组（网格），最后一组不足时可选随机补全"
     )
-    parser.add_argument("--input_dir", type=str, default="",
-                        help="输入目录，应包含 images/ 和 labels/ 子目录（切片后数据; 必传; 例: D:/datasets/base_0_0）")
-    parser.add_argument("--output_dir", type=str, default="",
-                        help="输出目录，将自动创建 images/ 和 labels/ 存放合成结果（必传; 例: D:/datasets/base_0_2）")
+    parser.add_argument("--input_dir", type=str, required=True,
+                        help="输入目录（必传），应包含 images/ 和 labels/ 子目录（切片后数据; 例: D:/datasets/base_0_0）")
+    parser.add_argument("--output_dir", type=str, required=True,
+                        help="输出目录（必传），将自动创建 images/ 和 labels/ 存放合成结果（例: D:/datasets/base_0_2）")
     parser.add_argument("--img_suffix", type=str, default=".jpg",
                         help="输出图片扩展名")
-    parser.add_argument("--overwrite", action="store_true", default=True,
-                        help="覆盖已有输出目录")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="覆盖已存在的输出目录（默认关闭：输出目录已存在时报错退出，避免误删数据）")
     parser.add_argument("--group_size", type=int, default=4,
                         help="每组图片数，默认为4（2x2网格）")
     parser.add_argument("--start_index", type=int, default=0,
@@ -210,9 +209,8 @@ def main():
     if args.seed is not None:
         random.seed(args.seed)
 
-    input_path = Path(args.input_dir)
-    if not input_path.exists():
-        raise FileNotFoundError(f"输入目录不存在: {input_path}")
+    # 目录校验：必传 + 拒绝 cwd/系统关键路径 + 输入≠输出，全部在删除动作之前完成
+    input_path, output_path = validate_io_dirs(args.input_dir, args.output_dir)
 
     img_dir = input_path / "images"
     label_dir = input_path / "labels"
@@ -221,12 +219,11 @@ def main():
     if not label_dir.exists():
         print("警告：未找到 labels 子目录，将跳过标签处理")
 
-    output_path = Path(args.output_dir)
     if output_path.exists():
         if args.overwrite:
             safe_rmtree(output_path, description="输出目录")
         else:
-            raise FileExistsError(f"输出目录已存在，请使用 --overwrite 覆盖")
+            raise FileExistsError(f"输出目录已存在：{output_path}；确认要覆盖请显式加 --overwrite")
 
     out_img_dir = output_path / "images"
     out_label_dir = output_path / "labels"

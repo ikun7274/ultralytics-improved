@@ -15,9 +15,11 @@ import torch
 from PIL import Image
 from torch.nn import functional as F
 
+from ultralytics.data.online_degrade import _OCCLUSION_TYPES, _WEATHER_TYPES
+from ultralytics.data.online_io import _ensure_dir
 from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
 from ultralytics.utils import LOGGER, IterableSimpleNamespace, colorstr, deprecation_warn
-from ultralytics.utils.patches import imwrite  # M2: unicode-safe save (cv2.imwrite silently fails on non-ASCII paths)
+from ultralytics.utils.patches import imwrite  # unicode-safe save (cv2.imwrite silently fails on non-ASCII paths)
 from ultralytics.utils.checks import check_version
 from ultralytics.utils.instance import Instances
 from ultralytics.utils.metrics import bbox_ioa
@@ -495,7 +497,7 @@ class Mosaic(BaseMixTransform):
         self.save_exist_ok = exist_ok
         self.save_max = save_max
         self.save_annotated = save_annotated
-        # P0-1: tag each saved mosaic with the worker pid so multi-worker DataLoader
+        # tag each saved mosaic with the worker pid so multi-worker DataLoader
         # instances don't silently overwrite each other's outputs (counter is per-instance,
         # so workers racing on the same _saved value produced colliding filenames).
         self._saved = 0
@@ -525,9 +527,10 @@ class Mosaic(BaseMixTransform):
             except Exception as e:
                 # annotation drawing is best-effort for verification only; keep a debug trace
                 LOGGER.debug(f"Mosaic: annotation drawing failed while saving (best-effort): {e}")
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+        # _ensure_dir: mkdir once per process instead of a syscall per saved sample per worker.
+        _ensure_dir(self.save_dir)
         if not imwrite(str(self.save_dir / f"mosaic_{self._save_tag}_{self._saved:05d}_n{n_inst}.jpg"), img):
-            # M2: never consume the save_max quota (nor silently pass) when the write actually failed.
+            # never consume the save_max quota (nor silently pass) when the write actually failed.
             LOGGER.warning(
                 f"Mosaic: save failed for '{self.save_dir}' (imwrite returned False) -- check path/permissions; "
                 "save_max quota NOT consumed."
@@ -551,6 +554,8 @@ class Mosaic(BaseMixTransform):
             >>> print(len(indexes))  # Output: 3
         """
         if self.buffer_enabled:  # select images from buffer
+            # The buffer is a deque; materialising it as a list is kept intentionally, because
+            # deque indexing is O(n) and random.choices indexes it once per drawn sample.
             return random.choices(list(self.dataset.buffer), k=self.n - 1)
         else:  # select any images
             return [random.randint(0, len(self.dataset) - 1) for _ in range(self.n - 1)]
@@ -850,9 +855,14 @@ def slice_geometry(
     ``bias*w`` and narrows the right/bottom tile by the same amount, so the seam moves by ``bias*w``
     while every pixel of the image still belongs to at least one tile.
     """
-    assert 0.0 <= overlap_ratio < 1.0, f"slice_geometry: 'overlap_ratio' must be in [0, 1), got {overlap_ratio}."
-    assert -0.5 <= bias_x <= 0.5, f"slice_geometry: 'bias_x' must be in [-0.5, 0.5], got {bias_x}."
-    assert -0.5 <= bias_y <= 0.5, f"slice_geometry: 'bias_y' must be in [-0.5, 0.5], got {bias_y}."
+    # Explicit ValueError rather than assert: this validates USER configuration, and assert statements
+    # are stripped entirely under ``python -O``, which would silently disable the guard.
+    if not 0.0 <= overlap_ratio < 1.0:
+        raise ValueError(f"slice_geometry: 'overlap_ratio' must be in [0, 1), got {overlap_ratio}.")
+    if not -0.5 <= bias_x <= 0.5:
+        raise ValueError(f"slice_geometry: 'bias_x' must be in [-0.5, 0.5], got {bias_x}.")
+    if not -0.5 <= bias_y <= 0.5:
+        raise ValueError(f"slice_geometry: 'bias_y' must be in [-0.5, 0.5], got {bias_y}.")
     sw = min(w, max(1, int((1 + overlap_ratio) * w / 2)))
     sh = min(h, max(1, int((1 + overlap_ratio) * h / 2)))
     # Seam delta in pixels. The seam moves by exactly `delta` while both tiles keep a positive width
@@ -894,7 +904,7 @@ def compute_slice_bias(
     win_x = max(np.median(b[:, 2] - b[:, 0]), w * 0.05)
     win_y = max(np.median(b[:, 3] - b[:, 1]), h * 0.05)
     cands = np.linspace(margin, 1.0 - margin, 32)
-    # L3 fix: 旧实现 32 候选 x 2 轴的 Python 列表推导 (逐候选内层求和); 改为一次广播比较。
+    # 旧实现 32 候选 x 2 轴的 Python 列表推导 (逐候选内层求和); 改为一次广播比较。
     # (N,1) 目标中心 vs (1,32) 候选 -> (N,32) 布尔, axis=0 求和即每候选窗口内目标数。
     score_x = (np.abs(cx[:, None] - (cands * w)[None, :]) < (win_x / 2)).sum(axis=0)
     score_y = (np.abs(cy[:, None] - (cands * h)[None, :]) < (win_y / 2)).sum(axis=0)
@@ -1000,15 +1010,19 @@ class OnlineSlice(BaseTransform):
             bias_jitter (float): Uniform random seam perturbation added each call (relative to the image
                 extent), so the same image does not get identical seams every epoch. 0 disables.
         """
-        assert 0.0 <= p <= 1.0, f"OnlineSlice: 'p' must be in [0, 1], got {p}."
-        assert 0.0 <= overlap_ratio < 1.0, f"OnlineSlice: 'overlap_ratio' must be in [0, 1), got {overlap_ratio}."
-        assert 0.0 <= min_area_ratio <= 1.0, f"OnlineSlice: 'min_area_ratio' must be in [0, 1], got {min_area_ratio}."
-        assert 0.0 <= min_retain_ratio <= 1.0, (
-            f"OnlineSlice: 'min_retain_ratio' must be in [0, 1], got {min_retain_ratio}."
-        )
-        assert 0.0 <= min_center_ratio <= 1.0, (
-            f"OnlineSlice: 'min_center_ratio' must be in [0, 1], got {min_center_ratio}."
-        )
+        # Explicit ValueError rather than assert: every one of these is a user-supplied hyperparameter
+        # from default.yaml, and ``python -O`` strips asserts -- the invalid value would then be
+        # accepted silently and only show up as nonsense slicing geometry much later.
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f"OnlineSlice: 'p' must be in [0, 1], got {p}.")
+        if not 0.0 <= overlap_ratio < 1.0:
+            raise ValueError(f"OnlineSlice: 'overlap_ratio' must be in [0, 1), got {overlap_ratio}.")
+        if not 0.0 <= min_area_ratio <= 1.0:
+            raise ValueError(f"OnlineSlice: 'min_area_ratio' must be in [0, 1], got {min_area_ratio}.")
+        if not 0.0 <= min_retain_ratio <= 1.0:
+            raise ValueError(f"OnlineSlice: 'min_retain_ratio' must be in [0, 1], got {min_retain_ratio}.")
+        if not 0.0 <= min_center_ratio <= 1.0:
+            raise ValueError(f"OnlineSlice: 'min_center_ratio' must be in [0, 1], got {min_center_ratio}.")
         self.p = p
         self.overlap_ratio = overlap_ratio
         self.min_area_ratio = min_area_ratio
@@ -1070,9 +1084,10 @@ class OnlineSlice(BaseTransform):
                 x0, y0, x1, y1 = (int(round(float(v))) for v in b)
                 cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
                 cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+        # _ensure_dir: mkdir once per process instead of a syscall per saved tile per worker.
+        _ensure_dir(self.save_dir)
         if not imwrite(str(self.save_dir / f"{tag}_{self._saved:05d}_n{len(boxes_px)}.jpg"), img):
-            # M2: never consume the save_max quota (nor silently pass) when the write actually failed.
+            # never consume the save_max quota (nor silently pass) when the write actually failed.
             LOGGER.warning(
                 f"OnlineSlice: tile save failed for '{self.save_dir}' (imwrite returned False) -- check "
                 "path/permissions; save_max quota NOT consumed."
@@ -3375,18 +3390,18 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     online_aug_on = not getattr(dataset, "rect", False) and not getattr(dataset, "use_obb", False)
 
     # ---- 训练后期关闭在线增强 (close_aug_epoch, 与 close_mosaic 同构的时间维调度) ----
-    # S5 修复附带: 此前该值从未被复制到 dataset 上, base.py 的 getattr(self, "close_aug_epoch", 0)
+    # 修复附带: 此前该值从未被复制到 dataset 上, base.py 的 getattr(self, "close_aug_epoch", 0)
     # 恒为 0, 时间维调度从未生效; set_epoch/_rebuild_epoch_masks 靠它判断最后 N 个 epoch 全部关增强。
     dataset.close_aug_epoch = int(getattr(hyp, "close_aug_epoch"))
 
-    # M-1 fix: mirror the LRU capacity onto the dataset so it is self-describing (base.py consumes the same
+    # mirror the LRU capacity onto the dataset so it is self-describing (base.py consumes the same
     # hyp key directly in __init__, since this function runs too late for an eager read there).
     dataset.slice_raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", 2) or 0)
 
     # ---- 在线切片 (slice_prob 独立开关) ----
     slice_enabled = online_aug_on and getattr(hyp, "slice_prob") > 0.0
     if slice_enabled:
-        # P2-3: tile cap honours slice_save_max_tile override (falls back to slice_save_max when None).
+        # tile cap honours slice_save_max_tile override (falls back to slice_save_max when None).
         # tile is the ONLY branch whose cap lives on the OnlineSlice instance itself (see _save in
         # augment.py: line 941), so the override must be applied here at construction time -- unlike
         # blur/ratio/compose whose caps base.py reads per-call from `self`.
@@ -3427,6 +3442,11 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     dataset.compose_save = online_aug_on and bool(getattr(hyp, "compose_save"))
     dataset.compose_save_dir = str(getattr(hyp, "compose_save_dir") or "")
     dataset.compose_max_side = int(getattr(hyp, "compose_max_side") or 0)
+    # Same working-resolution cap, but for the degradation branches (blur / weather / occlusion / ratio).
+    # Mirrored onto the dataset exactly like compose_max_side: without this copy the key would be
+    # registered in default.yaml yet never reach the dataset, and _degrade_max_side() would silently
+    # stay on its "auto" default no matter what the user configured.
+    dataset.degrade_max_side = int(getattr(hyp, "degrade_max_side", 0) or 0)
     dataset.ratio_pad_keep = online_aug_on and bool(getattr(hyp, "ratio_pad_keep"))
     dataset.ratio_pad_target = str(getattr(hyp, "ratio_pad_target") or "auto")
     dataset.ratio_pad_color = str(getattr(hyp, "ratio_pad_color") or "black")
@@ -3456,10 +3476,12 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     dataset.occlusion_color = str(getattr(hyp, "occlusion_color") or "auto")
     dataset.occlusion_max_cover = float(getattr(hyp, "occlusion_max_cover"))
     dataset.occlusion_save_dir = str(getattr(hyp, "occlusion_save_dir") or "")
-    # M4 fix: weather/occlusion 类型白名单校验 (拼错立即在构造期报错, 不再静默落入默认分支)。
-    # 与 base.py 的 _WEATHER_TYPES / _OCCLUSION_TYPES 及 _apply_weather / _apply_occlusion 分派一致;
+    # weather/occlusion 类型白名单校验 (拼错立即在构造期报错, 不再静默落入默认分支)。
+    # 常量在模块顶层直接取自 online_degrade —— 与 _apply_weather / _apply_occlusion 的分派同源, 单一真源。
+    # 不要改回 `from ultralytics.data.base import ...`: base.py 自己一次都不用这两个名字, 那样就是隐式
+    # re-export, Ruff F401 一次 --fix (或 IDE 优化导入) 就会删掉 base 里那两行, 校验随之静默消失,
+    # 拼错退化成运行时随机兜底 —— 正是 M-2 记录的那个陷阱。
     # 空串回退默认类型 (与 base.py 运行时行为一致)。
-    from ultralytics.data.base import _OCCLUSION_TYPES, _WEATHER_TYPES
 
     _w = [t.strip() for t in dataset.weather_types.split(",") if t.strip()]
     _bad = sorted(set(_w) - _WEATHER_TYPES)
@@ -3475,7 +3497,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
             f"occlusion_types contains unknown type(s) {_bad}; valid types: {sorted(_OCCLUSION_TYPES)}."
         )
     dataset.occlusion_types = ",".join(_o) if _o else "rect"
-    # P2-3: per-branch save cap overrides (slice_save_max_{tile,blur,ratio,compose}).
+    # per-branch save cap overrides (slice_save_max_{tile,blur,ratio,compose}).
     # base.py's _save_cap() reads these from `self`; if not set here it falls back to slice_save_max.
     # Keep tile in sync with the legacy `save_max` passed to OnlineSlice above.
     dataset.slice_save_max_tile = getattr(hyp, "slice_save_max_tile")
@@ -3484,7 +3506,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     dataset.slice_save_max_compose = getattr(hyp, "slice_save_max_compose")
     dataset.slice_save_max_weather = getattr(hyp, "slice_save_max_weather")
     dataset.slice_save_max_occlusion = getattr(hyp, "slice_save_max_occlusion")
-    # L5: 全局画框开关与切片解耦 —— 各在线分支 (blur/ratio/weather/occlusion/compose) 的保存块
+    # 全局画框开关与切片解耦 —— 各在线分支 (blur/ratio/weather/occlusion/compose) 的保存块
     # 统一只读 dataset 属性, 不再依赖 slice_transform 实例 (slice_transform=None 时亦可保存)。
     dataset.slice_save_annotated = bool(getattr(hyp, "slice_save_annotated"))
 
