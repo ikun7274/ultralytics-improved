@@ -1,0 +1,64 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+#
+# 本文件只承载「CI 口径的格式 / 静态检查」配置，**不含打包元数据**：
+# 本项目以源码目录方式使用，未以 wheel 形式分发；加 [project] / [build-system]
+# 会改变 `pip install -e .` 的语义，故勿在此添加（由 tests/test_lint_config.py 守护）。
+#
+# 为什么必须有它（代码审查报告 M-6）
+# ---------------------------------
+# 仓库此前没有任何 Ruff 配置，本地跑 Ruff 会回落到 **默认 88 列 + 版本相关默认规则集**，
+# 于是 `ruff format --check .` 报 235 / 271 个文件需重排（绝大多数是本就合规的上游代码），
+# 而 CI（.github/workflows/format.yml → ultralytics/actions，按上游 120 列执行）只会改动本项目
+# 自有/改过的那些文件。本地与 CI 口径不一致时「提交前自查」没有意义，且 PR 上 CI 会替你改写代码。
+#   → 补齐配置后：**235 → 23 个 .py**（差距全部落回"真未格式化的本项目文件"）。
+#
+# 与上游 ultralytics/pyproject.toml 保持同值的项：line-length / target-version /
+# [tool.ruff.format] / [tool.ruff.lint.pydocstyle] / [tool.docformatter] / [tool.codespell]。
+# 改动这些项前请先对照上游，否则本文件就从"复现 CI"退化成"自定义 CI"。
+#
+# 上游有、这里**故意没有**的项：[tool.pytest.ini_options]。上游在该节含
+# `addopts = "--doctest-modules --durations=30 --color=yes"`，在本仓库会让 pytest 去收集
+# ultralytics/ 的全部模块并 import torch，既慢又与本项目 `pytest tests/... -q` 的用法冲突。
+
+[tool.ruff]
+line-length = 120 # 上游同值；缺它则回落 88 —— 这正是 M-6 的根因
+target-version = "py38" # 上游同值
+# 不重复列 .gitignore 里已有的 runs/ weights/ .workbuddy/ 等：Ruff 默认 respect-gitignore，
+# 在这里再抄一份就成了第二份要手工维护的清单（同 M-10 的教训：输入的副本会静默漂移）。
+# 这里只补 .gitignore 覆盖不到的：
+extend-exclude = [
+    "*.md", # Markdown 代码块归 CI 的 prettier 步骤；Ruff 会把 README 里**刻意对齐**的行内注释
+            # 压成单空格（`slice_prob=1.0,   # 在线切片概率` → `slice_prob=1.0, # 在线切片概率`），
+            # 破坏示例可读性，而 CI 端的 prettier 并不改写代码块内容。
+]
+
+[tool.ruff.lint]
+# 显式枚举，**不依赖** Ruff 的版本相关默认集：0.16.7 的默认集（含 S / ASYNC / YTT / UP / DTZ /
+# PL / FURB / …）与 0.13 时代差异很大，依赖默认会得到"同一份代码在不同 Ruff 版本下结论不同"。
+# 本列表是「提交前自查」口径的**唯一真源**，pytools/lint.py 直接复用它（不另抄一份）。
+select = ["E4", "E7", "E9", "F", "B", "SIM", "C4", "PERF", "RET", "ARG", "PIE", "RUF"]
+# 中文注释里的全角标点会被判为"歧义 Unicode"，属纯噪声：
+ignore = [
+    "RUF001", # ambiguous-unicode-character-string
+    "RUF002", # ambiguous-unicode-character-docstring
+    "RUF003", # ambiguous-unicode-character-comment
+]
+
+[tool.ruff.format]
+docstring-code-format = true # 上游同值
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+# 以下两节与上游同值，便于在本地复现 CI 的 docformatter / codespell 步骤
+# （这两个工具未随仓库安装，pytools/lint.py 会在缺失时明确提示"已跳过"，而不是假装通过）。
+[tool.docformatter]
+wrap-summaries = 120
+wrap-descriptions = 120
+pre-summary-newline = true
+close-quotes-on-newline = true
+in-place = true
+
+[tool.codespell]
+ignore-words-list = "grey,writeable,finalY,RepResNet,Idenfy,WIT,Smoot,EHR,ROUGE,ALS,iTerm,Carmel,FPR,Hach,Calle,ore,COO,MOT,crate,nd,ned,strack,dota,ane,segway,fo,gool,winn,commend,bloc,nam,afterall,skelton,goin,alls,manger,trough,cann"
+skip = "*.pt,*.pth,*.torchscript,*.onnx,*.tflite,*.pb,*.bin,*.param,*.mlmodel,*.engine,*.npy,*.data*,*.csv,*pnnx*,*venv*,*translat*,*lock*,__pycache__*,*.ico,*.jpg,*.png,*.webp,*.avif,*.mp4,*.mov,/runs,/.git,./docs/??/*.md,./docs/mkdocs_??.yml"
