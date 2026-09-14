@@ -26,7 +26,7 @@ def parse_yolo_label(txt_path):
     anns = []
     if not Path(txt_path).exists():
         return anns
-    with open(txt_path, 'r') as f:
+    with open(txt_path, 'r', encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -44,7 +44,7 @@ def parse_yolo_label(txt_path):
 
 
 def write_yolo_label(txt_path, anns):
-    with open(txt_path, 'w') as f:
+    with open(txt_path, 'w', encoding="utf-8") as f:
         for cls_id, xc, yc, w, h in anns:
             f.write(f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
 
@@ -141,7 +141,7 @@ def process_image(img_path, label_path, out_img_dir, out_label_dir,
     new_img = Image.new('RGB', (new_w, new_h), color=PAD_COLORS[pad_color])
     new_img.paste(img, (pad_left, pad_top))
 
-    # P1-10: 可选 max_side 等比缩放, 同时按相同比例缩放 pad_left/pad_top,
+    # 可选 max_side 等比缩放, 同时按相同比例缩放 pad_left/pad_top,
     # 否则把"先 padding 再缩放"的图与"未缩放的 pad 参数"一起丢给 remap_labels,
     # 标签坐标会系统性偏移.
     if max_side > 0 and max(new_w, new_h) > max_side:

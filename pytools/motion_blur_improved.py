@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def _safe_label_path(input_path: Path, stem: str) -> Path | None:
-    """YOLO 标签查找 (P1-10):
+    """YOLO 标签查找:
     1. 优先同目录 (与 image 同级)
     2. 回退到同级 labels/ 子目录 (Ultralytics 标准 YOLO 布局: images/<...>/foo.jpg, labels/<...>/foo.txt)
     """
@@ -24,7 +24,7 @@ def _safe_label_path(input_path: Path, stem: str) -> Path | None:
 
 
 def _safe_imwrite(path: str | Path, img: np.ndarray) -> bool:
-    """Unicode-safe imwrite (P1-10): cv2.imwrite 中文路径会静默返回 False (项目内已验证),
+    """Unicode-safe imwrite: cv2.imwrite 中文路径会静默返回 False (项目内已验证),
     用 cv2.imencode + .tofile() 绕开. 失败返回 False 但不抛异常."""
     try:
         ok, buf = cv2.imencode(Path(path).suffix or ".jpg", img)
@@ -164,7 +164,7 @@ def process_folder(
             out_origin = output_path / f"{stem}{suffix}"
             out_origin.write_bytes(file.read_bytes())
             total_origin_img += 1
-            # 同步复制原图对应的txt标签 (P1-10: 同时支持同目录与 labels/ 标准目录)
+            # 同步复制原图对应的txt标签 (同时支持同目录与 labels/ 标准目录)
             if copy_yolo_labels:
                 src_txt = _safe_label_path(input_path, stem)
                 if src_txt is not None:
@@ -178,8 +178,8 @@ def process_folder(
         short_sigma = rng.uniform(0.0, short_sigma_max)
         short_image = apply_motion_blur(img, length=short_length, angle=short_angle, defocus_sigma=short_sigma)
         short_image_path = output_path / f"{stem}_blurred_short{suffix}"
-        # P1-10: cv2.imwrite 在中文路径上静默失败, 改用 unicode-safe imwrite
-        # M3: 检查返回值, 失败计入失败数而非静默吞掉
+        # cv2.imwrite 在中文路径上静默失败, 改用 unicode-safe imwrite
+        # 检查返回值, 失败计入失败数而非静默吞掉
         if not _safe_imwrite(short_image_path, short_image):
             write_failed += 1
             print(f"  ⚠ 写入失败: {short_image_path}")
@@ -202,7 +202,7 @@ def process_folder(
             f"长模糊：length={long_length:.1f}, angle={long_angle:.1f}, sigma={long_sigma:.2f}"
         )
 
-        # 复制模糊图对应的YOLO标签 (P1-10: 同目录/标准 labels/ 二选一)
+        # 复制模糊图对应的YOLO标签 (同目录/标准 labels/ 二选一)
         if copy_yolo_labels:
             label_file = _safe_label_path(input_path, stem)
             if label_file is not None:
@@ -220,7 +220,7 @@ def process_folder(
     if copy_yolo_labels:
         print(f"复制原图标签：{total_origin_label}")
         print(f"复制模糊图标签：{total_blur_label}")
-    # M3: 失败汇总, 让用户明确知道输出数据集是否完整
+    # 失败汇总, 让用户明确知道输出数据集是否完整
     if read_failed:
         print(f"⚠ 警告: {read_failed} 张图片读取失败被跳过")
     if write_failed:

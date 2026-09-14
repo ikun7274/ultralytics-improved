@@ -276,7 +276,7 @@ def fixed_grid_slice_coco(coco_json, img_dir, out_slice_dir,
     out_img_dir = out_dir / "images"
     out_img_dir.mkdir(exist_ok=True)
 
-    with open(coco_json, 'r') as f:
+    with open(coco_json, 'r', encoding="utf-8") as f:
         coco = json.load(f)
 
     print(f"原始COCO标注总数: {len(coco['annotations'])}")
@@ -396,7 +396,7 @@ def fixed_grid_slice_coco(coco_json, img_dir, out_slice_dir,
     }
 
     new_json_path = out_dir / 'sliced_annotations.json'
-    with open(new_json_path, 'w') as f:
+    with open(new_json_path, 'w', encoding="utf-8") as f:
         json.dump(new_coco, f, indent=2)
 
     print(f"2x2网格切片完成，重叠比例：{overlap_ratio:.2f}")
@@ -413,7 +413,7 @@ def filter_background_slices(slice_json_path, slice_img_folder, neg_ratio):
     if not json_path.exists():
         print(f"警告：JSON 文件 {json_path} 不存在，跳过背景筛选。")
         return
-    with open(json_path, "r") as f:
+    with open(json_path, "r", encoding="utf-8") as f:
         coco = json.load(f)
     pos_ids = set(ann["image_id"] for ann in coco["annotations"])
     all_ids = set(img["id"] for img in coco["images"])
@@ -433,7 +433,7 @@ def filter_background_slices(slice_json_path, slice_img_folder, neg_ratio):
             if img_path.exists():
                 img_path.unlink()
     coco["images"] = [img for img in coco["images"] if img["id"] not in remove_ids]
-    with open(json_path, "w") as f:
+    with open(json_path, "w", encoding="utf-8") as f:
         json.dump(coco, f, indent=2)
     print(f"已保留 {keep_num} 个背景切片，删除了 {len(remove_ids)} 个背景切片。")
 
@@ -520,7 +520,7 @@ def generate_final_statistics(yolo_root, output_json="statistics.json", slice_pa
             empty_labels += 1
             continue
         non_empty_labels += 1
-        with open(lbl_file, "r") as f:
+        with open(lbl_file, "r", encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split()
                 if parts:
@@ -531,7 +531,7 @@ def generate_final_statistics(yolo_root, output_json="statistics.json", slice_pa
     classes_file = root.parent / "classes.txt" if root.parent else None
     class_names = {}
     if classes_file and classes_file.exists():
-        with open(classes_file, "r") as f:
+        with open(classes_file, "r", encoding="utf-8") as f:
             names = [line.strip() for line in f if line.strip()]
             for idx, name in enumerate(names):
                 class_names[idx] = name
@@ -554,7 +554,7 @@ def generate_final_statistics(yolo_root, output_json="statistics.json", slice_pa
     }
 
     out_path = root / output_json
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
 
     print("\n========== 最终数据集统计 ==========")

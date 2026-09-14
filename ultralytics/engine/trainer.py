@@ -1065,7 +1065,7 @@ class BaseTrainer:
     def save_metrics(self, metrics):
         """Append one epoch of metrics to results.csv, keeping the header and every row aligned.
 
-        M-5: the metric set can change between runs (e.g. resuming with val_slice_dual_metric enabled appends
+        The metric set can change between runs (e.g. resuming with val_slice_dual_metric enabled appends
         the whole_* columns while check_resume keeps the existing results.csv). The file is positional, so rows
         written after such a change would silently out-grow the header and plot_results() would mis-read them.
         """

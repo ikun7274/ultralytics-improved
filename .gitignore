@@ -55,6 +55,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+# Ruff 缓存目录（pytools/lint.py 用 --no-cache 跑，但 IDE / 手动执行会生成）
+.ruff_cache/
 mlruns/
 
 # Translations

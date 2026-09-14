@@ -47,6 +47,18 @@ from ultralytics.utils.patches import imread
 _ONLINE_DEFAULTS: dict[str, Any] = {
     # epoch-level branch ratios (rebuilt per epoch by set_epoch; see _mask_specs)
     "slice_ratio": 1.0,
+    # slicing geometry / filters (authoritative defaults live in default.yaml; see there)
+    "slice_prob": 0.0,
+    "slice_overlap_ratio": 0.2,
+    "slice_min_tile_area_ratio": 0.005,
+    "slice_min_box_retain_ratio": 0.4,
+    "slice_min_center_retain_ratio": 0.6,
+    "slice_center_constraint": False,
+    "slice_center_bias": False,
+    "slice_bias_margin": 0.25,
+    "slice_bias_jitter": 0.05,
+    "slice_full_box_only": False,
+    "slice_background_ratio": -1,
     "ratio_pad_ratio": 1.0,
     "blur_ratio": 1.0,
     "compose_ratio": 1.0,
@@ -66,6 +78,7 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     "blur_long_len_min": 20,
     "blur_long_len_max": 35,
     "blur_long_defocus_sigma": 1.0,
+    "blur_axis_aligned": True,
     # weather
     "weather_types": "rain,haze,noise",
     "weather_rain_density": 0.15,
@@ -84,11 +97,23 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     # working-resolution caps (0 = auto)
     "compose_max_side": 0,
     "degrade_max_side": 0,
+    "degrade_resample": "area",
     # sampling / caching
     "slice_grouped_sampler": True,
+    "slice_raw_cache_size": 2,
+    "prefetch_factor": 2,
+    "ims_cache_frames": 0,
+    "ims_cache_mb": 1024,
     # annotated saves
     "slice_save_annotated": True,
     "slice_save_max": 0,
+    "slice_save_exist_ok": True,
+    "slice_save_max_tile": None,
+    "slice_save_max_blur": None,
+    "slice_save_max_ratio": None,
+    "slice_save_max_compose": None,
+    "slice_save_max_weather": None,
+    "slice_save_max_occlusion": None,
     "slice_save_dir": None,
     "compose_save_dir": "",
     "ratio_pad_save_dir": "",
@@ -101,6 +126,85 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
 def _online_default(key: str) -> Any:
     """Return the online-augmentation fallback for ``key`` (see ``_ONLINE_DEFAULTS``)."""
     return _ONLINE_DEFAULTS[key]
+
+
+def _legacy_ims_cap(ni: int, batch_size: int) -> int:
+    """Upstream's steady-state bound on ``self.ims``: ``min(ni, batch*8, 1000) - 1`` frames.
+
+    Kept verbatim (including the ``max(1, ...)`` floor) so the ``ims_cache_frames < 0`` branch can
+    reproduce the upstream formula exactly for A/B runs. Equals ``max(1, max_buffer_length - 1)``.
+    """
+    return max(1, min(ni, batch_size * 8, 1000) - 1)
+
+
+def _ims_frame_bytes(imgsz: int | list[int], channels: int) -> int:
+    """Bytes of ONE memoised ``self.ims`` frame.
+
+    ``BaseDataset.load_image`` stores the frame AFTER resizing it to ``imgsz`` (not at the sensor
+    resolution), so the square ``imgsz`` shape is the right estimate. Rectangular training
+    (``rect``/``resize_short``) stores strictly smaller frames, so this OVER-estimates a little --
+    meaning the derived cap is conservative (never larger than the budget allows).
+    """
+    side = int(max(imgsz)) if isinstance(imgsz, (list, tuple)) else int(imgsz)
+    return max(1, side * side * int(channels))
+
+
+def _ims_cap_for_budget(budget_mb: float, frame_bytes: int) -> int:
+    """Frames of ``frame_bytes`` that fit in ``budget_mb`` MiB; ``0`` when there is no budget.
+
+    ``0`` is returned for a non-positive budget and is NOT a usable cap: ``_remember_ims`` reads
+    ``_ims_cap <= 0`` as "do not evict", so a zero cap would turn the bounded cache into an unbounded
+    leak (one frame per image in the dataset). Callers must map "no budget" to something else.
+    """
+    if budget_mb <= 0:
+        return 0
+    return max(1, int(budget_mb * (1 << 20)) // max(1, int(frame_bytes)))
+
+
+def _resolve_ims_cap(hyp: Any, ni: int, batch_size: int, imgsz: int | list[int], channels: int, augment: bool) -> int:
+    """Resolve the ``self.ims`` frame cap for one dataset -- see ``ims_cache_frames`` in default.yaml.
+
+    ``0`` (default) = auto: ``min(upstream formula, frames that fit in ``ims_cache_mb``)``. The
+    ``min`` is deliberate -- the default may only ever LOWER memory relative to upstream, never raise
+    it, so the blast radius is limited to the configurations that are actually pathological (large
+    ``imgsz`` and/or large ``batch``): with the shipped 1 GiB budget, ``imgsz <= 640`` and
+    ``batch <= 64`` resolve to upstream's value unchanged (511 frames = 599 MiB), while
+    ``batch=64`` at 1280/1920 drops 2.3/5.3 GiB to ~1 GiB. ``> 0`` = that many frames exactly (may
+    exceed upstream, to buy back JPEG re-decodes). ``< 0`` = upstream's formula verbatim, for A/B.
+
+    A non-augmenting dataset gets ``0``; note that is NOT a cap but "no writer" -- ``load_image``'s
+    cache write sits behind ``self.augment``, whereas ``_remember_ims`` reads ``<= 0`` as "never
+    evict", so zero must never be produced for an augmenting dataset.
+    """
+    if not augment:
+        return 0
+    frames = int(getattr(hyp, "ims_cache_frames", _online_default("ims_cache_frames")) or 0)
+    if frames > 0:
+        return frames
+    legacy = _legacy_ims_cap(ni, batch_size)
+    if frames < 0:
+        return legacy
+    budget_mb = float(getattr(hyp, "ims_cache_mb", _online_default("ims_cache_mb")) or 0)
+    budgeted = _ims_cap_for_budget(budget_mb, _ims_frame_bytes(imgsz, channels))
+    # `budgeted == 0` means "no budget configured" (`ims_cache_mb <= 0`) -> keep upstream's rule.
+    return min(legacy, budgeted) if budgeted else legacy
+
+
+def _describe_ims_cap(hyp: Any, cap: int, imgsz: int | list[int], channels: int) -> str:
+    """One-line, greppable report of the resolved ``self.ims`` budget, per worker."""
+    frame = _ims_frame_bytes(imgsz, channels)
+    frames = int(getattr(hyp, "ims_cache_frames", _online_default("ims_cache_frames")) or 0)
+    if frames > 0:
+        source = "explicit"
+    elif frames < 0:
+        source = "upstream formula"
+    else:
+        source = "auto=min(upstream, budget)"
+    return (
+        f"self.ims whole-image cache: {cap} frames x {frame / (1 << 20):.2f} MiB = "
+        f"{cap * frame / (1 << 20):.0f} MiB/worker [ims_cache_frames={source}, imgsz={imgsz}, "
+        f"channels={channels}]; tune ims_cache_frames / ims_cache_mb to trade re-decodes for memory"
+    )
 
 
 def _cap_long_side(im: np.ndarray, cap: float, interp: int = cv2.INTER_AREA) -> tuple[np.ndarray, float]:
@@ -137,7 +241,7 @@ def _cap_long_side(im: np.ndarray, cap: float, interp: int = cv2.INTER_AREA) -> 
 
 # Branches allowed to use BaseDataset._save_annotated. Whitelisted so a mistyped branch name fails
 # loudly instead of silently creating a fresh, empty save counter.
-_SAVE_BRANCHES: frozenset[str] = frozenset({"tile", "ratio", "blur", "compose", "weather", "occlusion"})
+_SAVE_BRANCHES: frozenset[str] = frozenset({"ratio", "blur", "compose", "weather", "occlusion"})
 
 
 class SegmentBases(NamedTuple):
@@ -378,9 +482,17 @@ class BaseDataset(Dataset):
         # indices while `ims` is keyed by ORIGINAL index; `_ims_keys` is an independent
         # insertion-ordered FIFO that keeps the cache bounded in every mode.
         self._ims_keys: dict[int, None] = {}
-        # Bounded by the same working set as the mosaic buffer, which is the legacy steady-state cap
-        # (min(ni, batch_size * 8, 1000) - 1 imgsz-sized frames per worker).
-        self._ims_cap = max(1, self.max_buffer_length - 1) if self.augment else 0
+        # Frame cap for that FIFO, resolved by `_resolve_ims_cap` from `ims_cache_frames` /
+        # `ims_cache_mb` + the dataset shape. Read from `hyp`, NOT from `self`: `v8_transforms`
+        # copies hyp's keys onto the dataset only AFTER `__init__` returns, so a `getattr(self, ...)`
+        # here would always fall back to the built-in default (the exact trap that made
+        # `slice_raw_cache_size` dead on arrival, see `test_raw_cache_size_reaches_dataset`).
+        self._ims_cap = _resolve_ims_cap(hyp, self.ni, self.batch_size, self.imgsz, self.channels, self.augment)
+        if self._ims_cap > 0:
+            # Print the estimate so the documented memory guidance ("halve the in-flight batches
+            # when online augmentation is on") covers this cache too, and so a config that silently
+            # did not take effect is visible instead of just being absent from the log.
+            LOGGER.info(f"{self.prefix}{_describe_ims_cap(hyp, self._ims_cap, self.imgsz, self.channels)}")
 
         # Per-worker LRU cache of ORIGINAL-resolution images. Without it one source image is
         # decoded once per sub-sample (4 tiles + 1 origin + 1 ratio + 2 blur + weather/occlusion, plus
@@ -397,7 +509,7 @@ class BaseDataset(Dataset):
         # ``slice_raw_cache_size=0`` still means "cache off"; any positive value is raised to 4
         # because ``_build_compose_sample`` reads FOUR distinct originals within a single sample -- a smaller
         # cache evicts them before the fourth read, which is exactly what the old default of 2 did.
-        _raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", 2) or 0)
+        _raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", _online_default("slice_raw_cache_size")) or 0)
         self._raw_cache_size = max(4, _raw_cache_size) if _raw_cache_size > 0 else 0
 
         # Per-epoch slice mask (slice_ratio exact ratio, original-level). None = pure slicing or
@@ -438,6 +550,9 @@ class BaseDataset(Dataset):
         # Lazily created state, declared here so the object shape is fixed after __init__ (IDE
         # completion + static checking) instead of materialising on first use.
         self._seg_cache: SegmentBases | None = None
+        # Version stamp of `_seg_cache`: tuple(self._segment_lengths()) as of the cached build.
+        # See `_segment_bases` for why "first call wins" was not good enough.
+        self._seg_key: tuple[int, ...] | None = None
         self._compose_warned = False
         # Per-branch annotated-save counters: {branch: [n_saved, {dedup keys}]}.
         self._save_state: dict[str, list] = {}
@@ -446,7 +561,7 @@ class BaseDataset(Dataset):
         # is 2; exposing it in the config makes the documented memory guidance (halve the in-flight
         # batches when online augmentation is on) applicable without editing build.py. Clamped to >= 1
         # because PyTorch rejects 0, and build_dataloader drops it when num_workers == 0.
-        self.prefetch_factor = max(1, int(getattr(hyp, "prefetch_factor", 2) or 2))
+        self.prefetch_factor = max(1, int(getattr(hyp, "prefetch_factor", _online_default("prefetch_factor")) or 2))
 
         # Grouped sampling: visit all sub-samples of one source image adjacently so the raw LRU above
         # actually hits. Consumed by build.py's build_dataloader (see GroupedImageSampler for the
@@ -561,7 +676,17 @@ class BaseDataset(Dataset):
         except Exception as e:
             raise FileNotFoundError(f"{self.prefix}Error loading data from {img_path}\n{HELP_URL}") from e
         count = self.fraction if isinstance(self.fraction, int) else round(len(im_files) * self.fraction)
-        im_files = im_files[:count] if count < len(im_files) else im_files
+        if count < len(im_files):
+            orig = im_files
+            im_files = im_files[:count]
+            if not im_files:
+                # fraction 裁剪取整后可能为 0（小数据集 × 小 fraction，如 8 张 × 0.001）。
+                # 上游会静默返回空列表，随后 get_labels() 的 label_files[0] 直接 IndexError。
+                # 兜底保留 1 张，保证训练可启动并打出可定位的警告。
+                LOGGER.warning(
+                    f"{self.prefix}fraction={self.fraction} over {len(orig)} image(s) rounds to 0; keeping 1 image"
+                )
+                im_files = orig[:1]
         check_file_speeds(im_files, prefix=self.prefix)  # check image read speeds
         return im_files
 
@@ -833,6 +958,12 @@ class BaseDataset(Dataset):
         st = getattr(self, "slice_transform", None)
         if st is not None and hasattr(st, "reset_counters"):
             st.reset_counters()
+            # Pin the current epoch for the deterministic seam jitter. Must live in this function
+            # (not in set_epoch's main-process path) for the same reason the counters do: workers rebuild
+            # via _sync_epoch_masks and would otherwise keep epoch 0 forever, so the 4 tiles of one image
+            # would share one grid in the main process and a different one in every worker.
+            if hasattr(st, "set_epoch"):
+                st.set_epoch(epoch)
         n = len(self.labels)
         aug_on = bool(self.augment)
         # --- close_aug_epoch: final N epochs disable all online augmentation (fallback to origin) ---
@@ -1014,6 +1145,11 @@ class BaseDataset(Dataset):
             out = img.copy()
             H2, W2 = img.shape[:2]
             cls_arr = np.asarray(cls).reshape(-1)
+            if len(boxes_arr) != len(cls_arr):
+                LOGGER.warning(
+                    f"_save_annotated({branch}): {len(boxes_arr)} boxes vs {len(cls_arr)} cls for "
+                    f"'{file_stem}' -- drawing only the aligned prefix."
+                )
             for b, c in zip(boxes_arr, cls_arr):
                 cx, cy, bw, bh = (float(v) for v in b)
                 x0 = int(round((cx - bw / 2) * W2))
@@ -1052,18 +1188,8 @@ class BaseDataset(Dataset):
         )
         return self.update_labels_info(label)
 
-    def _segment_bases(self) -> SegmentBases:
-        """Return the seven segment boundaries of the mixed sample pool, plus the pool total.
-
-        L8: cached after the first call -- branch switches are fixed once ``v8_transforms`` is
-        assembled, so recomputing 6 getattrs + a list on every ``__getitem__`` was pure overhead.
-        """
-        if getattr(self, "_seg_cache", None) is None:
-            self._seg_cache = self._compute_segment_bases()
-        return self._seg_cache
-
-    def _compute_segment_bases(self) -> SegmentBases:
-        """Compute (once) the seven segment boundaries of the mixed sample pool, plus the total.
+    def _segment_lengths(self) -> list[int]:
+        """Per-segment sample counts in layout order (base first). SINGLE SOURCE OF TRUTH.
 
         Layout (each optional branch is an independent, contiguous segment gated ONLY by its own
         switch; slicing lives entirely inside the base segment):
@@ -1073,16 +1199,16 @@ class BaseDataset(Dataset):
             [base_len+2N, +4N)            blur:      short + long motion-blurred images per original
             [base_len+4N, +ceil(N/4))     compose:   one 2x2 stitched image per group of 4 originals
             [base_len+4N+ceil(N/4), +N)   weather:   1 rain/haze/noise-degraded image per original
-            [...+N, +N)                   occlusion: 1 rect/stripe-occluded image per original
+            [base_len+4N+ceil(N/4)+N, +N) occlusion: 1 rect/stripe-occluded image per original
 
-        Returns a :class:`SegmentBases` named tuple (base, origin, ratio, blur, compose, weather,
-        occlusion, total). ``total`` is derived from the SAME per-segment lengths as the
-        boundaries, and ``__len__`` returns it verbatim -- the pool length and the decodable
-        index range therefore share one source of truth and can never drift apart. 
+        ``_segment_bases`` derives BOTH the cumulative boundaries and ``total`` from this list, and
+        uses ``tuple(...)`` of it as the ``_seg_cache`` version stamp. Every input of the layout is
+        therefore read exactly here -- adding a segment is a one-line change that invalidates the
+        cache automatically, with no second switch list to keep in sync (see ``_segment_bases``).
         """
         n = len(self.labels)
-        base_len = n * self._n_per()  # base segment: the slicing pipeline's samples
-        seg_lens = [
+        return [
+            n * self._n_per(),  # base segment: the slicing pipeline's samples
             n if self._keep_origin_on() else 0,  # origin
             n if bool(getattr(self, "ratio_pad_keep", _online_default("ratio_pad_keep"))) else 0,  # ratio
             2 * n if bool(getattr(self, "blur_keep", _online_default("blur_keep"))) else 0,  # blur (short + long)
@@ -1090,11 +1216,47 @@ class BaseDataset(Dataset):
             n if self._weather_on() else 0,  # weather
             n if self._occlusion_on() else 0,  # occlusion
         ]
-        bases = [base_len]
-        for seg in seg_lens:
-            bases.append(bases[-1] + seg)
-        *boundaries, total = bases
-        return SegmentBases(base_len, *boundaries, total)
+
+    def _segment_bases(self) -> SegmentBases:
+        """Return the seven segment boundaries of the mixed sample pool, plus the pool total.
+
+        Returns a :class:`SegmentBases` named tuple (base, origin, ratio, blur, compose, weather,
+        occlusion, total). ``total`` is derived from the SAME per-segment lengths as the
+        boundaries, and ``__len__`` returns it verbatim -- the pool length and the decodable
+        index range therefore share one source of truth and can never drift apart.
+
+        The result is cached, but the cache is VERSION-STAMPED on ``tuple(self._segment_lengths())``
+        -- its own input -- instead of "first call wins".
+
+        Why that matters: the branch switches are NOT settled by ``__init__``. The normal path is
+        ``__init__`` -> ``build_transforms`` -> ``v8_transforms`` attaching ``slice_transform`` /
+        ``slice_all_tiles`` / ``*_keep`` onto the object afterwards, and this module already relies
+        on that order (``len(self)`` is only logged after ``build_transforms``). A first-call-wins
+        cache made that order a silent correctness requirement: anything that touched ``len()``
+        earlier -- a partially configured dataset, a test/script that flips a switch after
+        constructing one, or a future edit that logs ``len()`` mid-``__init__`` -- froze the
+        boundaries on the OLD switches, after which the pool length disagreed with the decodable
+        index range and samples were dropped / indexed out of range with no error at all.
+
+        Cost (measured, 5-original all-branches pool): 2.5 us/call vs 0.1 us for the first-call-wins
+        accessor and 3.6 us for no cache at all -- i.e. it hands back about two thirds of the L8
+        change. That is deliberate and cheap in absolute terms: at 8520 images/epoch the pool is
+        ~85k samples, so the stamp costs ~0.2 s CPU per epoch (~0.01% of an epoch that decodes every
+        sample at original resolution) and it retires a whole silent-failure class. Keep the stamp
+        DERIVED from ``_segment_lengths``; never hand-maintain a second list of switches here -- that
+        would move the drift, not remove it.
+        """
+        seg_lens = self._segment_lengths()
+        key = tuple(seg_lens)
+        if getattr(self, "_seg_cache", None) is None or getattr(self, "_seg_key", None) != key:
+            # Cumulative starts: bases[i] is the START of segment i, bases[-1] the pool total.
+            bases = [seg_lens[0]]
+            for seg in seg_lens[1:]:
+                bases.append(bases[-1] + seg)
+            *boundaries, total = bases
+            self._seg_cache = SegmentBases(seg_lens[0], *boundaries, total)
+            self._seg_key = key
+        return self._seg_cache
 
     def grouped_sample_units(self) -> list[list[list[int]]] | None:
         """Lay the sample pool out as "units of <= 4 source images" for decode-locality sampling.
@@ -1387,8 +1549,13 @@ class BaseDataset(Dataset):
         (measured mean|diff| = 2.11 / corr = 0.9982), because the final resize preserves the
         RELATIVE scale of the degradation; ``scale == 1.0`` means the frame was left untouched.
         """
-        # The cap itself lives in _cap_long_side so compose can apply the same rule (see S-3).
-        return _cap_long_side(self._load_image_cached(img_index), self._degrade_max_side())
+        # The cap itself lives in _cap_long_side so compose can apply the same rule.
+        # The cap itself lives in _cap_long_side so compose can apply the same rule. The kernel is
+        # configurable (degrade_resample: "area" = antialiased/slower, "linear" = faster/softer);
+        # geometry is identical either way, only the resampling filter differs.
+        resample = str(getattr(self, "degrade_resample", _online_default("degrade_resample")) or "area")
+        interp = cv2.INTER_LINEAR if resample == "linear" else cv2.INTER_AREA
+        return _cap_long_side(self._load_image_cached(img_index), self._degrade_max_side(), interp=interp)
 
     def _build_blur_sample(self, index: int, img_index: int, long: bool = False) -> dict[str, Any]:
         """Build one in-memory motion-blurred image from a single original image (online port of the offline
@@ -1397,9 +1564,13 @@ class BaseDataset(Dataset):
         Two tiers per image: ``short`` (light, length in [blur_short_len_min, blur_short_len_max], no
         defocus) and ``long`` (heavy, length in [blur_long_len_min, blur_long_len_max], optional defocus
         sigma up to blur_long_defocus_sigma). The blur angle is sampled uniformly in [0, 180) per call
-        (augmentation randomness, consistent with fliplr etc.). Labels are UNCHANGED (blur does not move
-        targets). The blurred image is resized to the training size like the other branches and enters the
-        Mosaic mix pool (dataset.buffer). Nothing is written to disk (save via blur_save_dir).
+        (augmentation randomness, consistent with fliplr etc.), unless ``blur_axis_aligned`` is set, in
+        which case it is restricted to 0/90 deg -- the faithful model when the camera mounting is fixed
+        and the motion maps to the image axes (see ``online_degrade._apply_motion_blur``; that path is
+        also bit-identical to the general one and ~1.8x faster over both tiers). Labels are UNCHANGED
+        (blur does not move targets). The blurred image is resized to the training size like the other
+        branches and enters the Mosaic mix pool (dataset.buffer). Nothing is written to disk (save via
+        blur_save_dir).
 
         ``index`` is the EXPANDED mixed-pool index (for correct Mosaic buffer bookkeeping);
         ``img_index`` is the ORIGINAL image index this blurred sample derives from.
@@ -1423,8 +1594,17 @@ class BaseDataset(Dataset):
             blur = im
         else:
             length = random.uniform(lo, hi) * scale
-            angle = random.uniform(0.0, 180.0)
-            blur = _apply_motion_blur(im, length=length, angle=angle, defocus_sigma=sigma * scale)
+            # blur_axis_aligned: 拖影只取像面轴向 (0=水平 / 90=垂直, 二选一), 用于运动方向在像面上
+            # 恒定映射到水平或垂直的场景 (相机固定安装, 车载/航拍沿航迹方向)。这类域里轴对齐是更
+            # 贴合的建模而非近似: 轴对齐的 PSF 精确等于均匀箱式, 输出与"任意角下恰好取到 0/90"
+            # 逐位相同, 只是更快 (见 online_degrade._apply_motion_blur)。
+            # 刻意仍然只消费 random 流的一格 —— random.random() 与 random.uniform(0.0, 180.0) 同为
+            # 一次抽样, 因此开关翻转不会让下游所有随机决策整体错位, A/B 对比才可解释。
+            axis_aligned = bool(getattr(self, "blur_axis_aligned", _online_default("blur_axis_aligned")))
+            angle = (0.0 if random.random() < 0.5 else 90.0) if axis_aligned else random.uniform(0.0, 180.0)
+            blur = _apply_motion_blur(
+                im, length=length, angle=angle, defocus_sigma=sigma * scale, axis_aligned=axis_aligned
+            )
 
         label = deepcopy(self.labels[img_index])
         label.pop("shape", None)
@@ -1977,9 +2157,9 @@ class BaseDataset(Dataset):
             # _load_image_cached: 直接读原图 jpg + worker 内存 LRU (.npy 磁盘缓存已移除)
             im = self._load_image_cached(img_index)
             im, label = (
-                slice_t.slice_at(im, label, k, src=(img_index, k), count=count_slice) if emit_all else slice_t(
-                    im, label, src=img_index, count=count_slice
-                )
+                slice_t.slice_at(im, label, k, src=(img_index, k), count=count_slice, key=img_index)
+                if emit_all
+                else slice_t(im, label, src=img_index, count=count_slice, key=img_index)
             )
             # reuse the shared tail instead of a third hand-rolled resize. The sliced sub-image
             # becomes the new "original" for downstream transforms; _finalize_label applies the exact same

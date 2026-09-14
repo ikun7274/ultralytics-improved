@@ -42,25 +42,24 @@ if __name__ == '__main__':
         #---------训练参数---------------
         data='_mini_val_set/_mini_data.yaml',
         cache=False,                
-        imgsz=640,
-        epochs=1,
-        batch=4,
-        close_mosaic=20,
+        imgsz=320,
+        epochs=2,
+        batch=8,
         workers=0,                   
         optimizer='MuSGD',
         device='cpu',
         # resume=r'C:\Users\Administrator\Desktop\ultralytics-improved\runs\exp-3\weights\last.pt',  # 断点续训: 改成你本机 last.pt 路径
         # resume_extend_epochs=15,  # (int, 0=关闭) 续训自动延长: 自动修补ckpt元数据(epochs/patience), 从旧停点续训到该轮数; 需>ckpt已完成轮数
-        patience=50,
+        patience=0,
         amp=True,
-        fraction=0.001,
-        project=r"ultralytics-improved\runs",  
+        fraction=1.0,
+        project=r"C:\Users\Administrator\Desktop\Desktop\ultralytics-improved\runs",  
         name='exp',
-        exist_ok=False,
 
 
         # ---------Mosaic在线增强---------------
         mosaic=1.0,
+        close_mosaic=1,
 
         # ---------SAHI在线切片 (slice_*)-----------
         slice_prob=1.0,               # 在线切片概率 [0,1]; 0=关闭切片
@@ -119,8 +118,8 @@ if __name__ == '__main__':
 
 
         # ---------在线遮挡模拟 (occlusion_*): 语义遮挡块 (树冠/电线/阴影), 提升被遮挡目标鲁棒性, 标签不变---------
-        occlusion_keep=False,         # 独立开关, 开启在线遮挡模拟 (每图+1张遮挡图, 区段 +N); 与 blur/weather 同构
-        occlusion_ratio=0.5,          # 每epoch随机选 round(x*N) 张原图做遮挡(原图级), 未选中整图直通; 0.3~0.6 推荐
+        occlusion_keep=True,          # 独立开关, 开启在线遮挡模拟 (每图+1张遮挡图, 区段 +N); 与 blur/weather 同构
+        occlusion_ratio=0.1,          # 每epoch随机选 round(x*N) 张原图做遮挡(原图级), 未选中整图直通; 0.3~0.6 推荐
         occlusion_types="rect,stripe",# 遮挡类型, 逗号分隔; rect=随机矩形(树冠/阴影), stripe=细长条带(电线/枝干/云影)
         occlusion_blocks=1,           # 每图遮挡块数 (1~3)
         occlusion_size_ratio=0.2,     # 单块面积上限(相对原图面积), 防目标被完全盖住
@@ -130,7 +129,7 @@ if __name__ == '__main__':
 
         # ---------训练后期关闭在线增强 (close_aug_epoch): 与 close_mosaic 同构的时间维衰减---------
         # 训练最后 N 个 epoch 把切片/合成/比例/模糊/气象退化全部关闭, 各区段退回原图直通(len恒定), 让模型在真实分布上收敛;
-        close_aug_epoch=20, # 0=关闭该调度(默认, 完全向后兼容)
+        close_aug_epoch=1, # 0=关闭该调度(默认, 完全向后兼容)
 
 
         # ---------验证侧在线切片评估 (val_slice_*): 验证集切片推理 + 坐标还原 + NMS 融合 (SAHI评估)---------

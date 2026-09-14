@@ -185,12 +185,99 @@ def test_segment_bases_weather_occlusion_lengths():
 
 
 # ---------------------------------------------------------------------------
+# Segment-bases cache: every layout switch is attached AFTER __init__
+# ---------------------------------------------------------------------------
+# Every attribute that can move a boundary. `slice_transform` is the odd one out (None vs an
+# object rather than a bool), so it is set to None / "fake" instead of False / True.
+_LAYOUT_SWITCHES = (
+    "slice_all_tiles", "slice_keep_origin", "ratio_pad_keep",
+    "blur_keep", "compose_keep", "weather_keep", "occlusion_keep",
+)
+
+
+def _off_value(switch):
+    """The switch's OFF value (see ``_LAYOUT_SWITCHES``)."""
+    return None if switch == "slice_transform" else False
+
+
+@pytest.mark.parametrize("switch", [*_LAYOUT_SWITCHES, "slice_transform"])
+def test_segment_cache_invalidates_when_a_switch_changes(switch):
+    """A pool layout cached before a switch flip must follow that flip.
+
+    The switches are NOT settled by ``__init__``: ``v8_transforms`` attaches them afterwards (and
+    ``__init__`` itself only reads ``len(self)`` after ``build_transforms``). A "first call wins"
+    cache therefore made that ordering a *silent* correctness requirement -- read ``len()`` too
+    early (a log line, a sanity check, a test that configures a dataset after constructing it) and
+    the boundaries stayed frozen on the old switches, so the pool length disagreed with the
+    decodable index range and samples were dropped / indexed out of range with no error at all.
+
+    Asserted on both sides: the version stamp must move, AND the rendered layout must equal a
+    dataset that was built with the flipped switch from the start.
+    """
+    ds = _make_dataset()
+    ds._segment_bases()  # populate the cache (and the stamp)
+    stamp = ds._seg_key
+    setattr(ds, switch, _off_value(switch))
+    fresh = _make_dataset(**{switch: _off_value(switch)})
+    # _segment_bases() is what refreshes the stamp, so it must be called before the stamp is read.
+    assert _bases(ds) == _bases(fresh)
+    assert ds._seg_key != stamp, f"flipping {switch} must move the version stamp"
+    assert len(ds) == len(fresh)
+
+
+def test_segment_bases_are_cached_not_recomputed():
+    """The invalidation must not give back the caching win it is protecting.
+
+    Without this pin the "fix" could be to drop the cache entirely -- correct, but it would
+    hand back the L8 gain and re-allocate a ``SegmentBases`` (+ a list + a loop) on every
+    ``__getitem__``. A rebuild would return an EQUAL but different object, so identity is the
+    only assertion that can tell the two apart.
+    """
+    ds = _make_dataset()
+    first = ds._segment_bases()
+    assert ds._segment_bases() is first
+
+
+def test_early_len_does_not_poison_the_final_layout():
+    """The reported failure, reproduced end to end: read ``len()`` BEFORE the switches exist.
+
+    Mirrors ``__init__`` -> ``build_transforms``: mid-``__init__`` the object has no
+    ``slice_transform`` and every ``*_keep`` is False, so an early ``len(self)`` used to freeze the
+    plain-original layout into the cache and leave the fully configured dataset advertising N
+    samples instead of the expanded pool.
+    """
+    ds = _make_dataset(**{k: _off_value(k) for k in _LAYOUT_SWITCHES} | {"slice_transform": None})
+    early = len(ds)  # the poison
+    # v8_transforms now attaches the switches, as it does at the end of __init__.
+    all_on = {
+        "slice_all_tiles": True, "slice_transform": "fake", "slice_keep_origin": True,
+        "ratio_pad_keep": True, "blur_keep": True, "compose_keep": True,
+        "weather_keep": True, "occlusion_keep": True,
+    }
+    for k, v in all_on.items():
+        setattr(ds, k, v)
+    assert early == len(ds.labels), "the early read must see the unconfigured (plain original) layout"
+    assert len(ds) == len(_make_dataset()), "the late read must see the full expanded pool"
+
+
+def test_segment_cache_invalidates_when_labels_change():
+    """``len(self.labels)`` is a layout input too: replacing ``labels`` must resize the pool."""
+    ds = _make_dataset()
+    ds._segment_bases()
+    ds.labels = [_make_label() for _ in range(9)]
+    fresh = _make_dataset(labels=[_make_label() for _ in range(9)])
+    assert _bases(ds) == _bases(fresh)
+    assert len(ds) == len(fresh)
+
+
+# ---------------------------------------------------------------------------
 # Motion blur kernel: degenerate input must not produce NaN
 # ---------------------------------------------------------------------------
 def test_motion_blur_kernel_degenerate_safe():
     """A degenerate motion-blur kernel (length / angle that leaves no rasterised line) used to
-    divide by zero and produce NaN -- a failure that ``train.py``'s blanket
-    ``filterwarnings('ignore')`` silently hid. The guard now degrades to an identity kernel.
+    divide by zero and produce NaN -- a failure that the blanket ``filterwarnings('ignore')`` in
+    ``detect.py`` / ``export.py`` (kept as-is by user decision) would have silently hidden. The guard
+    now degrades to an identity kernel.
     """
     from ultralytics.data.online_degrade import _motion_blur_kernel
 
@@ -212,6 +299,136 @@ def test_motion_blur_kernel_normal():
     assert math.isfinite(k.sum())
     assert np.isclose(k.sum(), 1.0, atol=1e-5)
     assert k.sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# blur_axis_aligned: on an axis the PSF is exactly a uniform box, so cv2.blur is a bit-exact
+# (and much faster) stand-in for the dense filter2D convolution. Guarded at four levels: the
+# invariant, the bit-for-bit equality, the mechanism (which OpenCV call is made), and the sampler.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("length", [3.0, 5.0, 6.0, 9.5, 21.0, 35.0])
+def test_axis_psf_is_a_uniform_box_of_psf_size(length):
+    """Invariant the fast path rests on: on-axis the PSF is a uniform box exactly ``_psf_size`` wide.
+
+    If the rasterisation or the size formula ever drifts, the box filter silently stops being an
+    exact replacement -- this is the test that would catch it first.
+    """
+    from ultralytics.data.online_degrade import _motion_blur_kernel, _psf_size
+
+    n = _psf_size(length)
+    assert n % 2 == 1, "odd size keeps the PSF centre on a pixel"
+    for angle, vertical in ((0.0, False), (90.0, True)):
+        k = _motion_blur_kernel(length, angle)
+        taps = k[np.nonzero(k)]
+        assert k.shape == (n, n)
+        assert np.count_nonzero(k) == n, "the segment must occupy exactly one row/column"
+        assert np.unique(np.round(taps, 6)).size == 1, "on-axis taps must be uniform"
+        assert np.isclose(taps[0], 1.0 / n, atol=1e-6)
+        rows, cols = np.nonzero(k)
+        # a horizontal smear spans COLUMNS, a vertical one spans ROWS
+        assert np.ptp(rows if vertical else cols) + 1 == n
+
+
+@pytest.mark.parametrize("angle", [0.0, 90.0])
+@pytest.mark.parametrize("defocus", [0.0, 1.0])
+@pytest.mark.parametrize("length", [5.0, 7.25, 12.0, 20.0, 21.0, 27.5, 35.0])
+def test_axis_aligned_blur_is_bit_identical_to_the_psf(length, angle, defocus):
+    """``axis_aligned=True`` must be a pure replacement, not an approximation.
+
+    The switch is allowed to change WHICH angles are sampled; it is not allowed to change any pixel
+    for a given angle. Anything but exact equality here means the optimisation traded quality for
+    speed and must not be enabled by default.
+    """
+    from ultralytics.data.online_degrade import _apply_motion_blur
+
+    img = np.random.default_rng(11).integers(0, 256, (96, 128, 3), dtype=np.uint8)
+    fast = _apply_motion_blur(img, length=length, angle=angle, defocus_sigma=defocus, axis_aligned=True)
+    ref = _apply_motion_blur(img, length=length, angle=angle, defocus_sigma=defocus, axis_aligned=False)
+    assert np.array_equal(fast, ref)
+
+
+def test_axis_aligned_blur_uses_the_box_filter(monkeypatch):
+    """Guard the mechanism, not just the numbers: the fast path must make the O(1) cv2.blur call.
+
+    A later refactor could keep every output identical while quietly falling back to a dense
+    filter2D, handing back the whole speed-up; only watching the calls catches that.
+    """
+    from ultralytics.data import online_degrade as od
+
+    import cv2
+
+    calls = []
+    real_blur = cv2.blur
+
+    def spy_blur(im, ksize, *args, **kwargs):
+        calls.append(tuple(ksize))
+        return real_blur(im, ksize, *args, **kwargs)
+
+    monkeypatch.setattr(od.cv2, "blur", spy_blur)
+    monkeypatch.setattr(od.cv2, "filter2D", lambda *_a, **_k: pytest.fail("axis-aligned path must not convolve"))
+
+    img = np.zeros((32, 48, 3), np.uint8)
+    od._apply_motion_blur(img, length=21.0, angle=0.0, axis_aligned=True)
+    od._apply_motion_blur(img, length=21.0, angle=90.0, axis_aligned=True)
+    assert calls == [(21, 1), (1, 21)], "horizontal -> (n, 1) kernel, vertical -> (1, n)"
+
+
+def _stub_blur_dataset(monkeypatch, **flags):
+    """A dataset whose blur sampling can be observed without touching any pixels."""
+    from ultralytics.data import base as base_mod
+
+    ds = _make_dataset(**flags)
+    ds._blur_mask = None
+    monkeypatch.setattr(ds, "_degrade_frame", lambda _i: (np.zeros((32, 32, 3), np.uint8), 1.0))
+    monkeypatch.setattr(ds, "_finalize_label", lambda label, _img: label)
+    seen = []
+
+    def spy(im, length=15.0, angle=30.0, defocus_sigma=0.0, axis_aligned=False):
+        seen.append({"length": length, "angle": angle, "sigma": defocus_sigma, "axis": axis_aligned})
+        return im
+
+    monkeypatch.setattr(base_mod, "_apply_motion_blur", spy)
+    return ds, seen
+
+
+def test_build_blur_sample_restricts_angles_when_axis_aligned(monkeypatch):
+    """With the switch on the sampler must only ever emit 0/90 -- and must request the fast path."""
+    ds, seen = _stub_blur_dataset(monkeypatch, blur_axis_aligned=True)
+    for _ in range(8):
+        ds._build_blur_sample(0, 0, long=False)  # short tier
+        ds._build_blur_sample(0, 0, long=True)  # long tier (both tiers share this angle choice)
+    assert len(seen) == 16
+    assert all(s["axis"] is True for s in seen)
+    assert {s["angle"] for s in seen} == {0.0, 90.0}, "both axes must be reachable"
+    # Only the direction is replaced -- the tier wiring (length range / defocus) must be untouched.
+    assert all(5.0 <= s["length"] <= 12.0 and s["sigma"] == 0.0 for s in seen[0::2])
+    assert all(20.0 <= s["length"] <= 35.0 and s["sigma"] == 1.0 for s in seen[1::2])
+
+
+def test_build_blur_sample_keeps_continuous_angles_when_disabled(monkeypatch):
+    """``blur_axis_aligned: False`` must restore the original U[0, 180) smear direction."""
+    ds, seen = _stub_blur_dataset(monkeypatch, blur_axis_aligned=False)
+    for _ in range(16):
+        ds._build_blur_sample(0, 0)
+    assert all(s["axis"] is False for s in seen)
+    assert any(s["angle"] not in (0.0, 90.0) for s in seen), "angles must be free again"
+
+
+def test_blur_axis_aligned_keeps_the_rng_stream_position(monkeypatch):
+    """Flipping the switch must consume the same number of ``random`` draws.
+
+    Both branches draw exactly one length and one direction, so the stream is left in the same place
+    and an A/B of the switch compares the same augmentation sequence rather than two different samplings.
+    """
+    import random
+
+    def next_value_after_one_sample(flag):
+        ds, _ = _stub_blur_dataset(monkeypatch, blur_axis_aligned=flag)
+        random.seed(1234)
+        ds._build_blur_sample(0, 0)
+        return random.random()
+
+    assert next_value_after_one_sample(True) == next_value_after_one_sample(False)
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +524,7 @@ def _tiny_detect_dataset(tmp_path: Path):
 
 @pytest.mark.parametrize("configured,expected", [(8, 8), (0, 0), (5, 5)])
 def test_raw_cache_size_reaches_dataset(tmp_path, configured, expected):
-    """M-1: ``slice_raw_cache_size`` must actually reach the dataset.
+    """``slice_raw_cache_size`` must actually reach the dataset.
 
     It used to be read from ``self`` inside ``BaseDataset.__init__`` -- before ``v8_transforms`` copied
     hyp's keys onto the dataset -- so the knob (including its "0 = off" semantics and the "raise it to
@@ -390,7 +607,7 @@ def test_run_val_forces_rebuild_when_loader_is_not_sliced():
 
 
 def test_save_metrics_realigns_changed_metric_set(tmp_path):
-    """M-5: rows are positional, so a changed metric set (e.g. dual-metric on resume) must not
+    """Rows are positional, so a changed metric set (e.g. dual-metric on resume) must not
     silently out-grow the header."""
     from ultralytics.engine.trainer import BaseTrainer
 
@@ -410,7 +627,7 @@ def test_save_metrics_realigns_changed_metric_set(tmp_path):
 
 
 def test_sliced_metrics_guard_requires_whole_image_gt():
-    """L-2: sliced batches without ``_slice_base_labels`` must fail loudly."""
+    """Sliced batches without ``_slice_base_labels`` must fail loudly."""
     import torch
 
     from ultralytics.models.yolo.detect.val import DetectionValidator
@@ -423,7 +640,7 @@ def test_sliced_metrics_guard_requires_whole_image_gt():
 
 
 def test_sliced_metrics_guard_rejects_non_square_canvas():
-    """L-3: remap assumes a square canvas; a non-square one would silently mis-place every box."""
+    """Remap assumes a square canvas; a non-square one would silently mis-place every box."""
     import torch
 
     from ultralytics.models.yolo.detect.val import DetectionValidator
@@ -436,7 +653,7 @@ def test_sliced_metrics_guard_rejects_non_square_canvas():
 
 
 def test_finalize_metrics_clears_unfinished_slice_acc():
-    """L-4: originals that never saw all sub-tiles must not leak into the next pass."""
+    """Originals that never saw all sub-tiles must not leak into the next pass."""
     import types
 
     from ultralytics.models.yolo.detect.val import DetectionValidator
@@ -452,7 +669,8 @@ def test_finalize_metrics_clears_unfinished_slice_acc():
 
 
 # ---------------------------------------------------------------------------
-# Third-review regression guards (S-1 / S-2 / S-3 / M-3 / M-5 / M-10 / L-2)
+# Regression guards from the 2026-09 code reviews: cache bounds, determinism,
+# sampling locality, config hygiene, warning transparency.
 # ---------------------------------------------------------------------------
 def _make_loader_dataset(n=12, cap=4, extended=True):
     """Minimal BaseDataset skeleton able to run ``load_image`` (no directory scan).
@@ -494,7 +712,7 @@ def _make_loader_dataset(n=12, cap=4, extended=True):
 
 
 def test_ims_cache_bounded_when_extended_pool_is_on(monkeypatch):
-    """S-1: ``self.ims`` must stay FIFO-bounded even though the mosaic buffer cannot evict it.
+    """``self.ims`` must stay FIFO-bounded even though the mosaic buffer cannot evict it.
 
     Regression: the only eviction sat behind ``not self._extended_pool_on()``, so with slicing off
     plus any extended branch on, every visited image stayed resident -- one frame per image in the
@@ -516,7 +734,7 @@ def test_ims_cache_bounded_when_extended_pool_is_on(monkeypatch):
 
 
 def test_ims_cache_bounded_in_pure_ultralytics_mode(monkeypatch):
-    """S-1 parity: the pure-ultralytics path must stay bounded too (legacy buffer behaviour).
+    """Parity: the pure-ultralytics path must stay bounded too (legacy buffer behaviour).
 
     One owner (``_remember_ims``) now evicts ``self.ims`` in every mode; this guards that moving the
     eviction out of ``load_image``'s buffer branch did not lose the bound.
@@ -535,7 +753,7 @@ def test_ims_cache_bounded_in_pure_ultralytics_mode(monkeypatch):
 
 
 def test_degrade_frame_caps_resolution_and_scales_parameters():
-    """S-2: the degradation branches work at ``degrade_max_side``, not at the sensor resolution.
+    """The degradation branches work at ``degrade_max_side``, not at the sensor resolution.
 
     ``_degrade_frame`` must report the applied scale so pixel-typed parameters (PSF length, defocus
     sigma, rain-line length) can shrink with it -- that is what keeps the post-resize result
@@ -566,7 +784,7 @@ def test_degrade_frame_caps_resolution_and_scales_parameters():
 
 
 def test_weather_noise_uses_cv2_randn_on_a_single_channel_view(monkeypatch):
-    """S-4: noise must be drawn by ``cv2.randn`` into ONE float32 buffer, on a C1 view.
+    """Noise must be drawn by ``cv2.randn`` into ONE float32 buffer, on a C1 view.
 
     Two properties are load-bearing and both are silent when broken:
     * ``cv2.randn`` on a 3-channel matrix applies ``sigma/sqrt(3)`` (measured std 8.67 for sigma=15),
@@ -609,7 +827,7 @@ def test_weather_noise_uses_cv2_randn_on_a_single_channel_view(monkeypatch):
 
 
 def test_weather_noise_sigma_matches_the_configured_std():
-    """S-4: the produced noise must have the configured std -- the cv2.randn channel trap.
+    """The produced noise must have the configured std -- the cv2.randn channel trap.
 
     ``cv2.randn(dst, 0, sigma)`` silently yields ``sigma/sqrt(3)`` when ``dst`` is 3-channel, so a
     regression here looks like a working run with a 42% weaker augmentation. Mid-gray input keeps
@@ -627,7 +845,7 @@ def test_weather_noise_sigma_matches_the_configured_std():
 
 
 def test_weather_noise_is_reproducible_and_advances_the_numpy_stream_once():
-    """S-4: cv2's RNG is seeded from the numpy stream, so reproducibility is unchanged.
+    """cv2's RNG is seeded from the numpy stream, so reproducibility is unchanged.
 
     The branch used to consume the numpy stream itself; it now consumes exactly one ``randint`` and
     hands it to ``cv2.setRNGSeed``. Same ``np.random.seed`` -> same pixels, and every consumer
@@ -656,7 +874,7 @@ def test_weather_noise_is_reproducible_and_advances_the_numpy_stream_once():
 
 
 def test_motion_blur_crop_is_bit_identical_and_shrinks_the_kernel():
-    """S-4: trimming the zero border off the PSF must not change a single pixel.
+    """Trimming the zero border off the PSF must not change a single pixel.
 
     ``cv2.filter2D`` walks the whole ``size x size`` kernel even though a rasterized line only
     occupies a thin diagonal band, and its cost has a cliff around 11 px. Cropping the zeros away and
@@ -682,10 +900,10 @@ def test_motion_blur_crop_is_bit_identical_and_shrinks_the_kernel():
 
 
 def test_weather_noise_draws_in_chunks_never_full_frame(monkeypatch):
-    """S-3 (superseded by S-4): kept as a guard that no full-frame float64 temporary is allocated.
+    """Kept as a guard that no full-frame float64 temporary is allocated.
 
     Regression: ``np.random.normal(0, sigma, img.shape)`` allocated 274 MB (float64) for a
-    4000x3000 frame and was immediately truncated to uint8. S-4 replaced the chunked draw with a
+    4000x3000 frame and was immediately truncated to uint8. The draw is now done as a
     single ``cv2.randn`` into a float32 buffer, which is stricter than chunking: the only full-frame
     temporary left is the float32 accumulator (4x the frame), not an 8x float64 one.
     """
@@ -709,7 +927,7 @@ def test_weather_noise_draws_in_chunks_never_full_frame(monkeypatch):
 
 
 def test_load_image_cached_lru_capacity_and_hit_order(monkeypatch):
-    """M-3: explicit LRU -- capacity honoured, hits refresh order, eviction drops exactly one entry."""
+    """Explicit LRU -- capacity honoured, hits refresh order, eviction drops exactly one entry."""
     from collections import OrderedDict
 
     from ultralytics.data import base as base_mod
@@ -745,7 +963,7 @@ def test_load_image_cached_lru_capacity_and_hit_order(monkeypatch):
 
 
 def test_slice_val_subset_is_deterministic_across_rebuilds():
-    """M-5: ``val_slice_ratio < 1`` must score the SAME subset every round.
+    """``val_slice_ratio < 1`` must score the SAME subset every round.
 
     Regression: an unseeded ``random.sample`` redrew the sliced subset on each validation round (the
     wrapper is rebuilt per round), so mAP moved between epochs partly because a different set of
@@ -777,7 +995,7 @@ def test_slice_val_subset_is_deterministic_across_rebuilds():
 
 
 def test_occlusion_segment_mismatch_warns_instead_of_silently_truncating(monkeypatch, caplog):
-    """M-10: a segment/box length mismatch must be reported, not silently paired up by ``zip``."""
+    """A segment/box length mismatch must be reported, not silently paired up by ``zip``."""
     from ultralytics.data import base as base_mod
 
     ds = _make_dataset(labels=[_make_label()])
@@ -808,7 +1026,7 @@ def test_occlusion_segment_mismatch_warns_instead_of_silently_truncating(monkeyp
 
 
 def test_online_defaults_match_default_cfg():
-    """L-2: the in-code fallbacks and ``default.yaml`` must not drift.
+    """The in-code fallbacks and ``default.yaml`` must not drift.
 
     The 40+ ``getattr(self, <key>, _online_default(<key>))`` fallbacks are only correct if the table
     agrees with the authoritative config, and nothing else guards that.
@@ -824,8 +1042,29 @@ def test_online_defaults_match_default_cfg():
     assert not mismatched, f"_ONLINE_DEFAULTS drifted from default.yaml: {mismatched}"
 
 
+def test_online_defaults_cover_every_online_cfg_key():
+    """Reverse drift guard (pairs with the test above): every DEFAULT_CFG key in the
+    online-augment namespace MUST have a fallback in ``_ONLINE_DEFAULTS``, so no training-side
+    ``getattr(hyp, <key>, <literal>)`` can silently drift when a new online key is added but the
+    table is not. Excluded: ``mask_ratio`` (upstream segment-Mosaic key, not an online branch) and
+    the ``val_slice_*`` family (validator-side slicing has its own defaults in the val pipeline).
+    """
+    from ultralytics.cfg import DEFAULT_CFG_DICT
+    from ultralytics.data.base import _ONLINE_DEFAULTS
+
+    excluded = {"mask_ratio", "val_slice_ratio", "val_slice_overlap_ratio"}
+    missing = sorted(
+        k
+        for k in DEFAULT_CFG_DICT
+        if k not in excluded
+        and (k.startswith("slice_") or k.endswith(("_keep", "_ratio")))
+        and k not in _ONLINE_DEFAULTS
+    )
+    assert not missing, f"online cfg keys without _ONLINE_DEFAULTS fallback: {missing}"
+
+
 # ---------------------------------------------------------------------------
-# S-2 grouped sampling: keep one original's sub-samples inside the raw-image LRU
+# Grouped sampling: keep one original's sub-samples inside the raw-image LRU
 # ---------------------------------------------------------------------------
 def _sampler_stub(**flags):
     """``BaseDataset`` skeleton carrying every attribute ``grouped_sample_units`` reads."""
@@ -881,10 +1120,10 @@ def test_grouped_units_disabled_when_grouping_cannot_pay_off():
 
 
 def test_grouped_sampler_decodes_each_original_once():
-    """Behavioural S-2 check: grouped order decodes each original ~once, global shuffle ~once per sample.
+    """Behavioural check: grouped order decodes each original ~once, global shuffle ~once per sample.
 
     Simulates the worker-side LRU (capacity 4, keyed by original image) over both orders and counts
-    the reads that would need a real JPEG decode -- the cost S-2 is about (203 ms vs 21 ms a read).
+    the reads that would need a real JPEG decode -- the cost being guarded (203 ms vs 21 ms a read).
     """
     import collections
 
@@ -990,7 +1229,7 @@ def test_build_dataloader_wires_grouped_sampler(tmp_path, enabled, grouped):
 
 
 # ---------------------------------------------------------------------------
-# S-3: compose is capped BEFORE the canvas is allocated (was: stitch at full
+# compose is capped BEFORE the canvas is allocated (was: stitch at full
 # sensor resolution, then downscale the whole canvas -- 5.6x time / 8.7x peak)
 # ---------------------------------------------------------------------------
 def _cap_long_side():
@@ -1062,7 +1301,7 @@ def _compose_stub(tmp_path: Path, n=4, size=(256, 192), max_side=64, imgsz=64, l
 
 
 def test_compose_canvas_is_allocated_at_the_capped_size(tmp_path, monkeypatch):
-    """The pre-S-3 path allocated the canvas at FULL resolution and downscaled it afterwards.
+    """The original implementation allocated the canvas at FULL resolution and downscaled it afterwards.
 
     Both implementations render the same final geometry (labels are normalized, so the resize is
     label-neutral) -- which is exactly why the fix cannot be pinned down by looking at the output.
@@ -1207,10 +1446,10 @@ def test_compose_branch_runs_through_the_real_dataset(tmp_path):
 
 
 def test_blur_and_weather_branches_run_through_the_real_dataset(tmp_path):
-    """End-to-end: the two S-4 branches must survive a real ``__getitem__``.
+    """End-to-end: the two degrade branches (noise + blur) must survive a real ``__getitem__``.
 
-    S-4 replaced the noise RNG (``cv2.randn`` on a single-channel view, seeded from the numpy
-    stream) and trimmed the blur PSF before handing it to ``filter2D``. Both only execute inside
+    The noise draw now goes through ``cv2.randn`` (on a single-channel view, seeded from the numpy
+    stream), and the blur PSF is trimmed before being handed to ``filter2D``. Both only execute inside
     DataLoader workers, so a mistake there surfaces as a crashed epoch rather than a failed
     assertion -- so drive the real segments instead of the bare helpers.
 
@@ -1268,7 +1507,7 @@ def test_blur_and_weather_branches_run_through_the_real_dataset(tmp_path):
 
 
 def test_weather_occlusion_whitelist_single_source_of_truth():
-    """M-2: the type whitelist must come straight from ``online_degrade``, not be laundered via base.
+    """The type whitelist must come straight from ``online_degrade``, not be laundered via base.
 
     ``base.py`` used to import ``_WEATHER_TYPES`` / ``_OCCLUSION_TYPES`` for the sole purpose of
     letting ``augment.py`` re-import them from there -- it never used them itself (Ruff F401 x2).
@@ -1284,7 +1523,7 @@ def test_weather_occlusion_whitelist_single_source_of_truth():
 
 
 def test_base_carries_no_unused_online_degrade_import():
-    """M-2 guard: every name ``base.py`` pulls from ``online_degrade`` must actually be used there.
+    """Guard: every name ``base.py`` pulls from ``online_degrade`` must actually be used there.
 
     A name imported only to be re-exported is invisible to behavioural tests and is exactly what an
     auto-fix deletes, so assert it statically. This deliberately duplicates Ruff F401: the local loop
@@ -1312,7 +1551,7 @@ def test_base_carries_no_unused_online_degrade_import():
     (("weather_types", "rian", "noise"), ("occlusion_types", "rectangle", "rect")),
 )
 def test_typo_in_type_whitelist_fails_at_construction(tmp_path, key, bad, valid):
-    """M-2: a typo must raise while the dataset is built, not silently pick a runtime fallback.
+    """A typo must raise while the dataset is built, not silently pick a runtime fallback.
 
     This is the behaviour the re-export was enabling; if the import ever goes missing again the
     validation disappears, and this test is what notices.
@@ -1334,4 +1573,697 @@ def test_typo_in_type_whitelist_fails_at_construction(tmp_path, key, bad, valid)
     with pytest.raises(ValueError, match=key) as exc:
         build_yolo_dataset(cfg, str(img_dir), 2, data, mode="train")
     assert valid in str(exc.value), f"the error must name the valid types, got: {exc.value}"
+
+
+# ---------------------------------------------------------------------------
+# ONE 2x2 grid per (epoch, image), shared by all 4 tiles
+# ---------------------------------------------------------------------------
+def _biased_slice(**flags):
+    """A real ``OnlineSlice`` with the target-aware seam ON -- the grid math itself is under test."""
+    from ultralytics.data.augment import OnlineSlice
+
+    defaults = {"p": 1.0, "overlap_ratio": 0.2, "center_bias": True, "bias_jitter": 0.05}
+    defaults.update(flags)
+    return OnlineSlice(**defaults)
+
+
+def _spread_boxes(w=4000, h=3000, n=6, seed=0):
+    """Pixel ``xyxy`` boxes spread over the frame, so the seam search has a real signal."""
+    rng = np.random.default_rng(seed)
+    cx, cy = rng.uniform(0.1, 0.9, n), rng.uniform(0.1, 0.9, n)
+    bw, bh = rng.uniform(0.05, 0.15, n), rng.uniform(0.05, 0.15, n)
+    return np.stack([cx * w - bw * w / 2, cy * h - bh * h / 2, cx * w + bw * w / 2, cy * h + bh * h / 2], axis=1)
+
+
+def _tile_rects(tiles):
+    """The 4 tile rects as plain int tuples (hashable, so a set can prove they are identical)."""
+    return [(int(x0), int(y0), int(x1), int(y1)) for x0, y0, x1, y1 in tiles]
+
+
+def test_all_four_tiles_share_one_grid():
+    """``slice_all_tiles`` emits 4 samples per image; they must be the 4 tiles of ONE grid.
+
+    Regression: ``slice_at`` recomputed the geometry -- and re-drew ``bias_jitter`` -- on every call,
+    so k=0..3 landed on 4 different grids. Measured at the default jitter: 100% of images affected,
+    seams up to ~3% of the image extent apart, and the two seam decisions contradicting each other.
+    """
+    t = _biased_slice()
+    t.set_epoch(3)
+    w, h, xyxy = 4000, 3000, _spread_boxes()
+
+    grids = {tuple(_tile_rects(t._grid(w, h, xyxy, 17)[0])) for _ in range(4)}
+    assert len(grids) == 1, "the 4 tiles of one image must be the 4 tiles of one grid"
+
+
+def test_missing_key_keeps_the_per_call_seam():
+    """``key=None`` stays backward compatible: a fresh seam per call (the historical bug shape: a fresh seam every call)."""
+    import random
+
+    t = _biased_slice()
+    t.set_epoch(3)
+    w, h, xyxy = 4000, 3000, _spread_boxes()
+
+    random.seed(0)
+    assert len({t._grid(w, h, xyxy, None)[1:] for _ in range(4)}) == 4
+
+
+def test_grid_is_stable_within_an_epoch_and_changes_across_epochs():
+    """The grid must be a pure function of (epoch, image) -- independent of the global RNG state.
+
+    ``bias_jitter`` exists so the seams are not frozen across epochs; pinning them to the global
+    stream instead made them depend on how many random draws happened to precede them.
+    """
+    import random
+
+    t = _biased_slice()
+    t.set_epoch(3)
+    w, h, xyxy = 4000, 3000, _spread_boxes()
+
+    random.seed(123)
+    first = t._grid(w, h, xyxy, 17)[1:]
+    random.seed(999)
+    assert t._grid(w, h, xyxy, 17)[1:] == first, "the grid must not depend on the global RNG state"
+
+    t.set_epoch(4)
+    assert t._grid(w, h, xyxy, 17)[1:] != first, "per-epoch variation is the whole point of bias_jitter"
+    t.set_epoch(3)
+    assert t._grid(w, h, xyxy, 99)[1:] != first, "different images must still get different seams"
+
+
+def test_biased_grid_union_covers_the_whole_image():
+    """``slice_geometry`` promises every pixel is in >= 1 tile; that must survive the 4 emitted tiles."""
+    t = _biased_slice()
+    t.set_epoch(0)
+    w, h, xyxy = 4000, 3000, _spread_boxes()
+
+    for key in range(50):
+        cov = np.zeros((h, w), np.uint8)
+        for x0, y0, x1, y1 in _tile_rects(t._grid(w, h, xyxy, key)[0]):
+            cov[y0:y1, x0:x1] = 1
+        assert cov.all(), f"hole in the union of the 4 tiles for key={key}"
+
+
+def test_slice_at_forwards_the_image_key_not_the_tile_key(monkeypatch):
+    """``key`` must be the IMAGE index -- ``src`` is ``(img_index, k)`` and would defeat the whole point."""
+    from ultralytics.data.augment import OnlineSlice
+
+    t = _biased_slice()
+    t.set_epoch(2)
+    seen = []
+    real_grid = OnlineSlice._grid
+
+    def spy(self, w, h, xyxy=None, key=None):
+        out = real_grid(self, w, h, xyxy, key)
+        seen.append((key, round(out[1], 9), round(out[2], 9)))
+        return out
+
+    monkeypatch.setattr(OnlineSlice, "_grid", spy)
+    img = np.zeros((3000, 4000, 3), np.uint8)
+    label = {
+        "bboxes": _spread_boxes(4000, 3000, n=6),
+        "cls": np.zeros((6, 1), dtype=np.float32),
+        "segments": [],
+        "keypoints": None,
+        "normalized": False,
+        "bbox_format": "xyxy",
+    }
+    for k in range(4):
+        t.slice_at(img, label, k, src=(17, k), key=17)
+
+    assert [k for k, _, _ in seen] == [17] * 4, "src=(img_index, k) must NOT be used as the grid key"
+    assert len({(bx, by) for _, bx, by in seen}) == 1, "4 tiles -> 1 grid"
+
+
+def test_rebuild_epoch_masks_pushes_the_epoch_to_the_slice_transform():
+    """The epoch must reach ``OnlineSlice`` from ``_rebuild_epoch_masks``, not just the main process.
+
+    Workers rebuild through ``_sync_epoch_masks``; publishing the epoch anywhere else would leave them
+    pinned at epoch 0, i.e. one grid in the main process and a different one in every worker.
+    """
+
+    class _FakeSlice:
+        def __init__(self):
+            self.resets = 0
+            self.epochs = []
+
+        def reset_counters(self):
+            self.resets += 1
+
+        def set_epoch(self, epoch):
+            self.epochs.append(int(epoch))
+
+    ds = _make_dataset()
+    ds._mask_seed = 12345
+    fake = _FakeSlice()
+    ds.slice_transform = fake
+
+    ds._rebuild_epoch_masks(7, 100)
+    ds._rebuild_epoch_masks(8, 100)
+    assert fake.epochs == [7, 8], "every rebuild must publish its own epoch"
+    assert fake.resets == 2
+
+
+def test_real_dataset_feeds_the_image_index_and_epoch_to_the_grid(tmp_path, monkeypatch):
+    """End-to-end guard for the base.py wiring: image index in, one grid out, current epoch set.
+
+    The unit tests above prove the grid math; this one proves the dataset actually hands it the
+    ingredients (image index + current epoch). Without it, ``key`` would stay ``None`` and the whole
+    fix would silently do nothing while every unit test kept passing.
+    """
+    from ultralytics.cfg import get_cfg
+    from ultralytics.data.augment import OnlineSlice
+    from ultralytics.data.build import build_yolo_dataset
+
+    img_dir, data = _tiny_tiled_dataset(tmp_path, 3, size=(96, 96))
+    cfg = get_cfg(
+        overrides={
+            "data": str(tmp_path / "d.yaml"),
+            "imgsz": 64,
+            "task": "detect",
+            "mode": "train",
+            "slice_prob": 1.0,
+            "slice_all_tiles": True,
+            "slice_ratio": 1.0,
+            "slice_center_bias": True,
+            "slice_bias_jitter": 0.05,
+            "slice_keep_origin": False,
+            "ratio_pad_keep": False,
+            "blur_keep": False,
+            "compose_keep": False,
+            "weather_keep": False,
+            "occlusion_keep": False,
+            "mosaic": 0.0,
+            "workers": 0,
+            "cache": False,
+            "close_aug_epoch": 0,
+        }
+    )
+    ds = build_yolo_dataset(cfg, str(img_dir), 3, data, mode="train")
+    ds.set_epoch(5, epochs=50)
+
+    seen = []
+    real_grid = OnlineSlice._grid
+
+    def spy(self, w, h, xyxy=None, key=None):
+        out = real_grid(self, w, h, xyxy, key)
+        seen.append((key, round(out[1], 9), round(out[2], 9), int(self._slice_epoch)))
+        return out
+
+    monkeypatch.setattr(OnlineSlice, "_grid", spy)
+    assert len(ds) == 3 * 4  # emit_all only: 4 tiles per original, every other branch off
+    for i in range(len(ds)):
+        ds[i]
+
+    assert len(seen) == 12, "every base-segment sample must go through the biased grid"
+    assert {epoch for *_, epoch in seen} == {5}, "the grid must see the CURRENT epoch"
+    per_image = {}
+    for key, bx, by, _ in seen:
+        per_image.setdefault(key, set()).add((bx, by))
+    assert set(per_image) == {0, 1, 2}, f"the key must be the image index, got {sorted(per_image)}"
+    assert all(len(v) == 1 for v in per_image.values()), "4 tiles per image must share exactly one grid"
+
+
+# ---------------------------------------------------------------------------
+# Project keys are read through _hyp_get, so default.yaml is always the fallback
+# ---------------------------------------------------------------------------
+_PROJECT_KEY_PREFIXES = ("slice_", "compose_", "ratio_pad_", "blur_", "weather_", "occlusion_", "mosaic_save_")
+_PROJECT_EXTRA_KEYS = {"degrade_max_side", "close_aug_epoch"}
+
+
+def _hyp_ns(strip_project_keys=False, **overrides):
+    """A DEFAULT_CFG-derived hyp; ``strip_project_keys`` simulates an args.yaml from before the feature."""
+    from ultralytics.cfg import DEFAULT_CFG_DICT
+    from ultralytics.utils import IterableSimpleNamespace
+
+    cfg = dict(DEFAULT_CFG_DICT)
+    if strip_project_keys:
+        cfg = {
+            k: v
+            for k, v in cfg.items()
+            if not k.startswith(_PROJECT_KEY_PREFIXES) and k not in _PROJECT_EXTRA_KEYS
+        }
+    cfg.update(overrides)
+    return IterableSimpleNamespace(**cfg)
+
+
+def _stub_augment_dataset():
+    """Only the attributes ``v8_transforms`` / ``Mosaic.__init__`` actually read off the dataset."""
+    import types
+
+    return types.SimpleNamespace(data={}, rect=False, use_obb=False, use_keypoints=False, cache=False)
+
+
+def _mirror_onto_dataset(hyp):
+    """Run ``v8_transforms`` and return only the attributes it published (the OnlineSlice object excluded)."""
+    from ultralytics.data.augment import v8_transforms
+
+    ds = _stub_augment_dataset()
+    pre_existing = set(vars(ds))
+    v8_transforms(ds, 64, hyp)
+    return {k: v for k, v in vars(ds).items() if k != "slice_transform" and k not in pre_existing}
+
+
+def test_hyp_without_any_project_key_still_builds_the_augmentation_pipeline():
+    """Core: a hyp that predates every project key must not abort the augmentation build.
+
+    ``getattr(hyp, "<key>")`` with no default *is* ``hyp.<key>`` -- Ruff's B009 says as much -- so all
+    60 of those reads raised ``AttributeError`` from deep inside the augmentation build for any hyp
+    that was not freshly derived from the current ``DEFAULT_CFG``: a third-party namespace, or the
+    ``train_args`` restored from an older ``args.yaml`` / checkpoint that predates the key. They now
+    fall back to ``default.yaml``, so an old config must produce the very same dataset attributes.
+    """
+    assert _mirror_onto_dataset(_hyp_ns(strip_project_keys=True)) == _mirror_onto_dataset(_hyp_ns())
+
+
+def test_mirrored_defaults_come_from_default_yaml():
+    """With no overrides, every mirrored value must equal its ``default.yaml`` entry.
+
+    Pairs with ``test_online_defaults_match_default_cfg`` (which guards ``base._ONLINE_DEFAULTS``):
+    this one guards the ``v8_transforms`` side, so neither copy of the defaults can drift.
+    """
+    from ultralytics.cfg import DEFAULT_CFG_DICT
+
+    mirror = _mirror_onto_dataset(_hyp_ns())
+    checked = {k: v for k, v in mirror.items() if k in DEFAULT_CFG_DICT}
+    assert len(checked) >= 40, f"the mirror shrank unexpectedly: {sorted(checked)}"
+    wrong = {k: (v, DEFAULT_CFG_DICT[k]) for k, v in checked.items() if v != DEFAULT_CFG_DICT[k]}
+    assert not wrong, f"v8_transforms published values that are not default.yaml's: {wrong}"
+
+
+def test_hyp_get_resolution_order():
+    """Attribute first, then an explicit default, then ``default.yaml``."""
+    from ultralytics.cfg import DEFAULT_CFG_DICT
+    from ultralytics.data.augment import _hyp_get
+    from ultralytics.utils import IterableSimpleNamespace
+
+    hyp = IterableSimpleNamespace(slice_prob=0.7)
+    assert _hyp_get(hyp, "slice_prob") == 0.7, "the value on hyp must win"
+    assert DEFAULT_CFG_DICT["slice_prob"] != 0.7, "guard the assertion above against a coincidental default"
+    assert _hyp_get(hyp, "blur_short_len_min") == DEFAULT_CFG_DICT["blur_short_len_min"], "missing -> default.yaml"
+    assert _hyp_get(hyp, "augmentations", []) == [], "an explicit default must beat the default.yaml lookup"
+    assert _hyp_get(hyp, "slice_save_max_tile") is None, "an explicit None is a value, not a missing key"
+
+
+def test_hyp_get_rejects_a_key_that_is_registered_nowhere():
+    """A key in neither ``hyp`` nor ``default.yaml`` must fail loudly and name itself.
+
+    Silently taking a built-in literal is what made the old spelling dangerous: a new config key read
+    before it was registered went unnoticed until a user's hyp happened to lack it. Raising here makes
+    the "register it in default.yaml too" convention self-enforcing instead of a comment.
+    """
+    from ultralytics.data.augment import _hyp_get
+    from ultralytics.utils import IterableSimpleNamespace
+
+    with pytest.raises(ValueError, match="definitely_not_a_hyperparameter"):
+        _hyp_get(IterableSimpleNamespace(), "definitely_not_a_hyperparameter")
+
+
+def _ast_function(module, name):
+    """Return the AST node of the top-level function ``name`` in ``module``'s source file."""
+    import ast
+
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    return next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+def test_v8_transforms_has_no_bare_getattr_on_hyp():
+    """Guard: ``getattr(hyp, "<key>")`` must not come back -- it silently loses the fallback.
+
+    This deliberately duplicates Ruff B009 (the local loop has no lint step), and the mechanism is the
+    point: the call still *works* whenever hyp happens to carry the key, so no behavioural test would
+    notice the fallback disappearing until a user hit it.
+    """
+    import ast
+
+    from ultralytics.data import augment
+
+    offenders = [
+        f"line {node.lineno}: getattr(hyp, {node.args[1].value!r})"
+        for node in ast.walk(_ast_function(augment, "v8_transforms"))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == "hyp"
+        and isinstance(node.args[1], ast.Constant)
+    ]
+    assert not offenders, "read project keys through _hyp_get so default.yaml stays the fallback: " + "; ".join(
+        offenders
+    )
+
+
+def test_every_project_key_read_by_v8_transforms_is_registered():
+    """Guard: each key ``v8_transforms`` reads must be in ``default.yaml`` -- or carry a literal.
+
+    A 2-arg ``_hyp_get`` call asserts "default.yaml has it", so an unregistered key there would raise
+    at build time; checking it statically names the offender before a user does. A 3-arg call means the
+    key is deliberately outside ``default.yaml`` (today only ``augmentations``), which is the one case
+    where a literal default is allowed -- writing one for a registered key would be a second copy of a
+    default that already lives in the config.
+    """
+    import ast
+
+    from ultralytics.cfg import DEFAULT_CFG_DICT
+    from ultralytics.data import augment
+
+    unregistered, duplicated = [], []
+    for node in ast.walk(_ast_function(augment, "v8_transforms")):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_hyp_get"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+        ):
+            continue
+        key, has_default = node.args[1].value, len(node.args) >= 3
+        if not has_default and key not in DEFAULT_CFG_DICT:
+            unregistered.append(f"line {node.lineno}: {key}")
+        if has_default and key in DEFAULT_CFG_DICT:
+            duplicated.append(f"line {node.lineno}: {key}")
+    assert not unregistered, (
+        "these keys are read without a default but are not in default.yaml: " + "; ".join(unregistered)
+    )
+    assert not duplicated, (
+        "these keys get a literal default although default.yaml already defines one: " + "; ".join(duplicated)
+    )
+
+
+def test_old_args_yaml_can_still_construct_a_real_dataset(tmp_path):
+    """End-to-end: the real user path -- restoring an older ``args.yaml`` -- must not crash.
+
+    The unit test above proves the reads fall back; this one proves ``YOLODataset.__init__`` gets all
+    the way through the augmentation build with such a hyp instead of dying in the middle of it.
+    """
+    from ultralytics.data.dataset import YOLODataset
+
+    img_dir, data = _tiny_detect_dataset(tmp_path)
+    ds = YOLODataset(
+        img_path=str(img_dir),
+        imgsz=64,
+        cache=False,
+        data=data,
+        augment=True,
+        hyp=_hyp_ns(strip_project_keys=True),
+    )
+    assert ds.transforms is not None
+    assert getattr(ds, "blur_axis_aligned", None) is True, "the mirror must still run on a legacy hyp"
+
+
+# ---------------------------------------------------------------------------
+# The `self.ims` whole-image cache is bounded by a BYTE BUDGET and exposed as config
+# ---------------------------------------------------------------------------
+# Upstream's cap is `min(ni, batch*8, 1000) - 1`, which only tracks `batch`. One frame is
+# `imgsz*imgsz*channels`, so the two axes multiply: at batch=64/imgsz=1280 that is 511 frames
+# ~= 2.3 GiB per worker and at imgsz=1920 ~= 5.3 GiB, on top of the raw-image LRU. The shipped
+# 1 GiB budget caps those at 218 and 97 frames (~1 GiB) while leaving `imgsz <= 640`/`batch <= 64`
+# byte-for-byte unchanged.
+def _ims_hyp(**overrides):
+    """A DEFAULT_CFG-derived hyp with the ims-cache keys overridden."""
+    return _hyp_ns(**overrides)
+
+
+@pytest.mark.parametrize(
+    "imgsz,channels,budget_mb,expected",
+    [
+        (640, 3, 256, 218),  # 256 MiB // (640*640*3 B)
+        (1280, 3, 256, 54),
+        (1920, 3, 256, 24),
+        (640, 1, 256, 655),  # greyscale frames are 3x smaller -> 3x more frames
+        (2048, 3, 1, 1),  # 1 MiB is less than a single 2048 frame -> the floor of 1, never zero
+    ],
+)
+def test_ims_cap_for_budget_converts_bytes_to_frames(imgsz, channels, budget_mb, expected):
+    """The budget is a byte budget, so the frame count must scale with 1/(imgsz^2 * channels)."""
+    from ultralytics.data.base import _ims_cap_for_budget, _ims_frame_bytes
+
+    assert _ims_cap_for_budget(budget_mb, _ims_frame_bytes(imgsz, channels)) == expected
+
+
+def test_ims_cap_for_budget_reports_no_budget_as_zero():
+    """`0` is the "no budget configured" sentinel -- and NOT a usable cap (see the trap test)."""
+    from ultralytics.data.base import _ims_cap_for_budget
+
+    for budget in (0, -1, -256):
+        assert _ims_cap_for_budget(budget, 1228800) == 0
+
+
+@pytest.mark.parametrize("frames_cfg", [1, 7, 16])
+def test_ims_cache_frames_explicit_is_honoured_exactly(frames_cfg):
+    """`>0` is an exact frame count, independent of ni/batch/imgsz/budget."""
+    from ultralytics.data.base import _resolve_ims_cap
+
+    hyp = _ims_hyp(ims_cache_frames=frames_cfg, ims_cache_mb=1)
+    for ni, batch, imgsz in [(8520, 64, 1920), (300, 8, 640), (1, 1, 640)]:
+        assert _resolve_ims_cap(hyp, ni, batch, imgsz, 3, True) == frames_cfg
+
+
+def test_ims_cache_frames_explicit_may_exceed_upstream():
+    """`>0` is the documented way to spend memory to buy back JPEG re-decodes."""
+    from ultralytics.data.base import _legacy_ims_cap, _resolve_ims_cap
+
+    assert _legacy_ims_cap(8520, 8) == 63
+    assert _resolve_ims_cap(_ims_hyp(ims_cache_frames=999), 8520, 8, 640, 3, True) == 999
+
+
+def test_ims_cache_frames_negative_reproduces_upstream_exactly():
+    """`<0` is the A/B escape hatch: it must reproduce the upstream formula verbatim."""
+    from ultralytics.data.base import _legacy_ims_cap, _resolve_ims_cap
+
+    hyp = _ims_hyp(ims_cache_frames=-1)
+    for ni, batch in [(8520, 8), (8520, 16), (8520, 64), (2000, 200), (300, 1)]:
+        legacy = max(1, min(ni, batch * 8, 1000) - 1)
+        assert _legacy_ims_cap(ni, batch) == legacy, "the helper must equal upstream's formula"
+        assert _resolve_ims_cap(hyp, ni, batch, 1920, 3, True) == legacy
+
+
+@pytest.mark.parametrize("imgsz", [320, 640, 1280, 1920])
+@pytest.mark.parametrize("batch", [1, 8, 16, 64, 200])
+def test_ims_auto_never_exceeds_upstream_so_the_default_cannot_regress_memory(imgsz, batch):
+    """The default (`0` = auto) is `min(upstream, budget)`: it may only ever LOWER the footprint.
+
+    That is what keeps the blast radius to the pathological configurations -- typical runs resolve to
+    exactly the legacy upstream value (pinned by the end-to-end test below).
+    """
+    from ultralytics.data.base import _legacy_ims_cap, _resolve_ims_cap
+
+    for ni in (300, 8520):
+        assert _resolve_ims_cap(_ims_hyp(), ni, batch, imgsz, 3, True) <= _legacy_ims_cap(ni, batch)
+
+
+@pytest.mark.parametrize("frames", [0, -1])
+@pytest.mark.parametrize("budget", [0, -1, 1e-9, 1, 256, 1e9])
+def test_ims_cap_is_never_zero_for_an_augmenting_dataset(frames, budget):
+    """`_ims_cap <= 0` means "never evict" in `_remember_ims`, so zero is an unbounded LEAK.
+
+    `_ims_cap_for_budget` legitimately returns 0 for "no budget"; that is exactly why the caller may
+    not pass it straight through -- there is no safe zero while the dataset is augmenting.
+    """
+    from ultralytics.data.base import _resolve_ims_cap
+
+    hyp = _ims_hyp(ims_cache_frames=frames, ims_cache_mb=budget)
+    for ni, batch, imgsz in [(8520, 64, 1920), (8520, 64, 640), (8, 8, 64)]:
+        assert _resolve_ims_cap(hyp, ni, batch, imgsz, 3, True) >= 1
+
+
+def test_ims_cap_is_zero_only_when_the_dataset_does_not_augment():
+    """`0` is correct there: the cache WRITE is behind `self.augment`, so nothing would fill it."""
+    from ultralytics.data.base import _resolve_ims_cap
+
+    for hyp in (_ims_hyp(), _ims_hyp(ims_cache_frames=32), _ims_hyp(ims_cache_frames=-1)):
+        assert _resolve_ims_cap(hyp, 100, 16, 640, 3, False) == 0
+
+
+def test_ims_cache_keys_are_registered_int_config():
+    """§1 three-place rule: an unregistered key is silently not validated/coerced on the CLI.
+
+    Registration is asserted by BEHAVIOUR (a float must be rejected), not just by membership: that is
+    the part users actually feel, and it is what breaks if someone drops the key from ``CFG_INT_KEYS``.
+    """
+    from ultralytics.cfg import CFG_INT_KEYS, DEFAULT_CFG_DICT, get_cfg
+
+    for key in ("ims_cache_frames", "ims_cache_mb"):
+        assert key in DEFAULT_CFG_DICT, f"{key} must live in default.yaml"
+        assert key in CFG_INT_KEYS, f"{key} must be in CFG_INT_KEYS or '--{key}=8' is not validated"
+
+    cfg = get_cfg(overrides={"ims_cache_frames": 8, "ims_cache_mb": 64})
+    assert type(cfg.ims_cache_frames) is int and cfg.ims_cache_frames == 8
+    assert type(cfg.ims_cache_mb) is int and cfg.ims_cache_mb == 64
+
+    with pytest.raises(TypeError, match="ims_cache_mb"):
+        get_cfg(overrides={"ims_cache_mb": 1.5})
+
+
+@pytest.mark.parametrize("imgsz,batch", [(320, 8), (320, 64), (640, 8), (640, 16), (640, 64)])
+def test_ims_auto_leaves_common_configs_at_the_upstream_value(imgsz, batch):
+    """The shipped 1 GiB budget must be INVISIBLE for configs whose upstream cap already fits it.
+
+    This is what makes the new default safe to land: it is not "a new policy for everyone", it is a
+    ceiling that only the pathological axes (``imgsz`` >= 1280, ``batch`` >= 128) ever reach. Checked
+    rather than argued, because a budget tweak that quietly shrinks the 640-column range would cost
+    re-decodes in the most common configuration and no test would notice.
+    """
+    from ultralytics.data.base import _legacy_ims_cap, _resolve_ims_cap
+
+    for ni in (2000, 8520):
+        assert _resolve_ims_cap(_ims_hyp(), ni, batch, imgsz, 3, True) == _legacy_ims_cap(ni, batch)
+
+
+@pytest.mark.parametrize("imgsz", [1280, 1920, 2560])
+def test_ims_auto_caps_the_high_resolution_configs_within_budget(imgsz):
+    """The pathological axis: batch=64 at 1280/1920 used to be 2.3/5.3 GiB per worker."""
+    from ultralytics.data.base import _legacy_ims_cap, _ims_frame_bytes, _resolve_ims_cap
+
+    legacy = _legacy_ims_cap(8520, 64)
+    cap = _resolve_ims_cap(_ims_hyp(), 8520, 64, imgsz, 3, True)
+    assert cap < legacy, "the budget must bind here -- that is the whole point"
+    assert cap * _ims_frame_bytes(imgsz, 3) / (1 << 20) <= 1024, "and it must fit the documented budget"
+
+
+@pytest.mark.parametrize(
+    "imgsz,overrides,expected",
+    [
+        (64, {"ims_cache_frames": 6}, 6),  # explicit: read from hyp (the upstream cap would be 7)
+        (64, {"ims_cache_frames": -1}, 7),  # upstream formula
+        (640, {"ims_cache_mb": 8}, 6),  # auto, budget binds: min(7, 8 MiB / 1.17 MiB) = 6
+        (640, {"ims_cache_mb": 256}, 7),  # auto, budget loose: exactly the legacy upstream value
+    ],
+)
+def test_ims_cache_budget_reaches_the_dataset(tmp_path, imgsz, overrides, expected):
+    """End-to-end: the knob must actually reach ``BaseDataset._ims_cap``.
+
+    Same failure mode as ``slice_raw_cache_size`` (see its test): the value is read inside
+    ``BaseDataset.__init__``, so reading it off ``self`` instead of ``hyp`` would leave the config
+    registered, documented -- and completely inert. The two "auto" cases pin both directions (budget
+    binding and not binding), which is what proves the `min(...)` is wired.
+    """
+    from ultralytics.cfg import get_cfg
+    from ultralytics.data.base import _legacy_ims_cap
+    from ultralytics.data.build import build_yolo_dataset
+
+    img_dir, data = _tiny_tiled_dataset(tmp_path, 8)
+    cfg = get_cfg(
+        overrides={
+            "data": str(tmp_path / "d.yaml"),
+            "imgsz": imgsz,
+            "task": "detect",
+            "mode": "train",
+            "workers": 0,
+            "cache": False,
+            "close_aug_epoch": 0,
+            **overrides,
+        }
+    )
+    ds = build_yolo_dataset(cfg, str(img_dir), 8, data, mode="train")
+    assert ds.channels == 3  # precondition for the frame-size arithmetic
+    assert _legacy_ims_cap(8, 8) == 7  # ni=8 -> upstream's cap is 7, so 6 and 4 are distinguishable
+    assert ds._ims_cap == expected
+
+
+def test_ims_cache_frames_bounds_the_cache_end_to_end(tmp_path, monkeypatch):
+    """The resolved cap must be the one ``_remember_ims`` actually enforces (config -> eviction)."""
+    from ultralytics.cfg import get_cfg
+    from ultralytics.data import base as base_mod
+    from ultralytics.data.build import build_yolo_dataset
+
+    img_dir, data = _tiny_tiled_dataset(tmp_path, 8)
+    cfg = get_cfg(
+        overrides={
+            "data": str(tmp_path / "d.yaml"),
+            "imgsz": 64,
+            "task": "detect",
+            "mode": "train",
+            "workers": 0,
+            "cache": False,
+            "close_aug_epoch": 0,
+            "ims_cache_frames": 3,
+        }
+    )
+    ds = build_yolo_dataset(cfg, str(img_dir), 8, data, mode="train")
+    assert ds._ims_cap == 3
+    assert getattr(ds, "slice_transform", None) is None, "the test needs load_image to own the ims write"
+
+    monkeypatch.setattr(base_mod, "imread", lambda _f, **__: np.zeros((64, 64, 3), np.uint8))
+    for i in list(range(ds.ni)) * 3:
+        ds.load_image(i)
+    assert len(ds._ims_keys) == 3, "the configured cap, not the 7 the mosaic buffer would allow"
+    assert sum(im is not None for im in ds.ims) == 3
+
+
+def test_ims_cache_budget_is_reported(tmp_path, monkeypatch):
+    """The estimate must be logged: that line is how the documented memory guidance is verified."""
+    from ultralytics.cfg import get_cfg
+    from ultralytics.data import base as base_mod
+    from ultralytics.data.build import build_yolo_dataset
+
+    class _Recorder:
+        def __init__(self):
+            self.messages = []
+
+        def info(self, msg, *_, **__):
+            self.messages.append(str(msg))
+
+        def warning(self, msg, *_, **__):
+            self.messages.append(str(msg))
+
+    rec = _Recorder()
+    monkeypatch.setattr(base_mod, "LOGGER", rec)
+    img_dir, data = _tiny_tiled_dataset(tmp_path, 8)
+    cfg = get_cfg(
+        overrides={
+            "data": str(tmp_path / "d.yaml"),
+            "imgsz": 640,  # makes the budget bind at this tiny ni: min(7, 8 MiB / 1.17 MiB) = 6
+            "task": "detect",
+            "mode": "train",
+            "workers": 0,
+            "cache": False,
+            "close_aug_epoch": 0,
+            "ims_cache_mb": 8,
+        }
+    )
+    build_yolo_dataset(cfg, str(img_dir), 8, data, mode="train")
+
+    hit = [m for m in rec.messages if "self.ims whole-image cache" in m]
+    assert hit, "the resolved budget must be reported (nothing else makes the knob observable)"
+    assert "6 frames" in hit[0], hit[0]
+    assert "MiB/worker" in hit[0], hit[0]  # the per-worker total is what makes the line actionable
+    assert "auto=min(upstream, budget)" in hit[0], hit[0]
+
+
+def test_remember_ims_treats_a_zero_cap_as_no_eviction_at_all(monkeypatch):
+    """Documents the trap that makes "0 frames" unsafe, i.e. why `_resolve_ims_cap` floors at 1."""
+    from ultralytics.data import base as base_mod
+
+    ds = _make_loader_dataset(n=4, cap=1, extended=True)
+    ds._ims_cap = 0  # the value a naive "budget with nothing left in it" would hand over
+    monkeypatch.setattr(base_mod, "imread", lambda _f, **__: np.zeros((32, 32, 3), np.uint8))
+    for i in range(ds.ni):
+        ds.load_image(i)
+    assert sum(im is not None for im in ds.ims) == ds.ni, "a zero cap evicts nothing -- it is a leak"
+
+
+def test_ims_eviction_does_not_change_the_returned_frame(monkeypatch):
+    """Why this knob needs no A/B: a miss only costs a re-decode, never different pixels.
+
+    Each source decodes to a value derived from its own file name, so a stale or mis-keyed entry
+    would come back as a different number. ``_make_loader_dataset`` caps `self.ims` at 2, so the
+    reads below genuinely evict each other.
+    """
+    from ultralytics.data import base as base_mod
+
+    ds = _make_loader_dataset(n=6, cap=2, extended=True)
+
+    def fake_imread(f, **__):  # `flags=` arrives as a keyword from load_image
+        return np.full((32, 32, 3), int(Path(str(f)).stem.split("_")[-1]), np.uint8)
+
+    monkeypatch.setattr(base_mod, "imread", fake_imread)
+    first = [ds.load_image(i)[0].copy() for i in range(ds.ni)]
+    assert len({int(im.flat[0]) for im in first}) == ds.ni, "the fixture must make frames distinguishable"
+
+    for i in (0, 3, ds.ni - 1):  # every one of these was evicted by the reads above
+        im, _, hw = ds.load_image(i)
+        assert (im == i).all(), f"image {i} came back with the wrong content"
+        assert hw == (64, 64)
+
 

@@ -139,7 +139,7 @@ def fix_checkpoint_for_extension(
         backup_path = backup_with_timestamp(ckpt_path, bdir)
         print(f"已备份原文件 -> {backup_path}")
 
-    # P1-10: 先写到临时文件 + 校验, 再原子替换; 避免断电/磁盘满导致 ckpt 截断损坏
+    # 先写到临时文件 + 校验, 再原子替换; 避免断电/磁盘满导致 ckpt 截断损坏
     tmp_path = target.with_suffix(target.suffix + ".tmp")
     torch.save(ckpt, tmp_path)
 

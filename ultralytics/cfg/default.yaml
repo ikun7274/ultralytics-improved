@@ -20,6 +20,16 @@ cache: False # (bool | str) cache images in RAM (True/'ram') or on 'disk' to spe
 device: # (int | str | list) device: 0/[0,1] CUDA, 'npu:0' Ascend, 'xpu:0' Intel, 'cpu'/'mps', -1/[-1,-1] auto GPUs
 workers: 8 # (int) dataloader workers (per RANK if DDP)
 prefetch_factor: 2 # (int) 每个 worker 预取的批次数; PyTorch 默认即为 2; 在线增强开启时降到 1 可减少约一半在途内存(相比改源码, 现可直接配置)
+ims_cache_frames: 0 # (int) 每 worker 的 self.ims 整图缓存帧数上限: 0=自动(取 min(上游公式, ims_cache_mb 预算)), >0=显式帧数, <0=沿用上游公式 min(ni, batch*8, 1000)-1
+                    # 该缓存把 load_image 的整图件留在内存里, 省掉重复 imread; 一帧 = imgsz*imgsz*channels, 而上游公式只随 batch 增长,
+                    # 于是 batch=64/imgsz=1280 是 511 帧≈2.3GB/worker、imgsz=1920 是 5.3GB/worker(还要叠加原图 LRU)
+                    # 默认档取 min(...) 保证"只会更省内存, 绝不会比上游更费"; 代价只是超预算的帧要重新解码
+                    # 本键不影响增广语义与样本内容: 未命中即重新解码, 结果与命中时逐位相同(有测试按内容钉住)
+ims_cache_mb: 1024 # (int) ims_cache_frames=0(自动)时的每 worker 内存预算(MiB); <=0=视为无预算(回退上游公式); 仅在自动档生效(显式帧数档不读它)
+                   # 1GiB 是"不打扰常见配置"与"封顶病态配置"的折中: imgsz<=640 且 batch<=64 时上游值本就在 1GiB 以内(511 帧=599MiB),
+                   # 故自动档对它们逐帧无影响; 只有 imgsz>=1280 或 batch>=128 才开始生效(1280 封到 218 帧=1.0GB, 1920 封到 97 帧=1.0GB)
+                   # 实测(n=2000, mosaic=1.0, 上游 511 帧): 帧数 511→218 时每样本 imread 由 0.94 升到 2.15, 即用 ~1.2 次重解码换 ~344MiB/worker;
+                   # 若源图是 4000x3000(单次解码 ~203ms)而内存充裕, 应调大本值或直接 ims_cache_frames=-1
 project: # (str, optional) project name for results root
 name: # (str, optional) experiment name or export hardware target
 exist_ok: False # (bool) overwrite existing 'project/name' if True
@@ -149,7 +159,7 @@ slice_min_center_retain_ratio: 0.6 # (float) 配合 center_constraint: 目标中
 slice_full_box_only: False # (bool) 目标必须完整落在切片内才保留; 被边界切开即过滤 (绝不保留残缺框); 开启时优先于 center_constraint
 slice_center_bias: False # (bool) 目标感知切缝: 切缝按本图目标中心分布微移, 落在目标最稀疏区间, 减少目标被劈碎; 切缝偏移不改变切片数量/尺寸/重叠语义, 与 center_constraint 互补建议同开; 与验证侧固定网格无关
 slice_bias_margin: 0.25 # (float) 切缝偏移窗口: 切缝只在 [margin, 1-margin] 区间内微移, 保证 tile 不过小
-slice_bias_jitter: 0.05 # (float) 每图每调用随机扰动切缝 (相对原图边长), 防同一图每 epoch 切缝相同而过拟合; 0=关闭
+slice_bias_jitter: 0.05 # (float) 切缝抖动幅度 (相对原图边长): 每张原图每 epoch 只抖一次, 同一图同一 epoch 的 4 片共用同一张网格, 跨 epoch 才变化; 防切缝固定而过拟合; 0=关闭
 # ---- 切片结果保存 (用于人工检查切片是否正确) ----
 slice_save_dir: # (str) 切片图保存目录; 空=不保存
 slice_save_max: 0 # (int) 默认保存限额: 同时作用于 [切片, ratio, blur, compose] 四类; 0=不限. 单独细调见 slice_save_max_{tile,ratio,blur,compose}
@@ -185,6 +195,7 @@ val_slice_dual_metric: False # (bool) 双口径: 先跑切片验证(主, 驱动 
 #   0=自动=2×imgsz (保留 2 倍过采样, 保证缩放时仍是降采样); >0=手动上限(像素, 长边); <0=关闭(原始分辨率退化, 旧行为).
 #   切片分支不受影响: 切片必须在原分辨率上执行(小目标放大是语义要求, 而非浪费).
 degrade_max_side: 0 # (int, 0=自动=2×imgsz, 默认开启) 退化分支最长边像素上限; >0=手动; <0=关闭
+degrade_resample: "area" # (str, area|linear) 退化分支限幅缩放的重采样核: area=抗锯齿更好但慢(4000x3000 单次 ~21.5ms), linear=快 3 倍但画质略软(同场景 ~7.8ms); 两者几何完全一致, 仅滤波不同
 
 # ---------- 在线合成 (compose_*): 每 4 张原图拼 1 张 2x2 大图, 提供更大范围多目标上下文 ----------
 compose_keep: False # (bool, 独立开关, 不依赖切片/keep_origin) 每 4 张原图额外合成 1 张 2x2 拼接大图进样本池 -> 样本池 +ceil(N/4)
@@ -211,6 +222,9 @@ blur_short_len_max: 12 # (int|float) 短模糊(轻度, 无失焦) 的运动模�
 blur_long_len_min: 20 # (int|float) 长模糊(重度) 的运动模糊长度下限(像素)
 blur_long_len_max: 35 # (int|float) 长模糊(重度) 的运动模糊长度上限(像素)
 blur_long_defocus_sigma: 1.0 # (float) 长模糊的失焦高斯 σ 上限 [0,该值], 每张随机取; 0=长模糊不加失焦
+blur_axis_aligned: True # (bool) 拖影方向限制为像面轴对齐(水平/垂直, 二选一随机), 而非 [0,180) 任意角; 适用于相机安装固定、运动方向在像面上恒定映射到水平或垂直的场景(车载/航拍沿航迹)
+                        # 这类域里"轴对齐"是更贴合的建模而非近似: 实测轴对齐的 PSF 精确等于均匀箱式, 故走 cv2.blur 的 O(1) 行程和路径, 与旧 filter2D 逐位相同(242 组 max|diff|=0), 两档合计 28.1→15.4 ms/图(1.82×)
+                        # 代价: 拖影方向由任意角收窄为 0°/90° 两个方向(增广分布真的变了)。需要任意角时设 False 做 A/B
 blur_save_dir: "" # (str, 可选, 需 blur_keep) 模糊图保存目录 (画框/限数量/按图+档位跨 epoch 去重); 空=不保存 (默认)
 
 # ---------- 在线气象退化 (weather_*): 每张原图生成 1 张雨/雾/噪声退化图, 提升恶劣天气鲁棒性, 标签不变 ----------

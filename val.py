@@ -1,7 +1,7 @@
 import warnings
 
-# P2-7: 收窄告警过滤 — 仅屏蔽 Deprecation / Future / PendingDeprecation 类噪音,
-# 不再一刀切 ignore，RuntimeWarning 等真错误必须能冒泡 (例如 P1-5 模糊核除零)。
+# 收窄告警过滤 — 仅屏蔽 Deprecation / Future / PendingDeprecation 类噪音,
+# 不再一刀切 ignore，RuntimeWarning 等真错误必须能冒泡 (例如模糊核除零)。
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
@@ -17,18 +17,19 @@ def get_weight_size(path):
     return f'{stats.st_size / 1024 / 1024:.1f}'
 
 if __name__ == '__main__':
-    # P2-6: 移除硬编码的 runs/exp-2-2-5/weights/best.pt 路径 —
+    # 移除硬编码的 runs/exp-2-2-5/weights/best.pt 路径 —
     # 训练脚本默认 project 已经写到 <项目根>/runs, 这里自动取最近一次训练的最佳权重。
     # 仍可手动覆盖 model_path。
     _project_root = Path(__file__).resolve().parent / "runs"
     _latest_best = None
     if _project_root.exists():
-        candidates = sorted(
-            (p for p in _project_root.rglob("weights/best.pt")),
+        # 单遍取 mtime 最大者即可, 无需对全部候选排序 (runs/ 随实验增长时避免无谓的全量排序)。
+        _latest = max(
+            _project_root.rglob("weights/best.pt"),
             key=lambda p: p.stat().st_mtime,
-            reverse=True,
+            default=None,
         )
-        _latest_best = str(candidates[0]) if candidates else None
+        _latest_best = str(_latest) if _latest is not None else None
     if _latest_best is None:
         raise FileNotFoundError(
             f"未找到任何 runs/**/weights/best.pt (搜索根目录: {_project_root})。"
@@ -58,7 +59,7 @@ if __name__ == '__main__':
         postprocess_time_per_image = result.speed['postprocess']
         all_time_per_image = preprocess_time_per_image + inference_time_per_image + postprocess_time_per_image
         
-        n_l, n_p, n_g, flops = model_info(model.model)
+        _, n_p, _, flops = model_info(model.model)  # 层数/梯度数不用, 占位丢弃
         
         model_info_table = PrettyTable()
         model_info_table.title = "Model Info"
@@ -93,7 +94,7 @@ if __name__ == '__main__':
                                 ])
         print(model_metrice_table)
 
-        with open(result.save_dir / 'paper_data.txt', 'w+') as f:
+        with open(result.save_dir / 'paper_data.txt', 'w+', encoding="utf-8") as f:
             f.write(str(model_info_table))
             f.write('\n')
             f.write(str(model_metrice_table))

@@ -18,7 +18,7 @@ from torch.nn import functional as F
 from ultralytics.data.online_degrade import _OCCLUSION_TYPES, _WEATHER_TYPES
 from ultralytics.data.online_io import _ensure_dir
 from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
-from ultralytics.utils import LOGGER, IterableSimpleNamespace, colorstr, deprecation_warn
+from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, IterableSimpleNamespace, colorstr, deprecation_warn
 from ultralytics.utils.patches import imwrite  # unicode-safe save (cv2.imwrite silently fails on non-ASCII paths)
 from ultralytics.utils.checks import check_version
 from ultralytics.utils.instance import Instances
@@ -885,6 +885,7 @@ def compute_slice_bias(
     xyxy: np.ndarray | None,
     margin: float = 0.25,
     jitter: float = 0.05,
+    jitter_rng: random.Random | None = None,
 ) -> tuple[float, float]:
     """Target-aware seam bias for ``slice_geometry``.
 
@@ -895,6 +896,14 @@ def compute_slice_bias(
     ``slice_geometry``. ``jitter`` adds a uniform random perturbation each call (per-epoch variation
     without re-computing anything) so the same image does not get the identical seams every epoch.
     Empty boxes -> (0, 0) (centered grid, unchanged behavior).
+
+    Args:
+        jitter_rng (random.Random | None): Source of the ``jitter`` draw. ``None`` (default) uses the
+            GLOBAL ``random`` stream, which makes the bias vary on every call. Callers that need the
+            grid to be a stable property of ``(image, epoch)`` -- required so all 4 tiles of one
+            original in ``slice_all_tiles`` mode share ONE grid (otherwise the 2x2 union no longer
+            covers the image and the per-tile seam decisions contradict each other) -- must pass a
+            deterministic RNG derived from ``(epoch, image index)`` instead.
     """
     if xyxy is None or len(xyxy) == 0:
         return 0.0, 0.0
@@ -911,8 +920,12 @@ def compute_slice_bias(
     bx = float(cands[int(np.argmin(score_x))])
     by = float(cands[int(np.argmin(score_y))])
     if jitter > 0:
-        bx += random.uniform(-jitter, jitter)
-        by += random.uniform(-jitter, jitter)
+        # jitter_rng: deterministic per-(epoch, image) source when the caller needs a stable grid.
+        # Deliberately NOT drawn from the global stream in that case -- the seam is then a pure
+        # function of (image, epoch) and no longer shifts the downstream augmentation sequence.
+        rng = random if jitter_rng is None else jitter_rng
+        bx += rng.uniform(-jitter, jitter)
+        by += rng.uniform(-jitter, jitter)
         bx = min(max(bx, margin), 1.0 - margin)
         by = min(max(by, margin), 1.0 - margin)
     return bx - 0.5, by - 0.5
@@ -954,6 +967,10 @@ class OnlineSlice(BaseTransform):
         >>> t = OnlineSlice(p=1.0, overlap_ratio=0.2, min_area_ratio=0.005, min_retain_ratio=0.4, neg_ratio=0.2)
         >>> sliced_img, label = t(img_orig, label)  # label: original dict (bboxes/segments/keypoints/cls)
     """
+
+    # Class-level default so instances built via ``__new__`` stubs (tests) still answer `_grid_rng`.
+    # Must stay in sync with the ``__init__`` assignment.
+    _slice_epoch = 0
 
     def __init__(
         self,
@@ -1007,8 +1024,9 @@ class OnlineSlice(BaseTransform):
                 centered grid (fully backward compatible).
             bias_margin (float): In (0, 0.5]. Seam search window edge: the seam position is restricted to
                 ``[bias_margin, 1-bias_margin]`` of each axis so tiles never become too small.
-            bias_jitter (float): Uniform random seam perturbation added each call (relative to the image
-                extent), so the same image does not get identical seams every epoch. 0 disables.
+            bias_jitter (float): Uniform seam perturbation (relative to the image extent) applied once per
+                ``(epoch, image)``, so the same image does not get identical seams every epoch while all
+                4 tiles of that image keep sharing one grid. 0 disables.
         """
         # Explicit ValueError rather than assert: every one of these is a user-supplied hyperparameter
         # from default.yaml, and ``python -O`` strips asserts -- the invalid value would then be
@@ -1045,6 +1063,36 @@ class OnlineSlice(BaseTransform):
         # Unique keys of tiles already saved (src = (img_index, k) or img_index), so each tile is saved only
         # once across epochs / mosaic mix visits instead of accumulating one file per epoch.
         self._saved_keys = set()
+        # Current epoch, pushed by BaseDataset._rebuild_epoch_masks. It only feeds the deterministic seam
+        # jitter (see _grid_rng): the seam must be stable inside one epoch and vary across epochs. 0 is a
+        # valid deterministic default for standalone use (no trainer ever calling set_epoch).
+        # Class-level default matters: tests build instances via __new__ stubs and never run __init__.
+        self._slice_epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Record the current epoch that seeds the deterministic seam jitter.
+
+        Called from ``BaseDataset._rebuild_epoch_masks`` right next to ``reset_counters`` so the MAIN
+        process and every DataLoader worker hold the same epoch -- the same "rebuild in every process,
+        derive identically, transport nothing" contract the masks already rely on.
+        """
+        self._slice_epoch = int(epoch)
+
+    def _grid_rng(self, key: Any) -> random.Random | None:
+        """Deterministic seam-jitter RNG for ``key``, or ``None`` to use the global stream.
+
+        ``key`` identifies the ORIGINAL image (not the tile), so all 4 tiles of one image in
+        ``slice_all_tiles`` mode derive the SAME ``bias_x``/``bias_y`` and therefore one shared 2x2
+        grid. Drawing per call instead (the old behavior) gave each tile its own grid: the union of
+        the 4 tiles no longer covered the image once ``bias_jitter`` approached ``overlap_ratio/2``,
+        and the "seam lands where targets are sparsest" guarantee became per-tile noise.
+
+        ``key is None`` keeps the historical behavior (global ``random`` per call) for callers that
+        have no stable image identity; nothing in the dataset pipeline takes that path.
+        """
+        if key is None:
+            return None
+        return random.Random(f"OnlineSlice:{int(self._slice_epoch)}:{key}")
 
     def reset_counters(self) -> None:
         """Reset the per-epoch positive/background tile counters (called from BaseDataset.set_epoch).
@@ -1080,6 +1128,11 @@ class OnlineSlice(BaseTransform):
         img = tile
         if self.save_annotated and len(boxes_px):
             img = tile.copy()
+            if len(boxes_px) != len(cls):
+                LOGGER.warning(
+                    f"OnlineSlice._save_tile: {len(boxes_px)} boxes vs {len(cls)} cls for '{tag}' "
+                    "-- drawing only the aligned prefix."
+                )
             for b, c in zip(boxes_px, cls):
                 x0, y0, x1, y1 = (int(round(float(v))) for v in b)
                 cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
@@ -1097,19 +1150,26 @@ class OnlineSlice(BaseTransform):
         if src is not None:
             self._saved_keys.add(src)
 
-    def _grid(self, w: int, h: int, xyxy: np.ndarray | None = None) -> tuple[list, float, float]:
+    def _grid(self, w: int, h: int, xyxy: np.ndarray | None = None, key: Any = None) -> tuple[list, float, float]:
         """Return (tiles, bias_x, bias_y): the 4 (x0, y0, x1, y1) tiles of the 2x2 overlap grid.
 
         With ``center_bias`` the seam position is computed from the box centers (pixel ``xyxy``) via
         ``compute_slice_bias``; otherwise the centered grid is used (bias = 0, backward compatible).
+        ``key`` is the ORIGINAL image index; it makes the seam jitter deterministic per
+        ``(epoch, image)`` so all 4 tiles of one image share a single grid (see ``_grid_rng``).
         """
         bx, by = 0.0, 0.0
         if self.center_bias:
-            bx, by = compute_slice_bias(w, h, xyxy, self.bias_margin, self.bias_jitter)
+            bx, by = compute_slice_bias(
+                w, h, xyxy, self.bias_margin, self.bias_jitter, jitter_rng=self._grid_rng(key)
+            )
         return slice_geometry(w, h, self.overlap_ratio, bx, by), bx, by
 
-    def _geometry(self, img: np.ndarray, label: dict[str, Any]) -> list:
+    def _geometry(self, img: np.ndarray, label: dict[str, Any], key: Any = None) -> list:
         """Convert boxes to pixel xyxy and compute the 4 tile intersection results.
+
+        Args:
+            key (Any): Original-image identity forwarded to ``_grid`` for the deterministic seam jitter.
 
         Returns:
             (list): List of ``(x0, y0, x1, y1, keep_idx, tile_local_xyxy)`` for the 4 grid tiles.
@@ -1141,7 +1201,7 @@ class OnlineSlice(BaseTransform):
         if n:
             ori_area = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
 
-        tiles, bx, by = self._grid(w, h, xyxy if n else None)
+        tiles, bx, by = self._grid(w, h, xyxy if n else None, key)
         tile_results = []  # (x0, y0, x1, y1, keep_idx, tile_local_xyxy)
         for x0, y0, x1, y1 in tiles:
             if n == 0:
@@ -1275,7 +1335,7 @@ class OnlineSlice(BaseTransform):
         return sub, new_label
 
     def __call__(self, img: np.ndarray, label: dict[str, Any], src: Any = None,
-                 count: bool = True) -> tuple[np.ndarray, dict[str, Any]]:
+                 count: bool = True, key: Any = None) -> tuple[np.ndarray, dict[str, Any]]:
         """Slice the ORIGINAL-resolution image and return a RANDOMLY sampled tile (mode A).
 
         The label dict uses the raw dataset format: ``bboxes`` (N, 4) in ``bbox_format``/``normalized``,
@@ -1286,18 +1346,21 @@ class OnlineSlice(BaseTransform):
             src (Any): Optional unique key (e.g. ``(img_index, k)`` or ``img_index``) used to save each
                 tile only once across epochs / mosaic mix visits.
             count (bool): Whether to update counters/save (False for auxiliary mix samples).
+            key (Any): Original image index. Pins the seam jitter to ``(epoch, key)`` so the grid is a
+                stable property of the image within an epoch (``src`` cannot be reused for this: it also
+                carries the tile index ``k`` in ``slice_all_tiles`` mode and keys the save-once set).
         """
         if random.uniform(0, 1) > self.p:
             return img, label
         if img.shape[1] < 2 or img.shape[0] < 2:
             return img, label
-        tile_results = self._geometry(img, label)
+        tile_results = self._geometry(img, label, key)
         # Sample a random tile uniformly so that every tile is covered across epochs.
         x0, y0, x1, y1, idx, local = random.choice(tile_results)
         return self._emit(img, label, x0, y0, x1, y1, idx, local, src, count)
 
     def slice_at(self, img: np.ndarray, label: dict[str, Any], k: int,
-                 src: Any = None, count: bool = True) -> tuple[np.ndarray, dict[str, Any]]:
+                 src: Any = None, count: bool = True, key: Any = None) -> tuple[np.ndarray, dict[str, Any]]:
         """Return the ``k``-th (0..3) tile so all 4 tiles participate in training (mode B / emit_all).
 
         Background-quota-exceeded tiles fall back to the ORIGINAL image (Plan A), never to an empty
@@ -1307,12 +1370,14 @@ class OnlineSlice(BaseTransform):
             src (Any): Optional unique key (e.g. ``(img_index, k)`` or ``img_index``) used to save each
                 tile only once across epochs / mosaic mix visits.
             count (bool): Whether to update counters/save (False for auxiliary mix samples).
+            key (Any): Original image index -- the SAME value for k=0..3 of one image. It is what makes
+                the 4 tiles share one grid; do NOT pass ``(img_index, k)`` here.
         """
         if random.uniform(0, 1) > self.p:
             return img, label
         if img.shape[1] < 2 or img.shape[0] < 2:
             return img, label
-        tile_results = self._geometry(img, label)
+        tile_results = self._geometry(img, label, key)
         x0, y0, x1, y1, idx, local = tile_results[k]
         sub, out_label = self._emit(img, label, x0, y0, x1, y1, idx, local, src, count)
         # Plan A fallback: when this tile is empty AND the background quota is reached, _emit returns
@@ -3323,6 +3388,44 @@ class RandomLoadText(BaseTransform):
         return labels
 
 
+_MISSING = object()
+
+
+def _hyp_get(hyp: Any, key: str, default: Any = _MISSING) -> Any:
+    """Read one project hyperparameter, falling back to its ``default.yaml`` value.
+
+    ``v8_transforms`` mirrors ~67 project keys (slicing / compose / ratio / blur / weather / occlusion /
+    save caps) from ``hyp`` onto the dataset. Those reads used to be spelled ``getattr(hyp, "<key>")``
+    with no default, which is exactly equivalent to ``hyp.<key>`` -- Ruff flags all 60 of them as B009,
+    "not any safer than normal property access" -- and aborts the augmentation build with an
+    ``AttributeError`` whenever ``hyp`` was not freshly derived from the current ``DEFAULT_CFG``: a
+    third-party ``IterableSimpleNamespace``, a hand-built ``dict``, or the ``train_args`` restored from
+    an older ``args.yaml`` / checkpoint that predates the key. Falling back the same way
+    ``base._ONLINE_DEFAULTS`` already does for its per-call reads keeps one behaviour for the pipeline.
+
+    Resolution order: attribute on ``hyp`` -> ``default`` when given -> ``DEFAULT_CFG_DICT[key]``. A key
+    in neither place is a developer error (it is missing from ``ultralytics/cfg/default.yaml``), so it
+    raises a ``ValueError`` naming the key instead of silently picking a built-in literal -- which makes
+    the "register every new key in default.yaml" convention self-enforcing at build time.
+
+    不要改回 `getattr(hyp, "<key>", <字面量>)`: 默认值只能有一个真源 (default.yaml), 两处各写一遍
+    迟早漂移; 新增 cfg 键却忘了登记 default.yaml 时, 这里会立刻报错而不是静默用字面量兜底。
+
+    Deliberately NOT used for the upstream YOLO keys (``hyp.mosaic``, ``hyp.mixup``, ...): a ``hyp``
+    missing those is genuinely broken and upstream raises on them too.
+    """
+    if default is _MISSING:
+        try:
+            default = DEFAULT_CFG_DICT[key]
+        except KeyError:
+            raise ValueError(
+                f"hyperparameter '{key}' is neither set on hyp nor registered in ultralytics/cfg/default.yaml. "
+                f"Add it to the default config (plus the matching CFG_*_KEYS list in ultralytics/cfg/__init__.py "
+                f"when it must be settable from the CLI). A stale local default.yaml produces this error too."
+            ) from None
+    return getattr(hyp, key, default)
+
+
 def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     """Apply a series of image transformations for training.
 
@@ -3333,7 +3436,10 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         dataset (Dataset): The dataset object containing image data and annotations.
         imgsz (int): The target image size for resizing.
         hyp (IterableSimpleNamespace): A namespace of hyperparameters controlling various aspects of the
-            transformations.
+            transformations. Project keys (``slice_*`` / ``compose_*`` / ``ratio_pad_*`` / ``blur_*`` /
+            ``weather_*`` / ``occlusion_*`` / ``mosaic_save_*``) are read through ``_hyp_get``, so a hyp
+            that predates a key -- an older ``args.yaml`` or checkpoint ``train_args`` -- falls back to
+            ``default.yaml`` instead of aborting the build with an ``AttributeError``.
 
     Returns:
         (Compose): A composition of image transformations to be applied to the dataset.
@@ -3366,10 +3472,10 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         dataset,
         imgsz=imgsz,
         p=hyp.mosaic,
-        save_dir=str(getattr(hyp, "mosaic_save_dir", "") or ""),
-        save_max=int(getattr(hyp, "mosaic_save_max", 0)),
-        save_annotated=bool(getattr(hyp, "mosaic_save_annotated", True)),
-        exist_ok=bool(getattr(hyp, "mosaic_save_exist_ok", True)),
+        save_dir=str(_hyp_get(hyp, "mosaic_save_dir") or ""),
+        save_max=int(_hyp_get(hyp, "mosaic_save_max")),
+        save_annotated=bool(_hyp_get(hyp, "mosaic_save_annotated")),
+        exist_ok=bool(_hyp_get(hyp, "mosaic_save_exist_ok")),
     )
     affine = RandomPerspective(
         degrees=hyp.degrees,
@@ -3392,42 +3498,45 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     # ---- 训练后期关闭在线增强 (close_aug_epoch, 与 close_mosaic 同构的时间维调度) ----
     # 修复附带: 此前该值从未被复制到 dataset 上, base.py 的 getattr(self, "close_aug_epoch", 0)
     # 恒为 0, 时间维调度从未生效; set_epoch/_rebuild_epoch_masks 靠它判断最后 N 个 epoch 全部关增强。
-    dataset.close_aug_epoch = int(getattr(hyp, "close_aug_epoch"))
+    dataset.close_aug_epoch = int(_hyp_get(hyp, "close_aug_epoch"))
 
     # mirror the LRU capacity onto the dataset so it is self-describing (base.py consumes the same
     # hyp key directly in __init__, since this function runs too late for an eager read there).
-    dataset.slice_raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", 2) or 0)
+    dataset.slice_raw_cache_size = int(_hyp_get(hyp, "slice_raw_cache_size") or 0)
+    # degradation resample kernel ("area" = antialiased/slower, "linear" = faster/slightly softer);
+    # mirrored here because _degrade_frame reads it per-call from `self`.
+    dataset.degrade_resample = str(_hyp_get(hyp, "degrade_resample") or "area")
 
     # ---- 在线切片 (slice_prob 独立开关) ----
-    slice_enabled = online_aug_on and getattr(hyp, "slice_prob") > 0.0
+    slice_enabled = online_aug_on and _hyp_get(hyp, "slice_prob") > 0.0
     if slice_enabled:
         # tile cap honours slice_save_max_tile override (falls back to slice_save_max when None).
-        # tile is the ONLY branch whose cap lives on the OnlineSlice instance itself (see _save in
-        # augment.py: line 941), so the override must be applied here at construction time -- unlike
-        # blur/ratio/compose whose caps base.py reads per-call from `self`.
-        _tile_cap = getattr(hyp, "slice_save_max_tile")
+        # tile is the ONLY branch whose cap lives on the OnlineSlice instance itself (see
+        # OnlineSlice._save_tile), so the override must be applied here at construction time --
+        # unlike blur/ratio/compose whose caps base.py reads per-call from `self`.
+        _tile_cap = _hyp_get(hyp, "slice_save_max_tile")
         if _tile_cap is None:
-            _tile_cap = int(getattr(hyp, "slice_save_max"))
+            _tile_cap = int(_hyp_get(hyp, "slice_save_max"))
         dataset.slice_transform = OnlineSlice(
-            p=float(getattr(hyp, "slice_prob")),
-            overlap_ratio=float(getattr(hyp, "slice_overlap_ratio")),
-            min_area_ratio=float(getattr(hyp, "slice_min_tile_area_ratio")),
-            min_retain_ratio=float(getattr(hyp, "slice_min_box_retain_ratio")),
-            neg_ratio=float(getattr(hyp, "slice_background_ratio")),
-            save_dir=str(getattr(hyp, "slice_save_dir") or ""),
+            p=float(_hyp_get(hyp, "slice_prob")),
+            overlap_ratio=float(_hyp_get(hyp, "slice_overlap_ratio")),
+            min_area_ratio=float(_hyp_get(hyp, "slice_min_tile_area_ratio")),
+            min_retain_ratio=float(_hyp_get(hyp, "slice_min_box_retain_ratio")),
+            neg_ratio=float(_hyp_get(hyp, "slice_background_ratio")),
+            save_dir=str(_hyp_get(hyp, "slice_save_dir") or ""),
             save_max=int(_tile_cap),
-            save_annotated=bool(getattr(hyp, "slice_save_annotated")),
-            exist_ok=bool(getattr(hyp, "slice_save_exist_ok")),
-            center_constraint=bool(getattr(hyp, "slice_center_constraint")),
-            min_center_ratio=float(getattr(hyp, "slice_min_center_retain_ratio")),
-            full_box_only=bool(getattr(hyp, "slice_full_box_only")),
+            save_annotated=bool(_hyp_get(hyp, "slice_save_annotated")),
+            exist_ok=bool(_hyp_get(hyp, "slice_save_exist_ok")),
+            center_constraint=bool(_hyp_get(hyp, "slice_center_constraint")),
+            min_center_ratio=float(_hyp_get(hyp, "slice_min_center_retain_ratio")),
+            full_box_only=bool(_hyp_get(hyp, "slice_full_box_only")),
             # 目标感知切缝 (方案1): 切缝按本图目标中心分布微移, 减少目标被劈碎
-            center_bias=bool(getattr(hyp, "slice_center_bias")),
-            bias_margin=float(getattr(hyp, "slice_bias_margin")),
-            bias_jitter=float(getattr(hyp, "slice_bias_jitter")),
+            center_bias=bool(_hyp_get(hyp, "slice_center_bias")),
+            bias_margin=float(_hyp_get(hyp, "slice_bias_margin")),
+            bias_jitter=float(_hyp_get(hyp, "slice_bias_jitter")),
         )
-        dataset.slice_all_tiles = bool(getattr(hyp, "slice_all_tiles"))
-        dataset.slice_ratio = float(getattr(hyp, "slice_ratio"))
+        dataset.slice_all_tiles = bool(_hyp_get(hyp, "slice_all_tiles"))
+        dataset.slice_ratio = float(_hyp_get(hyp, "slice_ratio"))
     else:
         dataset.slice_transform = None
         dataset.slice_all_tiles = False
@@ -3435,52 +3544,55 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
 
     # ---- 独立增强开关 (slice_keep_origin / compose_keep / ratio_pad_keep / blur_keep 互不影响,
     # 不受 slice_prob 控制; keep_origin 无切片时由 _keep_origin_on() 自动抑制) ----
-    dataset.slice_keep_origin = online_aug_on and bool(getattr(hyp, "slice_keep_origin"))
+    dataset.slice_keep_origin = online_aug_on and bool(_hyp_get(hyp, "slice_keep_origin"))
     # ---- 独立增强开关 (compose_keep / ratio_pad_keep / blur_keep 互不影响, 不受 slice_prob 控制) ----
     # compose/ratio/blur 不需要切片或 keep_origin, 单独开启即生效(见 _segment_bases 区段布局)。
-    dataset.compose_keep = online_aug_on and bool(getattr(hyp, "compose_keep"))
-    dataset.compose_save = online_aug_on and bool(getattr(hyp, "compose_save"))
-    dataset.compose_save_dir = str(getattr(hyp, "compose_save_dir") or "")
-    dataset.compose_max_side = int(getattr(hyp, "compose_max_side") or 0)
+    dataset.compose_keep = online_aug_on and bool(_hyp_get(hyp, "compose_keep"))
+    dataset.compose_save = online_aug_on and bool(_hyp_get(hyp, "compose_save"))
+    dataset.compose_save_dir = str(_hyp_get(hyp, "compose_save_dir") or "")
+    dataset.compose_max_side = int(_hyp_get(hyp, "compose_max_side") or 0)
     # Same working-resolution cap, but for the degradation branches (blur / weather / occlusion / ratio).
     # Mirrored onto the dataset exactly like compose_max_side: without this copy the key would be
     # registered in default.yaml yet never reach the dataset, and _degrade_max_side() would silently
     # stay on its "auto" default no matter what the user configured.
-    dataset.degrade_max_side = int(getattr(hyp, "degrade_max_side", 0) or 0)
-    dataset.ratio_pad_keep = online_aug_on and bool(getattr(hyp, "ratio_pad_keep"))
-    dataset.ratio_pad_target = str(getattr(hyp, "ratio_pad_target") or "auto")
-    dataset.ratio_pad_color = str(getattr(hyp, "ratio_pad_color") or "black")
-    dataset.ratio_pad_save_dir = str(getattr(hyp, "ratio_pad_save_dir") or "")
-    dataset.blur_keep = online_aug_on and bool(getattr(hyp, "blur_keep"))
-    dataset.blur_short_len_min = float(getattr(hyp, "blur_short_len_min"))
-    dataset.blur_short_len_max = float(getattr(hyp, "blur_short_len_max"))
-    dataset.blur_long_len_min = float(getattr(hyp, "blur_long_len_min"))
-    dataset.blur_long_len_max = float(getattr(hyp, "blur_long_len_max"))
-    dataset.blur_long_defocus_sigma = float(getattr(hyp, "blur_long_defocus_sigma"))
-    dataset.blur_save_dir = str(getattr(hyp, "blur_save_dir") or "")
+    dataset.degrade_max_side = int(_hyp_get(hyp, "degrade_max_side") or 0)
+    dataset.ratio_pad_keep = online_aug_on and bool(_hyp_get(hyp, "ratio_pad_keep"))
+    dataset.ratio_pad_target = str(_hyp_get(hyp, "ratio_pad_target") or "auto")
+    dataset.ratio_pad_color = str(_hyp_get(hyp, "ratio_pad_color") or "black")
+    dataset.ratio_pad_save_dir = str(_hyp_get(hyp, "ratio_pad_save_dir") or "")
+    dataset.blur_keep = online_aug_on and bool(_hyp_get(hyp, "blur_keep"))
+    dataset.blur_short_len_min = float(_hyp_get(hyp, "blur_short_len_min"))
+    dataset.blur_short_len_max = float(_hyp_get(hyp, "blur_short_len_max"))
+    dataset.blur_long_len_min = float(_hyp_get(hyp, "blur_long_len_min"))
+    dataset.blur_long_len_max = float(_hyp_get(hyp, "blur_long_len_max"))
+    dataset.blur_long_defocus_sigma = float(_hyp_get(hyp, "blur_long_defocus_sigma"))
+    # 拖影方向是否限制为轴对齐 (水平/垂直)。与 blur_*_len_* 一样必须显式镜像到 dataset:
+    # 否则键在 default.yaml 里注册了却到不了 dataset, _build_blur_sample 只会读到内置默认值。
+    dataset.blur_axis_aligned = bool(_hyp_get(hyp, "blur_axis_aligned"))
+    dataset.blur_save_dir = str(_hyp_get(hyp, "blur_save_dir") or "")
     # ---- 在线气象退化 (weather_*): 雨/雾/噪声, 标签不变, 独立开关 + epoch 级比例 (复用掩码机制) ----
-    dataset.weather_keep = online_aug_on and bool(getattr(hyp, "weather_keep"))
-    dataset.weather_ratio = float(getattr(hyp, "weather_ratio"))
-    dataset.weather_types = str(getattr(hyp, "weather_types") or "rain,haze,noise")
-    dataset.weather_rain_density = float(getattr(hyp, "weather_rain_density"))
-    dataset.weather_rain_length = float(getattr(hyp, "weather_rain_length"))
-    dataset.weather_haze_beta = float(getattr(hyp, "weather_haze_beta"))
-    dataset.weather_noise_std = float(getattr(hyp, "weather_noise_std"))
-    dataset.weather_save_dir = str(getattr(hyp, "weather_save_dir") or "")
+    dataset.weather_keep = online_aug_on and bool(_hyp_get(hyp, "weather_keep"))
+    dataset.weather_ratio = float(_hyp_get(hyp, "weather_ratio"))
+    dataset.weather_types = str(_hyp_get(hyp, "weather_types") or "rain,haze,noise")
+    dataset.weather_rain_density = float(_hyp_get(hyp, "weather_rain_density"))
+    dataset.weather_rain_length = float(_hyp_get(hyp, "weather_rain_length"))
+    dataset.weather_haze_beta = float(_hyp_get(hyp, "weather_haze_beta"))
+    dataset.weather_noise_std = float(_hyp_get(hyp, "weather_noise_std"))
+    dataset.weather_save_dir = str(_hyp_get(hyp, "weather_save_dir") or "")
     # ---- 在线遮挡模拟 (occlusion_*): rect/stripe 语义遮挡块, 标签不变(超阈值目标剔除), 独立开关 + epoch 比例 ----
-    dataset.occlusion_keep = online_aug_on and bool(getattr(hyp, "occlusion_keep"))
-    dataset.occlusion_ratio = float(getattr(hyp, "occlusion_ratio"))
-    dataset.occlusion_types = str(getattr(hyp, "occlusion_types") or "rect,stripe")
-    dataset.occlusion_blocks = int(getattr(hyp, "occlusion_blocks") or 1)
-    dataset.occlusion_size_ratio = float(getattr(hyp, "occlusion_size_ratio"))
-    dataset.occlusion_color = str(getattr(hyp, "occlusion_color") or "auto")
-    dataset.occlusion_max_cover = float(getattr(hyp, "occlusion_max_cover"))
-    dataset.occlusion_save_dir = str(getattr(hyp, "occlusion_save_dir") or "")
+    dataset.occlusion_keep = online_aug_on and bool(_hyp_get(hyp, "occlusion_keep"))
+    dataset.occlusion_ratio = float(_hyp_get(hyp, "occlusion_ratio"))
+    dataset.occlusion_types = str(_hyp_get(hyp, "occlusion_types") or "rect,stripe")
+    dataset.occlusion_blocks = int(_hyp_get(hyp, "occlusion_blocks") or 1)
+    dataset.occlusion_size_ratio = float(_hyp_get(hyp, "occlusion_size_ratio"))
+    dataset.occlusion_color = str(_hyp_get(hyp, "occlusion_color") or "auto")
+    dataset.occlusion_max_cover = float(_hyp_get(hyp, "occlusion_max_cover"))
+    dataset.occlusion_save_dir = str(_hyp_get(hyp, "occlusion_save_dir") or "")
     # weather/occlusion 类型白名单校验 (拼错立即在构造期报错, 不再静默落入默认分支)。
     # 常量在模块顶层直接取自 online_degrade —— 与 _apply_weather / _apply_occlusion 的分派同源, 单一真源。
     # 不要改回 `from ultralytics.data.base import ...`: base.py 自己一次都不用这两个名字, 那样就是隐式
     # re-export, Ruff F401 一次 --fix (或 IDE 优化导入) 就会删掉 base 里那两行, 校验随之静默消失,
-    # 拼错退化成运行时随机兜底 —— 正是 M-2 记录的那个陷阱。
+    # 拼错退化成运行时随机兜底 —— 类型白名单校验防的正是这个陷阱。
     # 空串回退默认类型 (与 base.py 运行时行为一致)。
 
     _w = [t.strip() for t in dataset.weather_types.split(",") if t.strip()]
@@ -3497,18 +3609,17 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
             f"occlusion_types contains unknown type(s) {_bad}; valid types: {sorted(_OCCLUSION_TYPES)}."
         )
     dataset.occlusion_types = ",".join(_o) if _o else "rect"
-    # per-branch save cap overrides (slice_save_max_{tile,blur,ratio,compose}).
+    # per-branch save cap overrides (slice_save_max_{blur,ratio,compose,weather,occlusion}).
     # base.py's _save_cap() reads these from `self`; if not set here it falls back to slice_save_max.
-    # Keep tile in sync with the legacy `save_max` passed to OnlineSlice above.
-    dataset.slice_save_max_tile = getattr(hyp, "slice_save_max_tile")
-    dataset.slice_save_max_blur = getattr(hyp, "slice_save_max_blur")
-    dataset.slice_save_max_ratio = getattr(hyp, "slice_save_max_ratio")
-    dataset.slice_save_max_compose = getattr(hyp, "slice_save_max_compose")
-    dataset.slice_save_max_weather = getattr(hyp, "slice_save_max_weather")
-    dataset.slice_save_max_occlusion = getattr(hyp, "slice_save_max_occlusion")
+    # tile is deliberately NOT listed: its cap lives on the OnlineSlice instance (save_max above).
+    dataset.slice_save_max_blur = _hyp_get(hyp, "slice_save_max_blur")
+    dataset.slice_save_max_ratio = _hyp_get(hyp, "slice_save_max_ratio")
+    dataset.slice_save_max_compose = _hyp_get(hyp, "slice_save_max_compose")
+    dataset.slice_save_max_weather = _hyp_get(hyp, "slice_save_max_weather")
+    dataset.slice_save_max_occlusion = _hyp_get(hyp, "slice_save_max_occlusion")
     # 全局画框开关与切片解耦 —— 各在线分支 (blur/ratio/weather/occlusion/compose) 的保存块
     # 统一只读 dataset 属性, 不再依赖 slice_transform 实例 (slice_transform=None 时亦可保存)。
-    dataset.slice_save_annotated = bool(getattr(hyp, "slice_save_annotated"))
+    dataset.slice_save_annotated = bool(_hyp_get(hyp, "slice_save_annotated"))
 
     if hyp.copy_paste_mode == "flip":
         pre_transform.insert(1, CopyPaste(dataset, p=hyp.copy_paste, mode=hyp.copy_paste_mode))
@@ -3535,7 +3646,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
             pre_transform,
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
-            Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None), flip_idx=flip_idx),
+            Albumentations(p=1.0, transforms=_hyp_get(hyp, "augmentations", None), flip_idx=flip_idx),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),

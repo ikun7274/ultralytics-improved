@@ -18,7 +18,7 @@ from PIL import Image
 from torch.utils.data import Dataset, dataloader, distributed
 
 from ultralytics.cfg import IterableSimpleNamespace
-from ultralytics.data.base import GroupedImageSampler
+from ultralytics.data.base import GroupedImageSampler, _online_default
 from ultralytics.data.dataset import (
     DepthDataset,
     GroundingDataset,
@@ -384,7 +384,7 @@ def build_dataloader(
     # 项目说明.md recommends lowering it to 1 to halve the in-flight batches when online
     # augmentation is on -- which previously required editing this file. ``None`` when there are
     # no workers, because PyTorch rejects prefetch_factor together with num_workers=0.
-    prefetch_factor = max(1, int(getattr(dataset, "prefetch_factor", 2) or 2))
+    prefetch_factor = max(1, int(getattr(dataset, "prefetch_factor", _online_default("prefetch_factor")) or 2))
     return InfiniteDataLoader(
         dataset=dataset,
         batch_size=batch,

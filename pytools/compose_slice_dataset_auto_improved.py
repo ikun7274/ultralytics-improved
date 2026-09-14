@@ -25,7 +25,7 @@ def parse_yolo_label(txt_path):
     anns = []
     if not Path(txt_path).exists():
         return anns
-    with open(txt_path, 'r') as f:
+    with open(txt_path, 'r', encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -43,7 +43,7 @@ def parse_yolo_label(txt_path):
 
 
 def write_yolo_label(txt_path, anns):
-    with open(txt_path, 'w') as f:
+    with open(txt_path, 'w', encoding="utf-8") as f:
         for cls_id, xc, yc, w, h in anns:
             f.write(f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
 
@@ -61,7 +61,7 @@ def stitch_group(img_paths, label_paths, output_img_path, output_txt_path):
     cols = (n + rows - 1) // rows
     while rows * cols < n:
         rows += 1
-    # P1-10: 用 with 上下文读图, 防止 Windows 下文件句柄泄漏 (Image.open 不会自己 close)
+    # 用 with 上下文读图, 防止 Windows 下文件句柄泄漏 (Image.open 不会自己 close)
     imgs: list[Image.Image] = []
     try:
         for p in img_paths:
@@ -86,7 +86,7 @@ def stitch_group(img_paths, label_paths, output_img_path, output_txt_path):
 
     W_big = W_sub * cols
     H_big = H_sub * rows
-    # P1-10: 灰度/RGBA 图也能合成 — 用 'RGBA' / 'LA' 模式, 但统一可视化仍按 RGB
+    # 灰度/RGBA 图也能合成 — 用 'RGBA' / 'LA' 模式, 但统一可视化仍按 RGB
     base_mode = imgs[0].mode
     if base_mode in ("L", "1"):  # 灰度
         big_img = Image.new("L", (W_big, H_big))
