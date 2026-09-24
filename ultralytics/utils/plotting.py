@@ -401,10 +401,9 @@ class Annotator:
         """
         if color in self.dark_colors:
             return 104, 31, 17
-        elif color in self.light_colors:
+        if color in self.light_colors:
             return 255, 255, 255
-        else:
-            return txt_color
+        return txt_color
 
     def box_label(self, box, label: str = "", color: tuple = (128, 128, 128), txt_color: tuple = (255, 255, 255)):
         """Draw a bounding box on an image with a given label.
@@ -882,7 +881,7 @@ def plot_images(
     cls = labels.get("cls", np.zeros(0, dtype=np.int64))
     batch_idx = labels.get("batch_idx", np.zeros(cls.shape, dtype=np.int64))
     bboxes = labels.get("bboxes", np.zeros(0, dtype=np.float32))
-    confs = labels.get("conf", None)
+    confs = labels.get("conf")
     masks = labels.get("masks", np.zeros(0, dtype=np.uint8))
     kpts = labels.get("keypoints", np.zeros(0, dtype=np.float32))
     semantic_masks = labels.get("semantic_mask", np.zeros(0, dtype=np.int64))
@@ -999,12 +998,10 @@ def plot_images(
                             mask = mask.astype(bool)
                         else:
                             mask = image_masks[j].astype(bool)
-                        try:
+                        with contextlib.suppress(Exception):
                             im[y : y + h, x : x + w, :][mask] = (
                                 im[y : y + h, x : x + w, :][mask] * 0.4 + np.array(color) * 0.6
                             )
-                        except Exception:
-                            pass
                 annotator.fromarray(im)
 
         # Plot semantic masks
@@ -1041,6 +1038,7 @@ def plot_images(
     annotator.im.save(fname)  # save
     if on_plot:
         on_plot(fname)
+    return None
 
 
 @plt_settings()

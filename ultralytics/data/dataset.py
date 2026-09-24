@@ -745,7 +745,7 @@ class GroundingDataset(YOLODataset):
                         x1, y1, x2, y2 = cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2
                         segments.append([cls, x1, y1, x2, y1, x2, y2, x1, y2])  # segments2boxes returns the box
                         continue
-                    elif len(polygons) > 1:
+                    if len(polygons) > 1:
                         s = merge_multi_segment(polygons)
                         s = (np.concatenate(s, axis=0) / np.array([w, h], dtype=np.float32)).reshape(-1).tolist()
                     else:

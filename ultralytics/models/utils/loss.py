@@ -244,7 +244,7 @@ class DETRLoss(nn.Module):
             #     loss[3] += loss_[f'loss_mask{postfix}']
             #     loss[4] += loss_[f'loss_dice{postfix}']
 
-        loss = {
+        return {
             f"loss_class_aux{postfix}": loss[0],
             f"loss_bbox_aux{postfix}": loss[1],
             f"loss_giou_aux{postfix}": loss[2],
@@ -252,7 +252,6 @@ class DETRLoss(nn.Module):
         # if masks is not None and gt_mask is not None:
         #     loss[f'loss_mask_aux{postfix}'] = loss[3]
         #     loss[f'loss_dice_aux{postfix}'] = loss[4]
-        return loss
 
     @staticmethod
     def _get_index(match_indices: list[tuple]) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
@@ -373,7 +372,7 @@ class DETRLoss(nn.Module):
             self.aux_loss is True.
         """
         self.device = pred_bboxes.device
-        match_indices = kwargs.get("match_indices", None)
+        match_indices = kwargs.get("match_indices")
         gt_cls, gt_bboxes, gt_groups = batch["cls"], batch["bboxes"], batch["gt_groups"]
 
         total_loss = self._get_loss(

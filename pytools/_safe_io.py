@@ -1,4 +1,4 @@
-"""pytools 共享的路径安全工具：删目录护栏 + 目录参数校验。
+"""pytools 共享的路径安全工具：删目录护栏 + 目录参数校验。.
 
 背景
 ----
@@ -41,11 +41,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class UnsafePathError(RuntimeError):
-    """待删除路径命中安全护栏。"""
+    """待删除路径命中安全护栏。."""
 
 
 def _iter_forbidden() -> dict[Path, str]:
-    """返回 {禁止路径: 原因}。cwd 可能在运行期变化，故每次调用重新计算。"""
+    """返回 {禁止路径: 原因}。cwd 可能在运行期变化，故每次调用重新计算。."""
     forbidden: dict[Path, str] = {}
 
     def add(path, reason: str) -> None:
@@ -66,10 +66,9 @@ def _iter_forbidden() -> dict[Path, str]:
 
 
 def assert_deletable(path, description="目录") -> Path:
-    """若 ``path`` 命中护栏则抛 :class:`UnsafePathError`，否则返回其绝对路径。
+    """若 ``path`` 命中护栏则抛 :class:`UnsafePathError`，否则返回其绝对路径。.
 
-    注意：本函数只做安全检查，不关心路径是否存在（存在性由调用方决定），
-    因此也能用于「删除前尚未创建」的输出目录校验。
+    注意：本函数只做安全检查，不关心路径是否存在（存在性由调用方决定）， 因此也能用于「删除前尚未创建」的输出目录校验。
     """
     try:
         resolved = Path(path).expanduser().resolve()
@@ -86,7 +85,7 @@ def assert_deletable(path, description="目录") -> Path:
 
 
 def require_nonempty(values: dict) -> None:
-    """给定「参数名 -> 值」必须全部非空（非 ``None`` 且非空白串），否则 :class:`SystemExit`。
+    """给定「参数名 -> 值」必须全部非空（非 ``None`` 且非空白串），否则 :class:`SystemExit`。.
 
     专治 ``Path("")``：它看着像「没传」，实际等价于 ``Path(".")``，即当前工作目录。
     """
@@ -99,7 +98,7 @@ def require_nonempty(values: dict) -> None:
 
 
 def safe_rmtree(path, description="目录") -> bool:
-    """带护栏地删除目录；目录不存在时直接返回 ``False``。"""
+    """带护栏地删除目录；目录不存在时直接返回 ``False``。."""
     resolved = assert_deletable(path, description)
     if not resolved.exists():
         return False
@@ -119,7 +118,7 @@ def validate_io_dirs(
     input_description="输入目录（--input_dir）",
     output_description="输出目录（--output_dir）",
 ) -> tuple[Path, Path]:
-    """校验一对输入/输出目录，返回 ``(input_path, output_path)`` 两个绝对路径。
+    """校验一对输入/输出目录，返回 ``(input_path, output_path)`` 两个绝对路径。.
 
     规则：
 

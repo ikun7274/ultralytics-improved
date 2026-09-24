@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import sys
@@ -188,11 +189,10 @@ class TQDM:
         """Format time duration."""
         if seconds < 60:
             return f"{seconds:.1f}s"
-        elif seconds < 3600:
+        if seconds < 3600:
             return f"{int(seconds // 60)}:{seconds % 60:02.0f}"
-        else:
-            h, m = int(seconds // 3600), int((seconds % 3600) // 60)
-            return f"{h}:{m:02d}:{seconds % 60:02.0f}"
+        h, m = int(seconds // 3600), int((seconds % 3600) // 60)
+        return f"{h}:{m:02d}:{seconds % 60:02.0f}"
 
     def _generate_bar(self, width: int = 12) -> str:
         """Generate progress bar."""
@@ -358,10 +358,8 @@ class TQDM:
             else:
                 self.file.write("\r\033[K")
 
-            try:
+            with contextlib.suppress(Exception):
                 self.file.flush()
-            except Exception:
-                pass
 
     def __enter__(self) -> Self:
         """Enter context manager."""
@@ -385,10 +383,8 @@ class TQDM:
 
     def __del__(self) -> None:
         """Destructor to ensure cleanup."""
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
     def refresh(self) -> None:
         """Refresh display."""
@@ -455,7 +451,7 @@ if __name__ == "__main__":
         for i in range(random.randint(10, 20)):
             yield f"data_chunk_{i}"
 
-    for chunk in TQDM(data_stream(), desc="Stream processing", unit="chunks"):
+    for _chunk in TQDM(data_stream(), desc="Stream processing", unit="chunks"):
         time.sleep(0.1)
 
     print("\n6. File processing simulation (unknown size):")

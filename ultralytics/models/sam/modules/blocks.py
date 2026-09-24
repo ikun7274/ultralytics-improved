@@ -206,8 +206,7 @@ class CXBlock(nn.Module):
             x = self.gamma * x
         x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
 
-        x = input + self.drop_path(x)
-        return x
+        return input + self.drop_path(x)
 
 
 class Fuser(nn.Module):
@@ -449,9 +448,7 @@ class RoPEAttention(Attention):
         out = F.scaled_dot_product_attention(q, k, v)
 
         out = self._recombine_heads(out)
-        out = self.out_proj(out)
-
-        return out
+        return self.out_proj(out)
 
 
 def do_pool(x: torch.Tensor, pool: nn.Module, norm: nn.Module = None) -> torch.Tensor:
@@ -543,9 +540,7 @@ class MultiScaleAttention(nn.Module):
         x = x.transpose(1, 2)
         x = x.reshape(B, H, W, -1)
 
-        x = self.proj(x)
-
-        return x
+        return self.proj(x)
 
 
 class MultiScaleBlock(nn.Module):
@@ -658,8 +653,7 @@ class MultiScaleBlock(nn.Module):
 
         x = shortcut + self.drop_path(x)
         # MLP
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
+        return x + self.drop_path(self.mlp(self.norm2(x)))
 
 
 class PositionEmbeddingSine(nn.Module):

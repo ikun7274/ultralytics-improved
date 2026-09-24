@@ -254,10 +254,7 @@ def build_yolo_dataset(
         pad, rect = 0.0, rect and mode == "train"  # depth val letterbox stretches, so pad and rect_shape are ignored
     elif cfg.task == "semantic":
         data_path = Path(data.get("path", ""))
-        if "masks_dir" in data or (data_path / "masks").exists():
-            dataset = SemanticDataset
-        else:
-            dataset = PolygonSemanticDataset
+        dataset = SemanticDataset if "masks_dir" in data or (data_path / "masks").exists() else PolygonSemanticDataset
         pad = 0.0  # no pad for semantic
     elif multi_modal:
         dataset = YOLOMultiModalDataset
