@@ -139,8 +139,7 @@ class Predictor(BasePredictor):
         im = im.to(self.device)
         if not_tensor:
             im = (im - self.mean) / self.std
-        im = im.half() if self.model.fp16 else im.float()
-        return im
+        return im.half() if self.model.fp16 else im.float()
 
     def pre_transform(self, im):
         """Perform initial transformations on the input image for preprocessing.
@@ -1214,7 +1213,7 @@ class SAM2VideoPredictor(SAM2Predictor):
         Args:
             num_frames (int): The number of frames in the video.
         """
-        inference_state = {
+        return {
             "num_frames": num_frames,  # TODO: see if there's any chance to remove it
             "point_inputs_per_obj": {},  # inputs points on each frame
             "mask_inputs_per_obj": {},  # inputs mask on each frame
@@ -1243,7 +1242,6 @@ class SAM2VideoPredictor(SAM2Predictor):
             "tracking_has_started": False,
             "frames_already_tracked": [],
         }
-        return inference_state
 
     def get_im_features(self, im, batch=1):
         """Extract and process image features using SAM2's image encoder for subsequent segmentation tasks.
@@ -1315,12 +1313,11 @@ class SAM2VideoPredictor(SAM2Predictor):
                 "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
             }
             return obj_idx
-        else:
-            raise RuntimeError(
-                f"Cannot add new object id {obj_id} after tracking starts. "
-                f"All existing object ids: {inference_state['obj_ids']}. "
-                f"Please call 'reset_state' to restart from scratch."
-            )
+        raise RuntimeError(
+            f"Cannot add new object id {obj_id} after tracking starts. "
+            f"All existing object ids: {inference_state['obj_ids']}. "
+            f"Please call 'reset_state' to restart from scratch."
+        )
 
     def _run_single_frame_inference(
         self,
@@ -2296,12 +2293,11 @@ class SAM3SemanticPredictor(SAM3Predictor):
                 text = ["visual"]  # bboxes needs this `visual` text prompt if no text passed
         if text is not None and self.model.names != text:
             self.model.set_classes(text=text)
-        outputs = self.model.forward_grounding(
+        return self.model.forward_grounding(
             backbone_out=features,
             text_ids=torch.arange(nc, device=self.device, dtype=torch.long),
             geometric_prompt=geometric_prompt,
         )
-        return outputs
 
     def postprocess(self, preds, img, orig_imgs):
         """Post-process the predictions to apply non-overlapping constraints if required."""
@@ -2429,11 +2425,10 @@ class SAM3SemanticPredictor(SAM3Predictor):
         # Scoped for import ultralytics speed: SAM3 geometry imports optional torchvision ops.
         from .sam3.geometry_encoders import Prompt
 
-        geometric_prompt = Prompt(
+        return Prompt(
             box_embeddings=torch.zeros(0, num_prompts, 4, device=self.device),
             box_mask=torch.zeros(num_prompts, 0, device=self.device, dtype=torch.bool),
         )
-        return geometric_prompt
 
 
 class SAM3VideoPredictor(SAM2VideoPredictor, SAM3Predictor):
@@ -2800,12 +2795,11 @@ class SAM3VideoSemanticPredictor(SAM3SemanticPredictor):
             pred_masks_single_score
         )
         # Replace object scores with pixel scores. Note, that now only one object can claim the overlapping region
-        pred_masks = torch.where(
+        return torch.where(
             pixel_level_non_overlapping_masks > 0,
             pred_masks,
             torch.clamp(pred_masks, max=background_value),
         )
-        return pred_masks
 
     def _det_track_one_frame(
         self,
@@ -2924,9 +2918,7 @@ class SAM3VideoSemanticPredictor(SAM3SemanticPredictor):
         x_min, y_min, x_max, y_max = boxes.unbind(-1)
         x_c = (x_min + x_max) / 2
         y_c = (y_min + y_max) / 2
-        keep = (x_c > margin) & (x_c < 1.0 - margin) & (y_c > margin) & (y_c < 1.0 - margin)
-
-        return keep
+        return (x_c > margin) & (x_c < 1.0 - margin) & (y_c > margin) & (y_c < 1.0 - margin)
 
     def run_backbone_and_detection(
         self, im: torch.Tensor, text_ids: torch.Tensor, geometric_prompt: Prompt, allow_new_detections: bool
@@ -3546,7 +3538,7 @@ class SAM3VideoSemanticPredictor(SAM3SemanticPredictor):
                 trk_id_to_max_iou_high_conf_det,
                 empty_trk_obj_ids,
             )
-        elif det_masks.size(0) == 0:
+        if det_masks.size(0) == 0:
             # all previous tracklets are unmatched if they have a non-zero area
             new_det_fa_inds = np.array([], np.int64)
             trk_is_nonempty = (trk_masks > 0).any(dim=(1, 2)).cpu().numpy()
@@ -3791,7 +3783,7 @@ class SAM3VideoSemanticPredictor(SAM3SemanticPredictor):
                 if frame_idx not in output_dict[storage_key]:
                     continue
                 output_dict[storage_key][frame_idx]["maskmem_features"] = local_maskmem_features
-                output_dict[storage_key][frame_idx]["maskmem_pos_enc"] = [pos for pos in local_maskmem_pos_enc]
+                output_dict[storage_key][frame_idx]["maskmem_pos_enc"] = list(local_maskmem_pos_enc)
                 # for batched inference state, we also need to add per-object
                 # memory slides to support instance interactivity
                 self.tracker._add_output_per_object(
@@ -3972,5 +3964,4 @@ class SAM3VideoSemanticPredictor(SAM3SemanticPredictor):
 
         # keep the top-scoring detections
         score_order = np.argsort(det_scores_np[new_det_fa_inds])[::-1]
-        new_det_fa_inds = new_det_fa_inds[score_order[:num_to_keep]]
-        return new_det_fa_inds
+        return new_det_fa_inds[score_order[:num_to_keep]]

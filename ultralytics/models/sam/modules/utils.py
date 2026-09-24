@@ -83,8 +83,7 @@ def get_1d_sine_pe(pos_inds: torch.Tensor, dim: int, temperature: float = 10000)
     dim_t = temperature ** (2 * (dim_t // 2) / pe_dim)
 
     pos_embed = pos_inds.unsqueeze(-1) / dim_t
-    pos_embed = torch.cat([pos_embed.sin(), pos_embed.cos()], dim=-1)
-    return pos_embed
+    return torch.cat([pos_embed.sin(), pos_embed.cos()], dim=-1)
 
 
 def init_t_xy(end_x: int, end_y: int, scale: float = 1.0, offset: int = 0):
@@ -379,11 +378,9 @@ def add_decomposed_rel_pos(
     rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
 
-    attn = (attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]).view(
+    return (attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]).view(
         B, q_h * q_w, k_h * k_w
     )
-
-    return attn
 
 
 def get_abs_pos(
@@ -435,20 +432,17 @@ def get_abs_pos(
 
         if not retain_cls_token:
             return new_abs_pos.permute(0, 2, 3, 1)
-        else:
-            # add cls_token back, flatten spatial dims
-            assert has_cls_token
-            return torch.cat(
-                [cls_pos, new_abs_pos.permute(0, 2, 3, 1).reshape(1, h * w, -1)],
-                dim=1,
-            )
+        # add cls_token back, flatten spatial dims
+        assert has_cls_token
+        return torch.cat(
+            [cls_pos, new_abs_pos.permute(0, 2, 3, 1).reshape(1, h * w, -1)],
+            dim=1,
+        )
 
-    else:
-        if not retain_cls_token:
-            return abs_pos.reshape(1, h, w, -1)
-        else:
-            assert has_cls_token
-            return torch.cat([cls_pos, abs_pos], dim=1)
+    if not retain_cls_token:
+        return abs_pos.reshape(1, h, w, -1)
+    assert has_cls_token
+    return torch.cat([cls_pos, abs_pos], dim=1)
 
 
 def concat_rel_pos(

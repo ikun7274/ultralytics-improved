@@ -526,7 +526,7 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                             )
                         continue
                     continue
-                elif not isinstance(v, FLOAT_OR_INT):
+                if not isinstance(v, FLOAT_OR_INT):
                     if hard:
                         raise TypeError(
                             f"'{k}={v}' is of invalid type {type(v).__name__}. "
@@ -773,11 +773,11 @@ def merge_equals_args(args: list[str]) -> list[str]:
             new_args[-1] += f"={args[i + 1]}"
             i += 2
             continue
-        elif arg.endswith("=") and i < len(args) - 1 and "=" not in args[i + 1]:  # merge ['arg=', 'val']
+        if arg.endswith("=") and i < len(args) - 1 and "=" not in args[i + 1]:  # merge ['arg=', 'val']
             new_args.append(f"{arg}{args[i + 1]}")
             i += 2
             continue
-        elif arg.startswith("=") and i > 0:  # merge ['arg', '=val']
+        if arg.startswith("=") and i > 0:  # merge ['arg', '=val']
             new_args[-1] += arg
             i += 1
             continue
@@ -924,7 +924,7 @@ def handle_yolo_solutions(args: list[str]) -> None:
     if args[0] == "help":
         LOGGER.info(SOLUTIONS_HELP_MSG)
         return  # Early return for 'help' case
-    elif args[0] in SOLUTION_MAP:
+    if args[0] in SOLUTION_MAP:
         solution_name = args.pop(0)  # Extract the solution name directly
     else:
         LOGGER.warning(
@@ -1047,20 +1047,19 @@ def smart_value(v: str) -> Any:
     v_lower = v.lower()
     if v_lower == "none":
         return None
-    elif v_lower == "true":
+    if v_lower == "true":
         return True
-    elif v_lower == "false":
+    if v_lower == "false":
         return False
-    else:
-        try:
-            return ast.literal_eval(v)
-        except Exception:
-            name, _, attr = v.rpartition(".")
-            if (module := sys.modules.get(name)) and attr.isupper():
-                value = getattr(module, attr, None)
-                if isinstance(value, (int, float)):
-                    return value
-            return v
+    try:
+        return ast.literal_eval(v)
+    except Exception:
+        name, _, attr = v.rpartition(".")
+        if (module := sys.modules.get(name)) and attr.isupper():
+            value = getattr(module, attr, None)
+            if isinstance(value, (int, float)):
+                return value
+        return v
 
 
 def entrypoint(debug: str = "") -> None:
@@ -1103,7 +1102,7 @@ def entrypoint(debug: str = "") -> None:
         "solutions": lambda: handle_yolo_solutions(args[1:]),
         "help": lambda: LOGGER.info(CLI_HELP_MSG),
     }
-    full_args_dict = {**DEFAULT_CFG_DICT, **{k: None for k in TASKS}, **{k: None for k in MODES}, **special}
+    full_args_dict = {**DEFAULT_CFG_DICT, **dict.fromkeys(TASKS), **dict.fromkeys(MODES), **special}
 
     # Define common misuses of special commands, i.e. -h, -help, --help
     special.update({k[0]: v for k, v in special.items()})  # singular

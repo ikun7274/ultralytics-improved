@@ -1,5 +1,5 @@
 """
-修补 YOLO checkpoint 元数据以延长训练（针对早停/中断导致的提前终止）。
+修补 YOLO checkpoint 元数据以延长训练（针对早停/中断导致的提前终止）。.
 
 背景：Ultralytics 在训练启动时把 epochs / patience 写入 checkpoint 元数据（train_args 或 args），
 resume 时优先读 checkpoint 内存档配置，所以单纯改 epochs 参数无效，必须直接修补 last.pt。
@@ -20,11 +20,10 @@ import torch
 
 
 def detect_finished_epoch(ckpt: dict) -> int:
-    """从 checkpoint 中检测实际已完成的 epoch 数（兼容 train_args / args 两种 key）。
+    """从 checkpoint 中检测实际已完成的 epoch 数（兼容 train_args / args 两种 key）。.
 
     - checkpoint 的 'epoch' 字段是 0-indexed，表示"下一轮"的索引：
-      中断(手动停止/报错) → epoch >= 0 → 已完成 = epoch + 1
-      正常跑完原 epochs  → epoch 缺失或为 -1 → 已完成 = 原 epochs
+    中断(手动停止/报错) → epoch >= 0 → 已完成 = epoch + 1 正常跑完原 epochs → epoch 缺失或为 -1 → 已完成 = 原 epochs
     """
     original_epochs = None
     for key in ("train_args", "args"):
@@ -38,12 +37,12 @@ def detect_finished_epoch(ckpt: dict) -> int:
     if current_epoch is not None and current_epoch >= 0:
         return int(current_epoch) + 1  # 中断
     if original_epochs is not None:
-        return int(original_epochs)    # 正常结束
+        return int(original_epochs)  # 正常结束
     raise ValueError("无法从 Checkpoint 中检测已完成的 Epoch 数。")
 
 
 def backup_with_timestamp(src: Path, backup_dir: Path) -> Path:
-    """按时间戳备份 checkpoint（多次备份不会互相覆盖），返回备份文件路径。"""
+    """按时间戳备份 checkpoint（多次备份不会互相覆盖），返回备份文件路径。."""
     backup_dir = Path(backup_dir)
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -61,7 +60,7 @@ def fix_checkpoint_for_extension(
     save_as=None,
     dry_run=False,
 ):
-    """修补 YOLO checkpoint 元数据以延长训练。
+    """修补 YOLO checkpoint 元数据以延长训练。.
 
     Args:
         ckpt_path (str | Path): last.pt 的路径。
@@ -73,8 +72,7 @@ def fix_checkpoint_for_extension(
         dry_run (bool): True 时只打印将执行的修改，不备份、不保存。
 
     Returns:
-        dict: 修补结果摘要 {finished_epoch, new_epochs, new_patience, ckpt_path,
-                             backup_path, saved_path}。
+        dict: 修补结果摘要 {finished_epoch, new_epochs, new_patience, ckpt_path, backup_path, saved_path}。
     """
     ckpt_path = Path(ckpt_path)
     if not ckpt_path.exists():
@@ -106,8 +104,8 @@ def fix_checkpoint_for_extension(
             args["epochs"] = new_total_epochs
             args["patience"] = new_patience
         else:
-            setattr(args, "epochs", new_total_epochs)
-            setattr(args, "patience", new_patience)
+            args.epochs = new_total_epochs
+            args.patience = new_patience
 
     target = Path(save_as) if save_as else ckpt_path
 
@@ -175,11 +173,9 @@ def fix_checkpoint_for_extension(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="修补 YOLO checkpoint 元数据以延长训练（针对早停/中断提前终止）。"
-    )
+    parser = argparse.ArgumentParser(description="修补 YOLO checkpoint 元数据以延长训练（针对早停/中断提前终止）。")
     parser.add_argument("--ckpt", help="last.pt 的路径（必传; 例: <项目根>/runs/<exp>/weights/last.pt）", default="")
-    parser.add_argument("--epochs", type=int, help="新的总训练轮数（必须大于已完成轮数）",default=400)
+    parser.add_argument("--epochs", type=int, help="新的总训练轮数（必须大于已完成轮数）", default=400)
     parser.add_argument("--patience", type=int, default=20, help="新的早停耐心值（默认 20）")
     parser.add_argument("--no-backup", action="store_true", help="跳过时间戳备份（默认会备份）")
     parser.add_argument("--backup-dir", default=None, help="备份目录（默认与 ckpt 同目录）")

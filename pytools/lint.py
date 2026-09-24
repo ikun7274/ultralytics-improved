@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""提交前自查：在仓库内以「与 CI 一致的口径」跑 Ruff。
+"""提交前自查：在仓库内以「与 CI 一致的口径」跑 Ruff。.
 
 = 为什么需要它（代码审查报告 M-6）=
 
@@ -43,8 +43,9 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / "pyproject.toml"
@@ -61,15 +62,14 @@ _FORMAT_PATH = re.compile(r"^\s*--> (.+?):\d+:\d+", re.MULTILINE)
 
 
 def _digits(text: object) -> str:
-    """把 ``py38`` / ``3.8`` 归一成 ``38``：Ruff 打印 ``3.8`` 而 pyproject 写 ``py38``。"""
+    """把 ``py38`` / ``3.8`` 归一成 ``38``：Ruff 打印 ``3.8`` 而 pyproject 写 ``py38``。."""
     return re.sub(r"\D", "", str(text))
 
 
 def ruff_path(explicit: str | None = None) -> Path:
-    """定位 Ruff 可执行文件；找不到时 :class:`SystemExit`（**绝不静默跳过**）。
+    """定位 Ruff 可执行文件；找不到时 :class:`SystemExit`（**绝不静默跳过**）。.
 
-    ``--ruff`` / 环境变量 ``RUFF`` 属**用户显式指定**：指向不存在的文件时直接报错，
-    不再回落到 PATH —— 否则"我明明指了路径"会静默变成"用了另一份 ruff"，口径又不可知。
+    ``--ruff`` / 环境变量 ``RUFF`` 属**用户显式指定**：指向不存在的文件时直接报错， 不再回落到 PATH —— 否则"我明明指了路径"会静默变成"用了另一份 ruff"，口径又不可知。
     """
     for source, raw in (("--ruff", explicit), ("环境变量 RUFF", os.environ.get("RUFF"))):
         if raw:
@@ -92,7 +92,7 @@ def ruff_path(explicit: str | None = None) -> Path:
 
 
 def _run(ruff: Path, args: list[str]) -> subprocess.CompletedProcess:
-    """在仓库根执行 ruff 并捕获输出（打印完整命令，便于复现）。"""
+    """在仓库根执行 ruff 并捕获输出（打印完整命令，便于复现）。."""
     cmd = [str(ruff), *args]
     print(f"\n$ {shlex.join(cmd)}")
     return subprocess.run(
@@ -107,7 +107,7 @@ def _run(ruff: Path, args: list[str]) -> subprocess.CompletedProcess:
 
 
 def config_expectations() -> dict:
-    """读仓库根 ``pyproject.toml`` 里**我们希望生效**的值（唯一真源，不在此另抄一份）。"""
+    """读仓库根 ``pyproject.toml`` 里**我们希望生效**的值（唯一真源，不在此另抄一份）。."""
     with CONFIG_PATH.open("rb") as handle:
         data = tomllib.load(handle)
     ruff_cfg = data.get("tool", {}).get("ruff", {})
@@ -121,7 +121,7 @@ def config_expectations() -> dict:
 
 
 def resolved_settings(ruff: Path) -> dict[str, str]:
-    """Ruff **实际生效**的关键设置 —— M-6 那类静默分叉的守卫。"""
+    """Ruff **实际生效**的关键设置 —— M-6 那类静默分叉的守卫。."""
     proc = _run(ruff, ["check", "--no-cache", "--show-settings", "pytools/lint.py"])
     found: dict[str, str] = {}
     for key in _FINGERPRINT_KEYS:
@@ -132,7 +132,7 @@ def resolved_settings(ruff: Path) -> dict[str, str]:
 
 
 def show_fingerprint(ruff: Path) -> bool:
-    """打印口径指纹并与 pyproject.toml 对照；返回 ``True`` 表示两者一致。"""
+    """打印口径指纹并与 pyproject.toml 对照；返回 ``True`` 表示两者一致。."""
     expected = config_expectations()
     actual = resolved_settings(ruff)
     line = actual.get("linter.line_length", "<未解析到>")
@@ -149,7 +149,7 @@ def show_fingerprint(ruff: Path) -> bool:
 
 
 def _rule_counts(concise_stdout: str) -> dict[str, int]:
-    """把 concise 输出按规则码计数（自己数，不依赖 Ruff 汇总文案的措辞）。"""
+    """把 concise 输出按规则码计数（自己数，不依赖 Ruff 汇总文案的措辞）。."""
     counts: dict[str, int] = {}
     for line in concise_stdout.splitlines():
         match = _CONCISE_RULE.search(line)
@@ -160,7 +160,7 @@ def _rule_counts(concise_stdout: str) -> dict[str, int]:
 
 
 def _report_external_tools() -> None:
-    """docformatter / codespell 也在 CI 里跑；缺失时**明确说"已跳过"**而不是假装通过。"""
+    """Docformatter / codespell 也在 CI 里跑；缺失时**明确说"已跳过"**而不是假装通过。."""
     print("\n== CI 的其余步骤（本地可选）==")
     for tool in ("docformatter", "codespell"):
         exe = shutil.which(tool)
@@ -171,7 +171,7 @@ def _report_external_tools() -> None:
 
 
 def _apply_fix(ruff: Path) -> None:
-    """应用 Ruff 安全修复 + 格式化，并提醒复核。"""
+    """应用 Ruff 安全修复 + 格式化，并提醒复核。."""
     _run(ruff, ["check", "--no-cache", "--fix", "."])
     _run(ruff, ["format", "--no-cache", "."])
     print(

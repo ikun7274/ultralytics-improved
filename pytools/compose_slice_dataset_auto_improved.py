@@ -1,7 +1,6 @@
-import os
-import sys
 import argparse
 import random
+import sys
 from pathlib import Path
 
 # 共享的路径安全护栏（同目录 _safe_io.py）：直接运行 `python pytools/<脚本>.py` 时
@@ -9,11 +8,12 @@ from pathlib import Path
 _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-from _safe_io import safe_rmtree, validate_io_dirs  # noqa: E402
+import contextlib
+import math
 
+from _safe_io import safe_rmtree, validate_io_dirs  # noqa: E402
 from PIL import Image
 from tqdm import tqdm
-import math
 
 # Pillow >= 10 移除了 Image.LANCZOS, 改用 Image.Resampling.LANCZOS (旧版回退)
 _LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS", getattr(Image, "LANCZOS", None))
@@ -25,7 +25,7 @@ def parse_yolo_label(txt_path):
     anns = []
     if not Path(txt_path).exists():
         return anns
-    with open(txt_path, 'r', encoding="utf-8") as f:
+    with open(txt_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -43,15 +43,13 @@ def parse_yolo_label(txt_path):
 
 
 def write_yolo_label(txt_path, anns):
-    with open(txt_path, 'w', encoding="utf-8") as f:
+    with open(txt_path, "w", encoding="utf-8") as f:
         for cls_id, xc, yc, w, h in anns:
             f.write(f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
 
 
 def stitch_group(img_paths, label_paths, output_img_path, output_txt_path):
-    """
-    拼接一组图片（数量任意，但为了网格整齐，通常为 group_size），按顺序从左到右、从上到下排列。
-    自动计算行列。
+    """拼接一组图片（数量任意，但为了网格整齐，通常为 group_size），按顺序从左到右、从上到下排列。 自动计算行列。.
     """
     n = len(img_paths)
     if n == 0:
@@ -70,10 +68,8 @@ def stitch_group(img_paths, label_paths, output_img_path, output_txt_path):
                 imgs.append(im.copy())  # 拷贝一份, 让 .open 释放后仍可用
     except Exception:
         for im in imgs:
-            try:
+            with contextlib.suppress(Exception):
                 im.close()
-            except Exception:
-                pass
         raise
     widths = [img.width for img in imgs]
     heights = [img.height for img in imgs]
@@ -148,12 +144,10 @@ def stitch_group(img_paths, label_paths, output_img_path, output_txt_path):
 
 
 def get_image_groups(img_dir, labels_dir, group_size=4, random_fill=False):
+    """读取 img_dir 下所有图片文件，按文件名排序，每 group_size 个一组。 如果最后一组不足 group_size 且 random_fill=True，则从所有图片中随机选择（可重复）补足。 返回列表，每个元素为
+    (group_id, [img_paths], [label_paths]).
     """
-    读取 img_dir 下所有图片文件，按文件名排序，每 group_size 个一组。
-    如果最后一组不足 group_size 且 random_fill=True，则从所有图片中随机选择（可重复）补足。
-    返回列表，每个元素为 (group_id, [img_paths], [label_paths])
-    """
-    img_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     img_files = [f for f in Path(img_dir).iterdir() if f.suffix.lower() in img_exts]
     img_files.sort(key=lambda x: x.name)
     total = len(img_files)
@@ -176,7 +170,7 @@ def get_image_groups(img_dir, labels_dir, group_size=4, random_fill=False):
         # 对应的标签文件
         group_labels = []
         for img_p in group_imgs:
-            lbl_p = Path(labels_dir) / (img_p.stem + '.txt') if labels_dir else None
+            lbl_p = Path(labels_dir) / (img_p.stem + ".txt") if labels_dir else None
             group_labels.append(lbl_p)
         groups.append((gid, group_imgs, group_labels))
     return groups
@@ -186,24 +180,39 @@ def main():
     parser = argparse.ArgumentParser(
         description="按顺序将 images 目录中的图片每 group_size 张合成一组（网格），最后一组不足时可选随机补全"
     )
-    parser.add_argument("--input_dir", type=str, required=True,
-                        help="输入目录（必传），应包含 images/ 和 labels/ 子目录（切片后数据; 例: D:/datasets/base_0_0）")
-    parser.add_argument("--output_dir", type=str, required=True,
-                        help="输出目录（必传），将自动创建 images/ 和 labels/ 存放合成结果（例: D:/datasets/base_0_2）")
-    parser.add_argument("--img_suffix", type=str, default=".jpg",
-                        help="输出图片扩展名")
-    parser.add_argument("--overwrite", action="store_true",
-                        help="覆盖已存在的输出目录（默认关闭：输出目录已存在时报错退出，避免误删数据）")
-    parser.add_argument("--group_size", type=int, default=4,
-                        help="每组图片数，默认为4（2x2网格）")
-    parser.add_argument("--start_index", type=int, default=0,
-                        help="输出图片名称的起始编号")
-    parser.add_argument("--prefix", type=str, default="base_0_2",
-                        help="输出图片和标签的前缀名称，例如 prefix='myimg' 则输出 myimg_0000.jpg")
-    parser.add_argument("--random_fill", action="store_true", default=True,
-                        help="当最后一组图片不足 group_size 时，从所有图片中随机选择补全")
-    parser.add_argument("--seed", type=int, default=0,
-                        help="随机种子，用于可复现的补全")
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        required=True,
+        help="输入目录（必传），应包含 images/ 和 labels/ 子目录（切片后数据; 例: D:/datasets/base_0_0）",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="输出目录（必传），将自动创建 images/ 和 labels/ 存放合成结果（例: D:/datasets/base_0_2）",
+    )
+    parser.add_argument("--img_suffix", type=str, default=".jpg", help="输出图片扩展名")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="覆盖已存在的输出目录（默认关闭：输出目录已存在时报错退出，避免误删数据）",
+    )
+    parser.add_argument("--group_size", type=int, default=4, help="每组图片数，默认为4（2x2网格）")
+    parser.add_argument("--start_index", type=int, default=0, help="输出图片名称的起始编号")
+    parser.add_argument(
+        "--prefix",
+        type=str,
+        default="base_0_2",
+        help="输出图片和标签的前缀名称，例如 prefix='myimg' 则输出 myimg_0000.jpg",
+    )
+    parser.add_argument(
+        "--random_fill",
+        action="store_true",
+        default=True,
+        help="当最后一组图片不足 group_size 时，从所有图片中随机选择补全",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="随机种子，用于可复现的补全")
     args = parser.parse_args()
 
     if args.seed is not None:

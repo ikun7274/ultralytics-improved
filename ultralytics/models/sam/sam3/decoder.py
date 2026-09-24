@@ -67,8 +67,7 @@ class TransformerDecoderLayer(nn.Module):
         """Feedforward network forward pass."""
         tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout4(tgt2)
-        tgt = self.norm3(tgt)
-        return tgt
+        return self.norm3(tgt)
 
     def forward(
         self,

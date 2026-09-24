@@ -207,8 +207,7 @@ class Detect(nn.Module):
             self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
             self.shape = shape
 
-        dbox = self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0)) * self.strides
-        return dbox
+        return self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0)) * self.strides
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
@@ -615,13 +614,12 @@ class Pose(Detect):
             if ndim == 3:
                 a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
             return a.view(bs, self.nk, -1)
-        else:
-            y = kpts.clone()
-            if ndim == 3:
-                y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
-            y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
-            y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
-            return y
+        y = kpts.clone()
+        if ndim == 3:
+            y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
+        y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
+        y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
+        return y
 
 
 class Pose26(Pose):
@@ -729,13 +727,12 @@ class Pose26(Pose):
             if ndim == 3:
                 a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
             return a.view(bs, self.nk, -1)
-        else:
-            y = kpts.clone()
-            if ndim == 3:
-                y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
-            y[:, 0::ndim] = (y[:, 0::ndim] + self.anchors[0]) * self.strides
-            y[:, 1::ndim] = (y[:, 1::ndim] + self.anchors[1]) * self.strides
-            return y
+        y = kpts.clone()
+        if ndim == 3:
+            y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
+        y[:, 0::ndim] = (y[:, 0::ndim] + self.anchors[0]) * self.strides
+        y[:, 1::ndim] = (y[:, 1::ndim] + self.anchors[1]) * self.strides
+        return y
 
 
 class Depth(nn.Module):
@@ -939,7 +936,7 @@ class WorldDetect(Detect):
         m = self  # self.model[-1]  # Detect() module
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
         # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
-        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+        for a, _b, _s in zip(m.cv2, m.cv3, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box
             # b[-1].bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
 
@@ -1003,14 +1000,13 @@ class LRPCHead(nn.Module):
             cls_feat = cls_feat.flatten(2).transpose(-1, -2)
             cls_feat = self.vocab(cls_feat[:, mask] if conf else cls_feat * mask.unsqueeze(-1).int())
             return self.loc(loc_feat), cls_feat.transpose(-1, -2), mask
-        else:
-            cls_feat = self.vocab(cls_feat)
-            loc_feat = self.loc(loc_feat)
-            return (
-                loc_feat,
-                cls_feat.flatten(2),
-                torch.ones(cls_feat.shape[2] * cls_feat.shape[3], device=cls_feat.device, dtype=torch.bool),
-            )
+        cls_feat = self.vocab(cls_feat)
+        loc_feat = self.loc(loc_feat)
+        return (
+            loc_feat,
+            cls_feat.flatten(2),
+            torch.ones(cls_feat.shape[2] * cls_feat.shape[3], device=cls_feat.device, dtype=torch.bool),
+        )
 
 
 class YOLOEDetect(Detect):

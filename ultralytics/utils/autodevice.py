@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import random
 from typing import Any
 
@@ -65,10 +66,8 @@ class GPUInfo:
     def shutdown(self):
         """Shut down NVML if it was initialized."""
         if self.nvml_available and self.pynvml:
-            try:
+            with contextlib.suppress(Exception):
                 self.pynvml.nvmlShutdown()
-            except Exception:
-                pass
             self.nvml_available = False
 
     def refresh_stats(self):

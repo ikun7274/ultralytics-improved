@@ -172,9 +172,7 @@ def _scale_bounding_box_to_original_image_shape(
     box = ops.xyxy2xywh(box)
     # Adjust xy center to correspond top-left corner
     box[:2] -= box[2:] / 2
-    box = box.tolist()
-
-    return box
+    return box.tolist()
 
 
 def _format_ground_truth_annotations_for_detection(img_idx, image_path, batch, class_name_map=None) -> dict | None:
