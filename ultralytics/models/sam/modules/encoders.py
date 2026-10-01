@@ -273,12 +273,11 @@ class PromptEncoder(nn.Module):
         """Get the batch size of the output given the batch size of the input prompts."""
         if points is not None:
             return points[0].shape[0]
-        elif boxes is not None:
+        if boxes is not None:
             return boxes.shape[0]
-        elif masks is not None:
+        if masks is not None:
             return masks.shape[0]
-        else:
-            return 1
+        return 1
 
     def forward(
         self,
@@ -756,8 +755,7 @@ class Hiera(nn.Module):
         window_embed = self.pos_embed_window
         pos_embed = F.interpolate(self.pos_embed, size=(h, w), mode="bicubic")
         pos_embed = pos_embed + window_embed.tile([x // y for x, y in zip(pos_embed.shape, window_embed.shape)])
-        pos_embed = pos_embed.permute(0, 2, 3, 1)
-        return pos_embed
+        return pos_embed.permute(0, 2, 3, 1)
 
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         """Perform forward pass through Hiera model, extracting multiscale features from input images.

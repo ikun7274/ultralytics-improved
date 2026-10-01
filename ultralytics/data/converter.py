@@ -1142,8 +1142,7 @@ async def _convert_ndjson_to_yolo(ndjson_path: Path, output_path: Path, local: b
         # Keep class paths safe while check_cls_dataset restores the original display names.
         YAML.save(metadata_path, {"names": classification_names, "hash": _hash, "complete": True})
         return dataset_dir
-    else:
-        # Detection: write data.yaml with hash for future change detection
-        data_yaml.update(hash=_hash, complete=True)
-        YAML.save(metadata_path, data_yaml)
-        return metadata_path
+    # Detection: write data.yaml with hash for future change detection
+    data_yaml.update(hash=_hash, complete=True)
+    YAML.save(metadata_path, data_yaml)
+    return metadata_path
