@@ -130,8 +130,7 @@ class TransformerEncoderLayer(nn.Module):
         # FFN
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
-        tgt = self.norm3(tgt)
-        return tgt
+        return self.norm3(tgt)
 
     def forward_pre(
         self,
@@ -187,8 +186,7 @@ class TransformerEncoderLayer(nn.Module):
         tgt = tgt + self.dropout2(tgt2)
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout3(tgt2)
-        return tgt
+        return tgt + self.dropout3(tgt2)
 
     def forward(
         self,
@@ -525,5 +523,4 @@ def pool_text_feat(prompt, prompt_mask, pool_with_mask):
     num_valid = torch.clamp(torch.sum(is_valid, dim=0), min=1.0)
 
     # mean pool over all the valid tokens
-    pooled_text = (prompt * is_valid).sum(dim=0) / num_valid
-    return pooled_text
+    return (prompt * is_valid).sum(dim=0) / num_valid

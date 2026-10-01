@@ -1,14 +1,15 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import cv2
 import numpy as np
-import argparse
-import os
-from pathlib import Path
 
 
 def _safe_label_path(input_path: Path, stem: str) -> Path | None:
-    """YOLO 标签查找:
-    1. 优先同目录 (与 image 同级)
-    2. 回退到同级 labels/ 子目录 (Ultralytics 标准 YOLO 布局: images/<...>/foo.jpg, labels/<...>/foo.txt)
+    """YOLO 标签查找: 1. 优先同目录 (与 image 同级) 2. 回退到同级 labels/ 子目录 (Ultralytics 标准 YOLO 布局: images/<...>/foo.jpg,
+    labels/<...>/foo.txt).
     """
     same_dir = input_path / f"{stem}.txt"
     if same_dir.exists():
@@ -24,8 +25,8 @@ def _safe_label_path(input_path: Path, stem: str) -> Path | None:
 
 
 def _safe_imwrite(path: str | Path, img: np.ndarray) -> bool:
-    """Unicode-safe imwrite: cv2.imwrite 中文路径会静默返回 False (项目内已验证),
-    用 cv2.imencode + .tofile() 绕开. 失败返回 False 但不抛异常."""
+    """Unicode-safe imwrite: cv2.imwrite 中文路径会静默返回 False (项目内已验证), 用 cv2.imencode + .tofile() 绕开. 失败返回 False 但不抛异常.
+    """
     try:
         ok, buf = cv2.imencode(Path(path).suffix or ".jpg", img)
         if not ok:
@@ -37,7 +38,7 @@ def _safe_imwrite(path: str | Path, img: np.ndarray) -> bool:
 
 
 def motion_blur_kernel(length, angle):
-    """生成线段型运动模糊PSF，并保证线段完整落在卷积核内。"""
+    """生成线段型运动模糊PSF，并保证线段完整落在卷积核内。."""
     rad = np.deg2rad(angle)
     size = max(3, int(np.ceil(length)) | 1)
     kernel = np.zeros((size, size), dtype=np.float32)
@@ -52,53 +53,32 @@ def motion_blur_kernel(length, angle):
     x2 = center + dx * length_scaled
     y2 = center + dy * length_scaled
 
-    cv2.line(
-        kernel,
-        (int(round(x1)), int(round(y1))),
-        (int(round(x2)), int(round(y2))),
-        1.0,
-        thickness=1,
-        lineType=cv2.LINE_AA
-    )
+    cv2.line(kernel, (round(x1), round(y1)), (round(x2), round(y2)), 1.0, thickness=1, lineType=cv2.LINE_AA)
     kernel /= kernel.sum()
     return kernel
 
 
 def apply_motion_blur(img, length=15, angle=30, defocus_sigma=0):
-    """对图像应用运动模糊，并可叠加高斯失焦模糊。"""
+    """对图像应用运动模糊，并可叠加高斯失焦模糊。."""
     kernel = motion_blur_kernel(length, angle)
-    blurred = cv2.filter2D(
-        img,
-        -1,
-        kernel,
-        borderType=cv2.BORDER_REPLICATE
-    )
+    blurred = cv2.filter2D(img, -1, kernel, borderType=cv2.BORDER_REPLICATE)
     if defocus_sigma > 0:
         ksize = int(6 * defocus_sigma) | 1
-        blurred = cv2.GaussianBlur(
-            blurred,
-            (ksize, ksize),
-            defocus_sigma
-        )
+        blurred = cv2.GaussianBlur(blurred, (ksize, ksize), defocus_sigma)
     return blurred
 
 
 def get_image_files(input_dir):
-    """获取输入目录中的所有图片文件，不递归子目录。"""
+    """获取输入目录中的所有图片文件，不递归子目录。."""
     input_path = Path(input_dir)
     if not input_path.exists():
         raise FileNotFoundError(f"输入目录不存在：{input_dir}")
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-    return [
-        file for file in input_path.iterdir()
-        if file.is_file() and file.suffix.lower() in exts
-    ]
+    return [file for file in input_path.iterdir() if file.is_file() and file.suffix.lower() in exts]
 
 
 def sample_images(image_files, sample_ratio, sample_count, rng):
-    """
-    按比例或固定数量随机选取图片。
-    sample_count 优先于 sample_ratio。
+    """按比例或固定数量随机选取图片。 sample_count 优先于 sample_ratio。.
     """
     total = len(image_files)
     if total == 0:
@@ -109,7 +89,7 @@ def sample_images(image_files, sample_ratio, sample_count, rng):
     else:
         if sample_ratio <= 0:
             return []
-        count = max(1, int(round(total * float(sample_ratio))))
+        count = max(1, round(total * float(sample_ratio)))
         count = min(count, total)
     if count >= total:
         return image_files.copy()
@@ -128,7 +108,7 @@ def process_folder(
     sample_count=None,
     seed=None,
     copy_yolo_labels=True,
-    copy_origin=True
+    copy_origin=True,
 ):
     rng = np.random.default_rng(seed)
     input_path = Path(input_dir)
@@ -228,12 +208,16 @@ def process_folder(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="按比例/数量采样，生成运动+失焦模糊；支持复制原图与YOLO标签"
-    )
+    parser = argparse.ArgumentParser(description="按比例/数量采样，生成运动+失焦模糊；支持复制原图与YOLO标签")
 
-    parser.add_argument("--input_dir", default="", help="输入图片目录 (必传; 例: D:/datasets/base_3_1_background/images)")
-    parser.add_argument("--output_dir", default="", help="输出目录, 自动创建 (必传; 例: D:/datasets/base_3_1_background/images/motion_blur)")
+    parser.add_argument(
+        "--input_dir", default="", help="输入图片目录 (必传; 例: D:/datasets/base_3_1_background/images)"
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="",
+        help="输出目录, 自动创建 (必传; 例: D:/datasets/base_3_1_background/images/motion_blur)",
+    )
 
     parser.add_argument("--sample_ratio", type=float, default=0.5, help="随机选取图片比例，0~1")
     parser.add_argument("--sample_count", type=int, default=None, help="固定选取张数，优先级高于sample_ratio")
@@ -267,5 +251,5 @@ if __name__ == "__main__":
         sample_count=args.sample_count,
         seed=args.seed,
         copy_yolo_labels=not args.no_copy_label,
-        copy_origin=not args.no_copy_origin
+        copy_origin=not args.no_copy_origin,
     )

@@ -401,6 +401,7 @@ def onnx2engine(
                 """Use existing cache instead of calibrating again, otherwise, implicitly return None."""
                 if self.cache.exists() and self.cache.suffix == ".cache":
                     return self.cache.read_bytes()
+                return None
 
             def write_calibration_cache(self, cache: bytes) -> None:
                 """Write calibration cache to disk."""

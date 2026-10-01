@@ -21,5 +21,5 @@ polars>=0.20.0
 pi_heif>=0.13.0
 
 onnx>=1.16.0
-onnxruntime>=1.18.0
+onnxruntime>=1.30.0
 onnxslim>=0.1.28
