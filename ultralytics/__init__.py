@@ -20,7 +20,7 @@ settings = SETTINGS
 MODELS = ("YOLO", "YOLOWorld", "YOLOE", "NAS", "SAM", "FastSAM", "RTDETR", "LLM")
 PLATFORM_EXPORTS = ("Platform", "AsyncPlatform", "APIError", "APIConnectionError")
 
-__all__ = (  # noqa: PLE0604
+__all__ = (
     "__version__",
     "ASSETS",
     *MODELS,
