@@ -1,5 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+import contextlib
 import json
 import logging
 import plistlib
@@ -120,10 +121,8 @@ class ConsoleLogger:
 
         # Remove logging handler to prevent memory leak
         if self._log_handler:
-            try:
+            with contextlib.suppress(Exception):
                 logging.getLogger("ultralytics").removeHandler(self._log_handler)
-            except Exception:
-                pass
             self._log_handler = None
 
         # Final flush, without the frames of any bar that outlived the capture

@@ -148,7 +148,7 @@ class SAM3SemanticModel(torch.nn.Module):
             feat_sizes=vis_feat_sizes,
             encoder_extra_kwargs=encoder_extra_kwargs,
         )
-        encoder_out = {
+        return {
             # encoded image features
             "encoder_hidden_states": memory["memory"],
             "pos_embed": memory["pos_embed"],
@@ -161,7 +161,6 @@ class SAM3SemanticModel(torch.nn.Module):
             "prompt_after_enc": memory.get("memory_text", prompt),
             "prompt_mask": prompt_mask,
         }
-        return encoder_out
 
     def _run_decoder(
         self,
@@ -291,7 +290,7 @@ class SAM3SemanticModel(torch.nn.Module):
         backbone_out, img_feats, img_pos_embeds, vis_feat_sizes = SAM2Model._prepare_backbone_features(
             self, backbone_out, batch=len(text_ids)
         )
-        backbone_out.update({k: v for k, v in self.text_embeddings.items()})
+        backbone_out.update(dict(self.text_embeddings.items()))
         # index text features (note that regardless of early or late fusion, the batch size of
         # `txt_feats` is always the number of *prompts* in the encoder)
         txt_feats = backbone_out["language_features"][:, text_ids]
