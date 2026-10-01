@@ -20,6 +20,6 @@ prettytable>=3.9.0
 polars>=0.20.0
 pi_heif>=0.13.0
 
-onnx>=1.16.0
+onnx>=1.23.0
 onnxruntime>=1.18.0
 onnxslim>=0.1.28
