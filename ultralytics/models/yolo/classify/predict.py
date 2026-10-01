@@ -66,8 +66,7 @@ class ClassificationPredictor(BasePredictor):
                 [self.transforms(Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))) for im in img], dim=0
             )
         img = (img if isinstance(img, torch.Tensor) else torch.from_numpy(img)).to(self.model.device)
-        img = img.half() if self.model.fp16 else img.float()  # Convert uint8 to fp16/32
-        return img
+        return img.half() if self.model.fp16 else img.float()  # Convert uint8 to fp16/32
 
     def postprocess(self, preds, img, orig_imgs):
         """Process predictions to return Results objects with classification probabilities.
