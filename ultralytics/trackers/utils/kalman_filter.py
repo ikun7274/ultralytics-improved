@@ -275,12 +275,11 @@ class KalmanFilterXYAH:
         d = measurements - mean
         if metric == "gaussian":
             return np.sum(d * d, axis=1)
-        elif metric == "maha":
+        if metric == "maha":
             cholesky_factor = np.linalg.cholesky(covariance)
             z = np.linalg.solve(cholesky_factor, d.T)
             return np.sum(z * z, axis=0)  # square maha
-        else:
-            raise ValueError("Invalid distance metric")
+        raise ValueError("Invalid distance metric")
 
 
 class KalmanFilterXYWH(KalmanFilterXYAH):
