@@ -916,12 +916,11 @@ class Model(torch.nn.Module):
             from ultralytics.utils.tuner import run_ray_tune
 
             return run_ray_tune(self, *args, iterations=iterations, **kwargs)
-        else:
-            from .tuner import Tuner
+        from .tuner import Tuner
 
-            custom = {}  # method defaults
-            args = {**self.overrides, **custom, **kwargs, "mode": "train"}  # highest priority args on the right
-            return Tuner(args=args, _callbacks=self.callbacks)(iterations=iterations)
+        custom = {}  # method defaults
+        args = {**self.overrides, **custom, **kwargs, "mode": "train"}  # highest priority args on the right
+        return Tuner(args=args, _callbacks=self.callbacks)(iterations=iterations)
 
     def _apply(self, fn) -> Model:
         """Apply a function to model parameters, buffers, and tensors.
