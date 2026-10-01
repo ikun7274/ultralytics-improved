@@ -19,6 +19,7 @@ Commands:
 
 """
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -90,10 +91,8 @@ def on_pretrain_routine_end(trainer):
         LOGGER.warning(f"{PREFIX}Failed to initialize: {e}")
         LOGGER.warning(f"{PREFIX}Not tracking this run")
         if trainer._mlflow_started_run:
-            try:
+            with contextlib.suppress(Exception):
                 mlflow.end_run()
-            except Exception:
-                pass
 
 
 def _log_metrics(trainer, metrics):
