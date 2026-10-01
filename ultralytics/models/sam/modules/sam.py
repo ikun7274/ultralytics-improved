@@ -768,8 +768,7 @@ class SAM2Model(torch.nn.Module):
             if self.directly_add_no_mem_embed:
                 # directly add no-mem embedding (instead of using the transformer encoder)
                 pix_feat_with_mem = current_vision_feats[-1] + self.no_mem_embed
-                pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
-                return pix_feat_with_mem
+                return pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
 
             # Use a dummy token on the first frame (to avoid empty memory input to transformer encoder)
             to_cat_memory = [self.no_mem_embed.expand(1, B, self.mem_dim)]
@@ -787,8 +786,7 @@ class SAM2Model(torch.nn.Module):
             num_obj_ptr_tokens=num_obj_ptr_tokens,
         )
         # Reshape output (HW)BC => BCHW
-        pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
-        return pix_feat_with_mem
+        return pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
 
     def _encode_new_memory(
         self,
@@ -1000,8 +998,7 @@ class SAM2Model(torch.nn.Module):
         keep = max_obj_inds == batch_obj_inds
         # suppress overlapping regions' scores below -10.0 so that the foreground regions
         # don't overlap (here sigmoid(-10.0)=4.5398e-05)
-        pred_masks = torch.where(keep, pred_masks, torch.clamp(pred_masks, max=-10.0))
-        return pred_masks
+        return torch.where(keep, pred_masks, torch.clamp(pred_masks, max=-10.0))
 
     def set_binarize(self, binarize=False):
         """Set binarize for VideoPredictor."""
@@ -1144,8 +1141,7 @@ class SAM3Model(SAM2Model):
         area_ratio = area_after / area_before
         keep = area_ratio >= shrink_threshold
         keep_mask = keep[..., None, None].expand_as(pred_masks)
-        pred_masks_after = torch.where(keep_mask, pred_masks, torch.clamp(pred_masks, max=-10.0))
-        return pred_masks_after
+        return torch.where(keep_mask, pred_masks, torch.clamp(pred_masks, max=-10.0))
 
     def _suppress_object_pw_area_shrinkage(self, pred_masks):
         """This function suppresses masks that shrink in area after applying pixelwise non-overlapping constraints. Note
@@ -1155,5 +1151,4 @@ class SAM3Model(SAM2Model):
         pixel_level_non_overlapping_masks = self._apply_non_overlapping_constraints(pred_masks)
         # Fully suppress masks with high shrinkage (probably noisy) based on the pixel wise non-overlapping constraints
         # NOTE: The output of this function can be a no op if none of the masks shrink by a large factor.
-        pred_masks = self._suppress_shrinked_masks(pred_masks, pixel_level_non_overlapping_masks)
-        return pred_masks
+        return self._suppress_shrinked_masks(pred_masks, pixel_level_non_overlapping_masks)
