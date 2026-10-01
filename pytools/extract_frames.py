@@ -1,24 +1,24 @@
-import cv2
-import os
 import glob
+import os
+
+import cv2
 
 # ==================== 用户配置区 ====================
 # 移除硬编码的本机路径, 改为占位空串; 必传 INPUT_DIR 和 OUTPUT_DIR
-INPUT_DIR = ""                                                       # 视频所在目录（必传; 例: D:/videos/xxx）
-OUTPUT_DIR = ""                                                      # 输出图片的保存目录（自动创建; 例: D:/frames/xxx）
-PREFIX = "base_1_0"                     # 文件名前缀（可改为 B, C, SCENE 等）
-START_NUM = 1                    # 起始数字
-DIGITS = 5                       # 数字位数（如 5 代表 00001）
-EXTRACT_INTERVAL = 10            # 每隔多少帧提取1张（30fps视频下约每秒1张）
-JPEG_QUALITY = 100                # JPG画质 (0-100)
+INPUT_DIR = ""  # 视频所在目录（必传; 例: D:/videos/xxx）
+OUTPUT_DIR = ""  # 输出图片的保存目录（自动创建; 例: D:/frames/xxx）
+PREFIX = "base_1_0"  # 文件名前缀（可改为 B, C, SCENE 等）
+START_NUM = 1  # 起始数字
+DIGITS = 5  # 数字位数（如 5 代表 00001）
+EXTRACT_INTERVAL = 10  # 每隔多少帧提取1张（30fps视频下约每秒1张）
+JPEG_QUALITY = 100  # JPG画质 (0-100)
 # ===================================================
+
 
 def main():
     # 必传检查
     if not INPUT_DIR or not OUTPUT_DIR:
-        raise ValueError(
-            "INPUT_DIR / OUTPUT_DIR 必须配置。在脚本顶部的 用户配置区 设置实际路径后重试。"
-        )
+        raise ValueError("INPUT_DIR / OUTPUT_DIR 必须配置。在脚本顶部的 用户配置区 设置实际路径后重试。")
 
     # 1. 创建输出目录
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -43,7 +43,7 @@ def main():
     print(f"共发现 {len(video_files)} 个视频文件，开始处理...\n")
 
     counter = START_NUM  # 全局计数器（所有视频的图片按顺序连续编号）
-    failed_count = 0     # 累计写盘失败的张数, 结尾汇总告警
+    failed_count = 0  # 累计写盘失败的张数, 结尾汇总告警
 
     # 3. 遍历每个视频
     for video_path in video_files:
@@ -52,7 +52,7 @@ def main():
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            print(f"  ⚠ 无法打开视频，已跳过")
+            print("  ⚠ 无法打开视频，已跳过")
             continue
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -94,6 +94,7 @@ def main():
     # 失败汇总, 让用户明确知道是否有文件缺失
     if failed_count:
         print(f"⚠ 警告: {failed_count} 张图片写入失败 (输出目录可能缺文件)")
+
 
 if __name__ == "__main__":
     main()
