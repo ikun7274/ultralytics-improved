@@ -293,26 +293,25 @@ class BaseValidator:
                 for v in loss.values():
                     dist.reduce(v, dst=0, op=dist.ReduceOp.AVG)
             if RANK > 0:
-                return
+                return None
             loss = {k: v.cpu() / len(self.dataloader) for k, v in loss.items()}
             results = {**stats, **trainer.label_loss_items(loss, prefix="val")}
             return {k: round(float(v), 5) for k, v in results.items()}  # return results as 5 decimal place floats
-        else:
-            if RANK > 0:
-                return stats
-            LOGGER.info(
-                "Speed: {:.1f}ms preprocess, {:.1f}ms inference, {:.1f}ms loss, {:.1f}ms postprocess per image".format(
-                    *tuple(self.speed.values())
-                )
-            )
-            if self.args.save_json and self.jdict:
-                with open(str(self.save_dir / "predictions.json"), "w", encoding="utf-8") as f:
-                    LOGGER.info(f"Saving {f.name}...")
-                    json.dump(self.jdict, f)  # flatten and save
-                stats = self.eval_json(stats)  # update stats
-            if self.args.plots or self.args.save_json:
-                LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
+        if RANK > 0:
             return stats
+        LOGGER.info(
+            "Speed: {:.1f}ms preprocess, {:.1f}ms inference, {:.1f}ms loss, {:.1f}ms postprocess per image".format(
+                *tuple(self.speed.values())
+            )
+        )
+        if self.args.save_json and self.jdict:
+            with open(str(self.save_dir / "predictions.json"), "w", encoding="utf-8") as f:
+                LOGGER.info(f"Saving {f.name}...")
+                json.dump(self.jdict, f)  # flatten and save
+            stats = self.eval_json(stats)  # update stats
+        if self.args.plots or self.args.save_json:
+            LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
+        return stats
 
     def match_predictions(
         self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor, use_scipy: bool = False
