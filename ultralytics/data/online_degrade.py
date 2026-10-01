@@ -59,13 +59,13 @@ def _ratio_pad_params(w: int, h: int, target_ratio: str, auto: bool) -> tuple[in
         if math.isclose(ratio, target, rel_tol=_RATIO_REL_TOL):
             return None
     if ratio < target:  # widen
-        new_w = max(1, int(round(h * target)))
+        new_w = max(1, round(h * target))
         new_h = h
         pad_left = (new_w - w) // 2
         pad_top = 0
     else:  # heighten
         new_w = w
-        new_h = max(1, int(round(w / target)))
+        new_h = max(1, round(w / target))
         pad_left = 0
         pad_top = (new_h - h) // 2
     return new_w, new_h, pad_left, pad_top
@@ -74,10 +74,9 @@ def _ratio_pad_params(w: int, h: int, target_ratio: str, auto: bool) -> tuple[in
 def _psf_size(length: float) -> int:
     """Odd PSF side length that holds a motion-blur segment of ``length`` pixels.
 
-    Shared by the dense PSF path and the axis-aligned box path so the two cannot drift apart: when the
-    segment lies exactly along an axis the rasterized line covers ``_psf_size(length)`` pixels at uniform
-    weight, which is what makes the box filter in ``_apply_motion_blur`` an exact stand-in rather than an
-    approximation.
+    Shared by the dense PSF path and the axis-aligned box path so the two cannot drift apart: when the segment lies
+    exactly along an axis the rasterized line covers ``_psf_size(length)`` pixels at uniform weight, which is what makes
+    the box filter in ``_apply_motion_blur`` an exact stand-in rather than an approximation.
     """
     # ceil (not int()) so the half-length from the center never gets truncated by the border: int() would
     # silently shorten the effective blur for fractional lengths (e.g. 9.5 -> size 9, only 8px of blur).
@@ -88,8 +87,8 @@ def _psf_size(length: float) -> int:
 def _motion_blur_kernel(length: float, angle: float) -> np.ndarray:
     """Build a line-segment PSF motion-blur kernel (in-memory port of the offline motion_blur tool).
 
-    0 deg = horizontal-right; kernel is squared with an odd size (>=3); the segment is drawn anti-aliased
-    and normalized to sum = 1 (keeps brightness unchanged after convolution).
+    0 deg = horizontal-right; kernel is squared with an odd size (>=3); the segment is drawn anti-aliased and normalized
+    to sum = 1 (keeps brightness unchanged after convolution).
     """
     rad = np.deg2rad(angle)
     size = _psf_size(length)
@@ -102,8 +101,7 @@ def _motion_blur_kernel(length: float, angle: float) -> np.ndarray:
     y1 = center - dy * length_scaled
     x2 = center + dx * length_scaled
     y2 = center + dy * length_scaled
-    cv2.line(kernel, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))),
-             1.0, thickness=1, lineType=cv2.LINE_AA)
+    cv2.line(kernel, (round(x1), round(y1)), (round(x2), round(y2)), 1.0, thickness=1, lineType=cv2.LINE_AA)
     # Guard against a zero/degenerate kernel (e.g. blur_*_len_*: 0 -> a single point may not be rasterized).
     # Dividing by 0 would produce NaN pixels -> NaN loss; where an entry point still installs a blanket
     # `filterwarnings('ignore')` (detect.py / export.py -- see 代码审查报告-全面复审.md M-5) the
@@ -122,52 +120,49 @@ def _motion_blur_kernel(length: float, angle: float) -> np.ndarray:
 def _crop_kernel(kernel: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
     """Trim the all-zero border off a convolution kernel, returning ``(kernel, anchor)``.
 
-    ``cv2.filter2D`` is handed a ``size x size`` PSF in which the rasterized line occupies one thin
-    diagonal band, so most of the kernel is zeros it still walks over. Its cost was measured to depend
-    on the kernel's DIMENSIONS (a cliff around 11 px: a 9x9 kernel runs in ~6 ms, a 13x13 one in
-    ~45 ms at 1280x960) as well as on the non-zero tap count, so handing over the padded square is
-    pure waste. Dropping the zero border is *bit-identical* -- a zero tap contributes nothing, and the
-    explicit ``anchor`` keeps the kernel aligned on the original centre -- and measured 1.85x on the
-    short tier / 1.19x on the long tier (1.35x over the configured length distribution, 600 draws).
-    It also means a larger ``blur_short_len_max`` no longer falls off the cliff.
+    ``cv2.filter2D`` is handed a ``size x size`` PSF in which the rasterized line occupies one thin diagonal band, so
+    most of the kernel is zeros it still walks over. Its cost was measured to depend on the kernel's DIMENSIONS (a cliff
+    around 11 px: a 9x9 kernel runs in ~6 ms, a 13x13 one in ~45 ms at 1280x960) as well as on the non-zero tap count,
+    so handing over the padded square is pure waste. Dropping the zero border is *bit-identical* -- a zero tap
+    contributes nothing, and the explicit ``anchor`` keeps the kernel aligned on the original center -- and measured
+    1.85x on the short tier / 1.19x on the long tier (1.35x over the configured length distribution, 600 draws). It also
+    means a larger ``blur_short_len_max`` no longer falls off the cliff.
 
-    The bbox is unioned with the centre pixel so ``anchor`` always stays inside the kernel (OpenCV
-    asserts ``anchor.inside(Rect(0, 0, ksize.width, ksize.height))``); that extra zero row/column
-    costs nothing.
+    The bbox is unioned with the center pixel so ``anchor`` always stays inside the kernel (OpenCV asserts
+    ``anchor.inside(Rect(0, 0, ksize.width, ksize.height))``); that extra zero row/column costs nothing.
     """
     size = kernel.shape[0]
     c = size // 2
     nz = np.nonzero(kernel)
     y0, y1 = min(int(nz[0].min()), c), max(int(nz[0].max()), c)
     x0, x1 = min(int(nz[1].min()), c), max(int(nz[1].max()), c)
-    cropped = np.ascontiguousarray(kernel[y0:y1 + 1, x0:x1 + 1])
+    cropped = np.ascontiguousarray(kernel[y0 : y1 + 1, x0 : x1 + 1])
     return cropped, (c - x0, c - y0)
 
 
-def _apply_motion_blur(img: np.ndarray, length: float = 15.0, angle: float = 30.0,
-                       defocus_sigma: float = 0.0, axis_aligned: bool = False) -> np.ndarray:
+def _apply_motion_blur(
+    img: np.ndarray, length: float = 15.0, angle: float = 30.0, defocus_sigma: float = 0.0, axis_aligned: bool = False
+) -> np.ndarray:
     """Apply motion blur (and optional defocus) to a BGR/grayscale image (in-memory port of the offline tool).
 
-    ``axis_aligned=True`` restricts the smear to the image axes, where ``angle`` is expected to be 0
-    (horizontal) or 90 (vertical). This is NOT a cheaper approximation of the general path -- when the
-    segment lies exactly along an axis the anti-aliased line rasterizes to ``_psf_size(length)`` pixels of
-    uniform weight 1/n, i.e. a plain box filter, so the output is bit-identical while ``cv2.blur`` runs it
-    on an O(1) running-sum path whose cost is independent of the kernel length. Verified over 242
-    (length, axis) pairs -- every 0.25 px from 5 to 35, both axes, 3-channel 1280x960 -- ``cv2.blur`` and
-    the PSF's ``filter2D`` agree exactly (max|diff| = 0), at the production working resolution it runs
-    ~1.3x faster on the short tier (7.0 -> 5.2 ms) and ~1.9x on the long tier (20.5 -> 10.5 ms, defocus
-    included), 1.82x over both tiers (28.1 -> 15.4 ms/image). The bare convolution gain is larger still
-    (2.94x on the long tier) but the fixed-cost defocus pass that follows it dilutes it.
+    ``axis_aligned=True`` restricts the smear to the image axes, where ``angle`` is expected to be 0 (horizontal) or 90
+    (vertical). This is NOT a cheaper approximation of the general path -- when the segment lies exactly along an axis
+    the anti-aliased line rasterizes to ``_psf_size(length)`` pixels of uniform weight 1/n, i.e. a plain box filter, so
+    the output is bit-identical while ``cv2.blur`` runs it on an O(1) running-sum path whose cost is independent of the
+    kernel length. Verified over 242 (length, axis) pairs -- every 0.25 px from 5 to 35, both axes, 3-channel 1280x960
+    -- ``cv2.blur`` and the PSF's ``filter2D`` agree exactly (max|diff| = 0), at the production working resolution it
+    runs ~1.3x faster on the short tier (7.0 -> 5.2 ms) and ~1.9x on the long tier (20.5 -> 10.5 ms, defocus included),
+    1.82x over both tiers (28.1 -> 15.4 ms/image). The bare convolution gain is larger still (2.94x on the long tier)
+    but the fixed-cost defocus pass that follows it dilutes it.
 
-    Prefer it when the motion's image-plane projection really is axis-aligned (fixed camera mounting, e.g.
-    along-track aerial/vehicle imagery): there the constraint is the more faithful model, and it also costs
+    Prefer it when the motion's image-plane projection really is axis-aligned (fixed camera mounting, e.g. along-track
+    aerial/vehicle imagery): there the constraint is the more faithful model, and it also costs
     less. Note that it does narrow the smear direction from U[0, 180) to {0, 90}, which is a genuine change
-    to the augmentation distribution -- hence the ``blur_axis_aligned`` config switch rather than a silent
-    replacement.
+    to the augmentation distribution -- hence the ``blur_axis_aligned`` config switch rather than a silent replacement.
     """
     if axis_aligned:
         # The kernel length comes from the same helper the dense PSF uses, so the two paths cannot drift;
-        # `_psf_size` is odd by construction, so cv2's default centred anchor matches the PSF's centre.
+        # `_psf_size` is odd by construction, so cv2's default centered anchor matches the PSF's center.
         n = _psf_size(length)
         blurred = cv2.blur(img, (1, n) if float(angle) % 180.0 >= 45.0 else (n, 1))
     else:
@@ -179,20 +174,26 @@ def _apply_motion_blur(img: np.ndarray, length: float = 15.0, angle: float = 30.
     return blurred
 
 
-def _apply_weather(img: np.ndarray, weather_type: str, rain_density: float = 0.15, rain_length: float = 15.0,
-                   haze_beta: float = 0.4, noise_std: float = 15.0) -> np.ndarray:
+def _apply_weather(
+    img: np.ndarray,
+    weather_type: str,
+    rain_density: float = 0.15,
+    rain_length: float = 15.0,
+    haze_beta: float = 0.4,
+    noise_std: float = 15.0,
+) -> np.ndarray:
     """Apply one weather degradation (rain / haze / Gaussian noise) to a BGR image, in memory.
 
-    Labels are UNCHANGED (degradation never moves targets). Intensities are sampled randomly per
-    call so the model does not overfit to a single degradation level:
-      - rain:  ~density*max(h,w) semi-transparent streaks at a fixed 20-degree slant; alpha 0.2-0.6.
-      - haze:  atmospheric-scattering model I = J*t + A*(1-t), t = 1-beta, A = gray atmosphere (200).
-      - noise: additive Gaussian noise (RGB independent), sensor/low-light simulation.
+    Labels are UNCHANGED (degradation never moves targets). Intensities are sampled randomly per call so the model does
+    not overfit to a single degradation level:
+    - rain:  ~density*max(h,w) semi-transparent streaks at a fixed 20-degree slant; alpha 0.2-0.6.
+    - haze:  atmospheric-scattering model I = J*t + A*(1-t), t = 1-beta, A = gray atmosphere (200).
+    - noise: additive Gaussian noise (RGB independent), sensor/low-light simulation.
     `weather_type` is one of "rain" / "haze" / "noise" (caller picks randomly from `weather_types`).
 
-    Every branch runs in a single pass over the image and keeps the transient allocation close to 1x
-    the frame: the branches execute per sample inside DataLoader workers, so an extra full-size
-    float64 temporary (274 MB for a 4000x3000 frame) is directly a memory ceiling on `workers`.
+    Every branch runs in a single pass over the image and keeps the transient allocation close to 1x the frame: the
+    branches execute per sample inside DataLoader workers, so an extra full-size float64 temporary (274 MB for a
+    4000x3000 frame) is directly a memory ceiling on `workers`.
     """
     if weather_type == "rain":
         h, w = img.shape[:2]
@@ -214,8 +215,9 @@ def _apply_weather(img: np.ndarray, weather_type: str, rain_density: float = 0.1
         for t in (1, 2):
             batch = pts[thick2] if t == 2 else pts[~thick2]
             if len(batch):
-                cv2.polylines(overlay, [p for p in batch], isClosed=False, color=(205, 205, 225),
-                              thickness=t, lineType=cv2.LINE_AA)
+                cv2.polylines(
+                    overlay, list(batch), isClosed=False, color=(205, 205, 225), thickness=t, lineType=cv2.LINE_AA
+                )
         alpha = np.random.uniform(0.2, 0.6)  # single RNG family (np.random) with the rain lines
         return cv2.addWeighted(img, 1.0 - alpha, overlay, alpha, 0)
     if weather_type == "haze":
@@ -258,10 +260,9 @@ def _apply_weather(img: np.ndarray, weather_type: str, rain_density: float = 0.1
 def _union_area(rects: list[tuple[int, int, int, int]]) -> float:
     """Exact area of the union of axis-aligned integer rectangles (x-sweep + y-interval merge).
 
-    Replaces the full-image bool mask (h*w bytes per occluded sample -- 4000x3000 ~ 12 MB)
-    with an exact small computation: occluder counts are 1~3 per sample, so the sweep is O(k^2 log k).
-    Integer pixel semantics match the old mask exactly: a rect [x0, x1) x [y0, y1) covers
-    (x1-x0) * (y1-y0) pixels.
+    Replaces the full-image bool mask (h*w bytes per occluded sample -- 4000x3000 ~ 12 MB) with an exact small
+    computation: occluder counts are 1~3 per sample, so the sweep is O(k^2 log k). Integer pixel semantics match the old
+    mask exactly: a rect [x0, x1) x [y0, y1) covers (x1-x0) * (y1-y0) pixels.
     """
     if not rects:
         return 0.0
@@ -295,16 +296,15 @@ def _apply_occlusion(
 ) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
     """Draw semantic occlusion blocks (rect / stripe) on a BGR image, in memory.
 
-    Simulates real drone-view occluders -- tree crowns, shadows, power lines, cloud edges. Labels
-    are NOT moved by the drawing itself (the caller decides max_cover-based removal); returns the
-    occluded image plus the pixel ``(x0, y0, x1, y1)`` boxes of every block so the caller can
-    compute per-target covered ratios.
+    Simulates real drone-view occluders -- tree crowns, shadows, power lines, cloud edges. Labels are NOT moved by the
+    drawing itself (the caller decides max_cover-based removal); returns the occluded image plus the pixel ``(x0, y0,
+    x1, y1)`` boxes of every block so the caller can compute per-target covered ratios.
 
     - ``rect``: random rectangle, side in [0.5, 1.0] * base (base = sqrt(size_ratio * area)).
     - ``stripe``: thin band (width ~2% of the short side, length 0.5-1.0 of the long side),
-      near-horizontal or near-vertical (models power lines / branches / cloud edges).
+    near-horizontal or near-vertical (models power lines / branches / cloud edges).
     - ``color='auto'``: sample the image's dark-quartile mean so the block blends into the scene
-      instead of being a stark black blob; ``black`` / ``gray`` are fixed alternatives.
+    instead of being a stark black blob; ``black`` / ``gray`` are fixed alternatives.
     """
     h, w = img.shape[:2]
     out = img.copy()
@@ -317,7 +317,7 @@ def _apply_occlusion(
         # per-channel 25th percentile.
         flat = img.reshape(-1, _channels(img))[::37]
         q = np.quantile(flat, 0.25, axis=0)
-        oc_color = tuple(int(round(float(v))) for v in q)
+        oc_color = tuple(round(float(v)) for v in q)
     elif color == "black":
         oc_color = (0, 0, 0)
     else:  # gray
