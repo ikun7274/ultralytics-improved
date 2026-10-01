@@ -1,10 +1,12 @@
-import os
-import sys
-import logging
+from __future__ import annotations
+
 import argparse
 import json
-import shutil
+import logging
+import os
 import random
+import shutil
+import sys
 from pathlib import Path
 
 # 共享的路径安全护栏（同目录 _safe_io.py）：直接运行 `python pytools/<脚本>.py` 时
@@ -12,22 +14,24 @@ from pathlib import Path
 _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-from _safe_io import assert_deletable, require_nonempty, safe_rmtree  # noqa: E402
-
-from tqdm import tqdm
-from PIL import Image
-import cv2
-from ultralytics.data.converter import convert_coco
 import concurrent.futures
+import contextlib
+
+import cv2
+from _safe_io import assert_deletable, require_nonempty, safe_rmtree  # noqa: E402
+from PIL import Image
+from tqdm import tqdm
+
+from ultralytics.data.converter import convert_coco
 
 # 设置日志级别
 logging.getLogger("sahi").setLevel(logging.WARNING)
 
 # 调色板（用于可视化）
 COLOR_PALETTE = [
-    (0, 255, 0),    # 绿
-    (255, 0, 0),    # 蓝
-    (0, 0, 255),    # 红
+    (0, 255, 0),  # 绿
+    (255, 0, 0),  # 蓝
+    (0, 0, 255),  # 红
     (255, 255, 0),  # 青
     (255, 0, 255),  # 品红
     (0, 255, 255),  # 黄
@@ -39,7 +43,7 @@ COLOR_PALETTE = [
 
 
 def clear_dir(path):
-    """清空或创建目录（安全删除）"""
+    """清空或创建目录（安全删除）."""
     p = Path(path)
     if p.exists():
         safe_rmtree(p, description="待清空目录")
@@ -47,13 +51,13 @@ def clear_dir(path):
 
 
 def parse_yolo_label(label_path, img_w, img_h):
-    """解析 YOLO txt，返回绝对像素坐标和跳过数量"""
+    """解析 YOLO txt，返回绝对像素坐标和跳过数量."""
     annotations = []
     skipped = 0
     label_path = Path(label_path)
     if not label_path.exists():
         return annotations, skipped
-    with open(label_path, "r", encoding="utf-8") as f:
+    with open(label_path, encoding="utf-8") as f:
         lines = f.readlines()
     for line in lines:
         line = line.strip()
@@ -85,18 +89,20 @@ def parse_yolo_label(label_path, img_w, img_h):
         if w <= 0 or h <= 0:
             skipped += 1
             continue
-        annotations.append({
-            "class_id": class_id,
-            "x_min": x_min,
-            "y_min": y_min,
-            "w": w,
-            "h": h,
-        })
+        annotations.append(
+            {
+                "class_id": class_id,
+                "x_min": x_min,
+                "y_min": y_min,
+                "w": w,
+                "h": h,
+            }
+        )
     return annotations, skipped
 
 
 def validate_args(args):
-    """参数校验"""
+    """参数校验."""
     if not (0 <= args.overlap_ratio < 1):
         raise ValueError(f"overlap_ratio 应在 [0, 1) 范围内，当前值：{args.overlap_ratio}")
     if not (0 <= args.min_area_ratio <= 1):
@@ -108,12 +114,14 @@ def validate_args(args):
 
     orig_resolved = Path(args.orig_root).resolve()
     # 空值/None 会退化成 Path(".") == cwd，必须先挡掉，否则后续 rmtree 会删掉工作目录
-    require_nonempty({
-        "原始数据集目录 --orig_root": args.orig_root,
-        "临时 COCO 目录 --coco_tmp": args.coco_tmp,
-        "切片输出目录 --slice_coco_dir": args.slice_coco_dir,
-        "最终输出目录 --final_yolo_dir": args.final_yolo_dir,
-    })
+    require_nonempty(
+        {
+            "原始数据集目录 --orig_root": args.orig_root,
+            "临时 COCO 目录 --coco_tmp": args.coco_tmp,
+            "切片输出目录 --slice_coco_dir": args.slice_coco_dir,
+            "最终输出目录 --final_yolo_dir": args.final_yolo_dir,
+        }
+    )
     for output_dir in [args.coco_tmp, args.slice_coco_dir, args.final_yolo_dir]:
         assert_deletable(output_dir, description="输出目录")
         out_resolved = Path(output_dir).resolve()
@@ -124,27 +132,26 @@ def validate_args(args):
 
 
 def find_image_label_dirs(yolo_root):
-    """自动检测数据集结构，优先查找 images/train, labels/train"""
+    """自动检测数据集结构，优先查找 images/train, labels/train."""
     img_dir = Path(yolo_root) / "images" / "train"
     lab_dir = Path(yolo_root) / "labels" / "train"
     if img_dir.exists() and lab_dir.exists():
         return img_dir, lab_dir
-    else:
-        return Path(yolo_root) / "images", Path(yolo_root) / "labels"
+    return Path(yolo_root) / "images", Path(yolo_root) / "labels"
 
 
 def load_class_names_from_file(file_path):
-    """从文件读取类别名称（每行一个）"""
+    """从文件读取类别名称（每行一个）."""
     path = Path(file_path)
     if not path.exists():
         return None
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         names = [line.strip() for line in f if line.strip()]
     return names if names else None
 
 
 def process_one_image(img_path, label_dir, out_img_folder, class_names):
-    """单张图片处理：复制图片、解析标签，返回COCO格式标注"""
+    """单张图片处理：复制图片、解析标签，返回COCO格式标注."""
     try:
         with Image.open(img_path) as pil_img:
             width, height = pil_img.size
@@ -161,17 +168,19 @@ def process_one_image(img_path, label_dir, out_img_folder, class_names):
 
     annotations = []
     for ann in parsed_anns:
-        annotations.append({
-            "category_id": ann["class_id"] + 1,
-            "bbox": [ann["x_min"], ann["y_min"], ann["w"], ann["h"]],
-            "area": ann["w"] * ann["h"],
-            "iscrowd": 0
-        })
+        annotations.append(
+            {
+                "category_id": ann["class_id"] + 1,
+                "bbox": [ann["x_min"], ann["y_min"], ann["w"], ann["h"]],
+                "area": ann["w"] * ann["h"],
+                "iscrowd": 0,
+            }
+        )
     return img_path.name, width, height, annotations, skipped, None
 
 
 def yolo2coco(yolo_root, save_coco_dir, class_names, workers=1):
-    """YOLO -> COCO 转换，支持多进程"""
+    """YOLO -> COCO 转换，支持多进程."""
     clear_dir(save_coco_dir)
     img_dir, label_dir = find_image_label_dirs(yolo_root)
     out_img_folder = Path(save_coco_dir) / "images"
@@ -202,23 +211,27 @@ def yolo2coco(yolo_root, save_coco_dir, class_names, workers=1):
             image_id = len(coco_dict["images"]) + 1
             coco_dict["images"].append({"id": image_id, "file_name": file_name, "width": width, "height": height})
             for ann in anns:
-                coco_dict["annotations"].append({
-                    "id": len(coco_dict["annotations"]) + 1,
-                    "image_id": image_id,
-                    "category_id": ann["category_id"],
-                    "bbox": ann["bbox"],
-                    "area": ann["area"],
-                    "iscrowd": ann["iscrowd"],
-                    "keypoints": [],
-                    "num_keypoints": 0
-                })
+                coco_dict["annotations"].append(
+                    {
+                        "id": len(coco_dict["annotations"]) + 1,
+                        "image_id": image_id,
+                        "category_id": ann["category_id"],
+                        "bbox": ann["bbox"],
+                        "area": ann["area"],
+                        "iscrowd": ann["iscrowd"],
+                        "keypoints": [],
+                        "num_keypoints": 0,
+                    }
+                )
             total_annotations += len(anns)
             total_skipped += skipped
     else:
         print(f"使用 {workers} 个进程并行处理...")
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(process_one_image, img_path, label_dir, out_img_folder, class_names): img_path
-                       for img_path in img_paths}
+            futures = {
+                executor.submit(process_one_image, img_path, label_dir, out_img_folder, class_names): img_path
+                for img_path in img_paths
+            }
             with tqdm(total=len(futures), desc="并行转换 YOLO → COCO") as pbar:
                 for future in concurrent.futures.as_completed(futures):
                     pbar.update(1)
@@ -235,18 +248,22 @@ def yolo2coco(yolo_root, save_coco_dir, class_names, workers=1):
                     if file_name is None:
                         continue
                     image_id = len(coco_dict["images"]) + 1
-                    coco_dict["images"].append({"id": image_id, "file_name": file_name, "width": width, "height": height})
+                    coco_dict["images"].append(
+                        {"id": image_id, "file_name": file_name, "width": width, "height": height}
+                    )
                     for ann in anns:
-                        coco_dict["annotations"].append({
-                            "id": len(coco_dict["annotations"]) + 1,
-                            "image_id": image_id,
-                            "category_id": ann["category_id"],
-                            "bbox": ann["bbox"],
-                            "area": ann["area"],
-                            "iscrowd": ann["iscrowd"],
-                            "keypoints": [],
-                            "num_keypoints": 0
-                        })
+                        coco_dict["annotations"].append(
+                            {
+                                "id": len(coco_dict["annotations"]) + 1,
+                                "image_id": image_id,
+                                "category_id": ann["category_id"],
+                                "bbox": ann["bbox"],
+                                "area": ann["area"],
+                                "iscrowd": ann["iscrowd"],
+                                "keypoints": [],
+                                "num_keypoints": 0,
+                            }
+                        )
                     total_annotations += len(anns)
                     total_skipped += skipped
 
@@ -259,33 +276,30 @@ def yolo2coco(yolo_root, save_coco_dir, class_names, workers=1):
 
 
 # ================= 固定2x2网格切片（带重叠 + 双重面积过滤） =================
-def fixed_grid_slice_coco(coco_json, img_dir, out_slice_dir,
-                          min_area_ratio, overlap_ratio=0.0,
-                          min_retain_ratio=0.333):
+def fixed_grid_slice_coco(coco_json, img_dir, out_slice_dir, min_area_ratio, overlap_ratio=0.0, min_retain_ratio=0.333):
+    """2x2网格切片，支持重叠比例。 过滤条件：碎片面积 < min_area_ratio * 子图面积 且 碎片面积 < min_retain_ratio * 原始面积 时丢弃。 默认 min_area_ratio=0
+    关闭子图比例过滤，仅使用 min_retain_ratio 过滤边缘碎片。.
     """
-    2x2网格切片，支持重叠比例。
-    过滤条件：碎片面积 < min_area_ratio * 子图面积 且 碎片面积 < min_retain_ratio * 原始面积 时丢弃。
-    默认 min_area_ratio=0 关闭子图比例过滤，仅使用 min_retain_ratio 过滤边缘碎片。
-    """
-    from PIL import Image
     import json
     from pathlib import Path
+
+    from PIL import Image
 
     out_dir = Path(out_slice_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_img_dir = out_dir / "images"
     out_img_dir.mkdir(exist_ok=True)
 
-    with open(coco_json, 'r', encoding="utf-8") as f:
+    with open(coco_json, encoding="utf-8") as f:
         coco = json.load(f)
 
     print(f"原始COCO标注总数: {len(coco['annotations'])}")
-    if len(coco['annotations']) == 0:
+    if len(coco["annotations"]) == 0:
         print("警告：原始COCO无标注，切片后也将无标注。请检查YOLO→COCO转换步骤。")
 
     anns_by_img = {}
-    for ann in coco['annotations']:
-        anns_by_img.setdefault(ann['image_id'], []).append(ann)
+    for ann in coco["annotations"]:
+        anns_by_img.setdefault(ann["image_id"], []).append(ann)
 
     new_images = []
     new_annotations = []
@@ -294,8 +308,8 @@ def fixed_grid_slice_coco(coco_json, img_dir, out_slice_dir,
     total_original_anns = 0
     total_kept_anns = 0
 
-    for img_info in coco['images']:
-        img_path = Path(img_dir) / img_info['file_name']
+    for img_info in coco["images"]:
+        img_path = Path(img_dir) / img_info["file_name"]
         if not img_path.exists():
             print(f"警告：图片 {img_path} 不存在，跳过")
             continue
@@ -321,7 +335,7 @@ def fixed_grid_slice_coco(coco_json, img_dir, out_slice_dir,
             x_starts = [max(0, x) for x in x_starts]
             y_starts = [max(0, y) for y in y_starts]
 
-            ann_list = anns_by_img.get(img_info['id'], [])
+            ann_list = anns_by_img.get(img_info["id"], [])
             total_original_anns += len(ann_list)
 
             for row in range(2):
@@ -339,17 +353,12 @@ def fixed_grid_slice_coco(coco_json, img_dir, out_slice_dir,
                     sub_img_path = out_img_dir / sub_filename
                     sub_img.save(sub_img_path)
 
-                    new_img_info = {
-                        'id': new_img_id,
-                        'file_name': sub_filename,
-                        'width': sw,
-                        'height': sh
-                    }
+                    new_img_info = {"id": new_img_id, "file_name": sub_filename, "width": sw, "height": sh}
                     new_images.append(new_img_info)
 
                     sub_area = sw * sh
                     for ann in ann_list:
-                        x_min, y_min, bbox_w, bbox_h = ann['bbox']
+                        x_min, y_min, bbox_w, bbox_h = ann["bbox"]
                         x_max = x_min + bbox_w
                         y_max = y_min + bbox_h
                         ori_area = bbox_w * bbox_h  # 原始标注面积
@@ -374,12 +383,12 @@ def fixed_grid_slice_coco(coco_json, img_dir, out_slice_dir,
                             continue
 
                         new_ann = {
-                            'id': ann_id_counter + 1,
-                            'image_id': new_img_id,
-                            'category_id': ann['category_id'],
-                            'bbox': [new_x_min, new_y_min, new_w, new_h],
-                            'area': box_area,
-                            'iscrowd': ann.get('iscrowd', 0)
+                            "id": ann_id_counter + 1,
+                            "image_id": new_img_id,
+                            "category_id": ann["category_id"],
+                            "bbox": [new_x_min, new_y_min, new_w, new_h],
+                            "area": box_area,
+                            "iscrowd": ann.get("iscrowd", 0),
                         }
                         new_annotations.append(new_ann)
                         ann_id_counter += 1
@@ -389,14 +398,10 @@ def fixed_grid_slice_coco(coco_json, img_dir, out_slice_dir,
 
     print(f"原始标注总数: {total_original_anns}, 保留标注数: {total_kept_anns}")
 
-    new_coco = {
-        'images': new_images,
-        'annotations': new_annotations,
-        'categories': coco['categories']
-    }
+    new_coco = {"images": new_images, "annotations": new_annotations, "categories": coco["categories"]}
 
-    new_json_path = out_dir / 'sliced_annotations.json'
-    with open(new_json_path, 'w', encoding="utf-8") as f:
+    new_json_path = out_dir / "sliced_annotations.json"
+    with open(new_json_path, "w", encoding="utf-8") as f:
         json.dump(new_coco, f, indent=2)
 
     print(f"2x2网格切片完成，重叠比例：{overlap_ratio:.2f}")
@@ -405,7 +410,7 @@ def fixed_grid_slice_coco(coco_json, img_dir, out_slice_dir,
 
 
 def filter_background_slices(slice_json_path, slice_img_folder, neg_ratio):
-    """控制背景切片保留比例"""
+    """控制背景切片保留比例."""
     if neg_ratio < 0:
         print("neg_ratio 为负，保留所有背景切片。")
         return
@@ -413,10 +418,10 @@ def filter_background_slices(slice_json_path, slice_img_folder, neg_ratio):
     if not json_path.exists():
         print(f"警告：JSON 文件 {json_path} 不存在，跳过背景筛选。")
         return
-    with open(json_path, "r", encoding="utf-8") as f:
+    with open(json_path, encoding="utf-8") as f:
         coco = json.load(f)
-    pos_ids = set(ann["image_id"] for ann in coco["annotations"])
-    all_ids = set(img["id"] for img in coco["images"])
+    pos_ids = {ann["image_id"] for ann in coco["annotations"]}
+    all_ids = {img["id"] for img in coco["images"]}
     neg_ids = all_ids - pos_ids
     if not neg_ids:
         print("没有背景切片，无需筛选。")
@@ -439,7 +444,7 @@ def filter_background_slices(slice_json_path, slice_img_folder, neg_ratio):
 
 
 def coco2yolo(coco_json_path, save_yolo_root, slice_img_dir):
-    """切片COCO转回YOLO格式，并整理文件，补齐空标签"""
+    """切片COCO转回YOLO格式，并整理文件，补齐空标签."""
     save_root = Path(save_yolo_root)
     if save_root.exists():
         safe_rmtree(save_root, description="最终 YOLO 输出目录")
@@ -469,10 +474,8 @@ def coco2yolo(coco_json_path, save_yolo_root, slice_img_dir):
                     shutil.move(str(txt_file), str(labels_root / txt_file.name))
             for subdir in labels_root.iterdir():
                 if subdir.is_dir():
-                    try:
+                    with contextlib.suppress(OSError):
                         subdir.rmdir()
-                    except OSError:
-                        pass
             print(f"已整理 {len(txt_files)} 个标签文件到 {labels_root}")
         else:
             print("警告：未生成任何标签文件，请检查 COCO JSON 是否包含标注。")
@@ -496,15 +499,13 @@ def coco2yolo(coco_json_path, save_yolo_root, slice_img_dir):
 
 
 def generate_final_statistics(yolo_root, output_json="statistics.json", slice_params=None):
-    """
-    扫描最终 YOLO 格式数据集，生成统计报告，并记录切片参数。
-    """
+    """扫描最终 YOLO 格式数据集，生成统计报告，并记录切片参数。."""
     root = Path(yolo_root)
     img_dir = root / "images"
     labels_dir = root / "labels"
     if not img_dir.exists():
         print(f"警告：图片目录 {img_dir} 不存在，无法生成统计。")
-        return
+        return None
 
     img_files = [f for f in img_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}]
     total_images = len(img_files)
@@ -520,7 +521,7 @@ def generate_final_statistics(yolo_root, output_json="statistics.json", slice_pa
             empty_labels += 1
             continue
         non_empty_labels += 1
-        with open(lbl_file, "r", encoding="utf-8") as f:
+        with open(lbl_file, encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split()
                 if parts:
@@ -531,12 +532,12 @@ def generate_final_statistics(yolo_root, output_json="statistics.json", slice_pa
     classes_file = root.parent / "classes.txt" if root.parent else None
     class_names = {}
     if classes_file and classes_file.exists():
-        with open(classes_file, "r", encoding="utf-8") as f:
+        with open(classes_file, encoding="utf-8") as f:
             names = [line.strip() for line in f if line.strip()]
             for idx, name in enumerate(names):
                 class_names[idx] = name
     else:
-        for cls_id in class_counts.keys():
+        for cls_id in class_counts:
             class_names[cls_id] = f"class_{cls_id}"
 
     stats = {
@@ -546,11 +547,10 @@ def generate_final_statistics(yolo_root, output_json="statistics.json", slice_pa
         "non_empty_label_files": non_empty_labels,
         "total_instances": total_instances,
         "class_distribution": {
-            class_names.get(cls_id, f"class_{cls_id}"): count
-            for cls_id, count in sorted(class_counts.items())
+            class_names.get(cls_id, f"class_{cls_id}"): count for cls_id, count in sorted(class_counts.items())
         },
         "slice_parameters": slice_params if slice_params else {},
-        "description": "SAHI切片，该数据集是通过2x2网格切片（带重叠）从原始图片生成。"
+        "description": "SAHI切片，该数据集是通过2x2网格切片（带重叠）从原始图片生成。",
     }
 
     out_path = root / output_json
@@ -580,13 +580,9 @@ def generate_final_statistics(yolo_root, output_json="statistics.json", slice_pa
 
 
 def convert_yolo_to_xanylabeling(
-    yolo_txt_dir: str,
-    image_dir: str,
-    output_dir: str,
-    class_names: list,
-    version: str = "4.5.3"
+    yolo_txt_dir: str, image_dir: str, output_dir: str, class_names: list, version: str = "4.5.3"
 ):
-    """YOLO txt -> X-AnyLabeling JSON"""
+    """YOLO txt -> X-AnyLabeling JSON."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     img_exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
@@ -626,7 +622,7 @@ def convert_yolo_to_xanylabeling(
                 "shape_type": "rectangle",
                 "flags": {},
                 "attributes": {},
-                "kie_linking": []
+                "kie_linking": [],
             }
             shapes.append(shape)
         result = {
@@ -637,7 +633,7 @@ def convert_yolo_to_xanylabeling(
             "imageData": None,
             "imageHeight": img_h,
             "imageWidth": img_w,
-            "description": ""
+            "description": "",
         }
         json_path = output_path / (txt_name + ".json")
         with open(json_path, "w", encoding="utf-8") as f:
@@ -647,13 +643,9 @@ def convert_yolo_to_xanylabeling(
 
 
 def visualize_random_samples(
-    yolo_root: str,
-    vis_dir: str,
-    class_names: list,
-    num_samples: int = 10,
-    colors: list = None
+    yolo_root: str, vis_dir: str, class_names: list, num_samples: int = 10, colors: list | None = None
 ):
-    """随机可视化带标注的图片"""
+    """随机可视化带标注的图片."""
     root = Path(yolo_root)
     img_dir = root / "images"
     label_dir = root / "labels"
@@ -706,31 +698,44 @@ def visualize_random_samples(
 def main():
     parser = argparse.ArgumentParser(description="YOLO 数据集固定2x2网格切片工具（支持重叠、双重面积过滤）")
     # 目录
-    parser.add_argument("--orig_root", type=str, required=True,
-                        help="原始 YOLO 数据集根目录（必传; 例: D:/datasets/base_0_0）")
-    parser.add_argument("--coco_tmp", type=str, required=True,
-                        help="临时 COCO 存放目录（必传; 例: D:/datasets/coco_temp）")
-    parser.add_argument("--slice_coco_dir", type=str, required=True,
-                        help="切片输出目录（必传; 例: D:/datasets/slice_coco_output）")
-    parser.add_argument("--final_yolo_dir", type=str, required=True,
-                        help="最终 YOLO 切片数据集输出目录（必传; 例: D:/datasets/base_0_1）")
+    parser.add_argument(
+        "--orig_root", type=str, required=True, help="原始 YOLO 数据集根目录（必传; 例: D:/datasets/base_0_0）"
+    )
+    parser.add_argument(
+        "--coco_tmp", type=str, required=True, help="临时 COCO 存放目录（必传; 例: D:/datasets/coco_temp）"
+    )
+    parser.add_argument(
+        "--slice_coco_dir", type=str, required=True, help="切片输出目录（必传; 例: D:/datasets/slice_coco_output）"
+    )
+    parser.add_argument(
+        "--final_yolo_dir",
+        type=str,
+        required=True,
+        help="最终 YOLO 切片数据集输出目录（必传; 例: D:/datasets/base_0_1）",
+    )
     # 格式导出
-    parser.add_argument("--export_json", action="store_true", default=True,
-                        help="是否导出 X-AnyLabeling 格式的 JSON")
+    parser.add_argument("--export_json", action="store_true", default=True, help="是否导出 X-AnyLabeling 格式的 JSON")
     parser.add_argument("--json_dir", type=str, help="JSON 输出目录，默认在 final_yolo_dir 下创建 json 子目录")
 
     # 切片参数
-    parser.add_argument("--overlap_ratio", type=float, default=0.2,
-                        help="重叠比例（0~1），防止目标被切碎")
-    parser.add_argument("--min_area_ratio", type=float, default=0.005,
-                        help="基于子图面积的过滤阈值（0~1），默认0关闭；可以过滤原图中本来就存在的极小目标(可以防止误标)")
-    parser.add_argument("--min_retain_ratio", type=float, default=0.4,
-                        help="基于原始标注面积的过滤阈值（0~1），可以过滤边缘被切片的目标(如目标小于原来的1/3)")
-    
-    parser.add_argument("--neg_ratio", type=float, default=0.2,
-                        help="背景保留比例：<0 保留全部；>=0 保留数量 = 正样本数 × neg_ratio")
-    parser.add_argument("--classes", type=str, default=None,
-                        help="类别名称，逗号分隔，若未指定且自动读取失败则报错")
+    parser.add_argument("--overlap_ratio", type=float, default=0.2, help="重叠比例（0~1），防止目标被切碎")
+    parser.add_argument(
+        "--min_area_ratio",
+        type=float,
+        default=0.005,
+        help="基于子图面积的过滤阈值（0~1），默认0关闭；可以过滤原图中本来就存在的极小目标(可以防止误标)",
+    )
+    parser.add_argument(
+        "--min_retain_ratio",
+        type=float,
+        default=0.4,
+        help="基于原始标注面积的过滤阈值（0~1），可以过滤边缘被切片的目标(如目标小于原来的1/3)",
+    )
+
+    parser.add_argument(
+        "--neg_ratio", type=float, default=0.2, help="背景保留比例：<0 保留全部；>=0 保留数量 = 正样本数 × neg_ratio"
+    )
+    parser.add_argument("--classes", type=str, default=None, help="类别名称，逗号分隔，若未指定且自动读取失败则报错")
     parser.add_argument("--workers", type=int, default=1, help="并行进程数，默认1")
     parser.add_argument("--keep_temp", action="store_true", help="保留临时目录")
     parser.add_argument("--vis_num", type=int, default=10, help="可视化样本数，0表示不执行")
@@ -755,14 +760,16 @@ def main():
             raise FileNotFoundError(f"未找到类别文件 {classes_file}，且未通过 --classes 指定类别，无法继续。")
 
     print("===== 1. YOLO原始数据集转COCO =====")
-    coco_json_path, coco_img_path = yolo2coco(
-        args.orig_root, args.coco_tmp, class_names, workers=args.workers
-    )
+    coco_json_path, coco_img_path = yolo2coco(args.orig_root, args.coco_tmp, class_names, workers=args.workers)
 
     print("\n===== 2. 固定2x2网格切片（带重叠 + 双重面积过滤） =====")
     slice_json, slice_img_folder = fixed_grid_slice_coco(
-        coco_json_path, coco_img_path, args.slice_coco_dir,
-        args.min_area_ratio, args.overlap_ratio, args.min_retain_ratio
+        coco_json_path,
+        coco_img_path,
+        args.slice_coco_dir,
+        args.min_area_ratio,
+        args.overlap_ratio,
+        args.min_retain_ratio,
     )
 
     print("\n===== 2.5 背景切片比例控制 =====")
@@ -776,7 +783,7 @@ def main():
         "overlap_ratio": args.overlap_ratio,
         "min_area_ratio": args.min_area_ratio,
         "min_retain_ratio": args.min_retain_ratio,
-        "slice_mode": "2x2_grid_with_overlap"
+        "slice_mode": "2x2_grid_with_overlap",
     }
 
     print("\n===== 4. 生成统计报告 =====")
@@ -794,7 +801,7 @@ def main():
             yolo_txt_dir=os.path.join(args.final_yolo_dir, "labels"),
             image_dir=os.path.join(args.final_yolo_dir, "images"),
             output_dir=json_output_dir,
-            class_names=class_names
+            class_names=class_names,
         )
 
     if not args.keep_temp:
