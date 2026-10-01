@@ -107,12 +107,11 @@ class GMC:
         """
         if self.method in {"orb", "sift"}:
             return self.apply_features(raw_frame, detections)
-        elif self.method == "ecc":
+        if self.method == "ecc":
             return self.apply_ecc(raw_frame)
-        elif self.method == "sparseOptFlow":
+        if self.method == "sparseOptFlow":
             return self.apply_sparseoptflow(raw_frame)
-        else:
-            return np.eye(2, 3)
+        return np.eye(2, 3)
 
     def apply_ecc(self, raw_frame: np.ndarray) -> np.ndarray:
         """Apply the ECC (Enhanced Correlation Coefficient) algorithm to a raw frame for motion compensation.

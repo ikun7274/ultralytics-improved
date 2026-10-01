@@ -268,7 +268,7 @@ def run_tracker_in_thread(model_name, filename):
     """
     model = YOLO(model_name)
     results = model.track(filename, save=True, stream=True)
-    for r in results:
+    for _r in results:
         pass
 
 

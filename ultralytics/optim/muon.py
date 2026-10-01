@@ -96,7 +96,9 @@ def muon_update(
         updates = list(momentums)
     buckets = {}  # group matrices transposed to rows <= cols by (rows, scale) for batched orthogonalization
     for i, u in enumerate(updates):
-        m = u.reshape(len(u), -1) if u.ndim > 2 else u  # .view fails on non-contiguous tensors; reshape copies if needed
+        m = (
+            u.reshape(len(u), -1) if u.ndim > 2 else u
+        )  # .view fails on non-contiguous tensors; reshape copies if needed
         transpose = m.size(0) > m.size(1)
         if transpose:
             m = m.transpose(0, 1)

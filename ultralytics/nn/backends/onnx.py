@@ -164,8 +164,7 @@ class ONNXBackend(BaseBackend):
             )
             self.session.run_with_iobinding(self.io)
             return self.bindings
-        else:
-            return self.session.run(self.output_names, {self.session.get_inputs()[0].name: im.cpu().numpy()})
+        return self.session.run(self.output_names, {self.session.get_inputs()[0].name: im.cpu().numpy()})
 
 
 class ONNXIMXBackend(ONNXBackend):
@@ -214,10 +213,10 @@ class ONNXIMXBackend(ONNXBackend):
         if self.task == "detect":
             # boxes, conf, cls
             return np.concatenate([y[0], y[1][:, :, None], y[2][:, :, None]], axis=-1)
-        elif self.task == "pose":
+        if self.task == "pose":
             # boxes, conf, kpts
             return np.concatenate([y[0], y[1][:, :, None], y[2][:, :, None], y[3]], axis=-1, dtype=y[0].dtype)
-        elif self.task == "segment":
+        if self.task == "segment":
             return (
                 np.concatenate([y[0], y[1][:, :, None], y[2][:, :, None], y[3]], axis=-1, dtype=y[0].dtype),
                 y[4],
