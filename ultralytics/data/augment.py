@@ -19,11 +19,11 @@ from ultralytics.data.online_degrade import _OCCLUSION_TYPES, _WEATHER_TYPES
 from ultralytics.data.online_io import _ensure_dir
 from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, IterableSimpleNamespace, colorstr, deprecation_warn
-from ultralytics.utils.patches import imwrite  # unicode-safe save (cv2.imwrite silently fails on non-ASCII paths)
 from ultralytics.utils.checks import check_version
 from ultralytics.utils.instance import Instances
 from ultralytics.utils.metrics import bbox_ioa
 from ultralytics.utils.ops import segment2box, xywh2xyxy, xyxyxyxy2xywhr
+from ultralytics.utils.patches import imwrite  # unicode-safe save (cv2.imwrite silently fails on non-ASCII paths)
 from ultralytics.utils.torch_utils import TORCHVISION_0_10, TORCHVISION_0_11, TORCHVISION_0_13
 
 DEFAULT_MEAN = (0.0, 0.0, 0.0)
@@ -59,8 +59,7 @@ class BaseTransform:
         labels = self.apply_image(labels, params)
         labels = self.apply_instances(labels, params)
         labels = self.apply_semantic(labels, params)
-        labels = self.apply_depth(labels, params)
-        return labels
+        return self.apply_depth(labels, params)
 
     def get_params(self, labels):
         """Compute and return transformation parameters.
@@ -466,8 +465,17 @@ class Mosaic(BaseMixTransform):
         >>> augmented_labels = mosaic_aug(original_labels)
     """
 
-    def __init__(self, dataset, imgsz: int = 640, p: float = 1.0, n: int = 4, save_dir: str | Path = "",
-                 save_max: int = 0, save_annotated: bool = True, exist_ok: bool = True):
+    def __init__(
+        self,
+        dataset,
+        imgsz: int = 640,
+        p: float = 1.0,
+        n: int = 4,
+        save_dir: str | Path = "",
+        save_max: int = 0,
+        save_annotated: bool = True,
+        exist_ok: bool = True,
+    ):
         """Initialize the Mosaic augmentation object.
 
         This class performs mosaic augmentation by combining multiple (4 or 9) images into a single mosaic image. The
@@ -521,9 +529,11 @@ class Mosaic(BaseMixTransform):
                 xyxy = instances.xyxy  # pixel coords on the canvas
                 cls = instances.cls
                 for b, c in zip(xyxy, cls):
-                    x0, y0, x1, y1 = (int(round(float(v))) for v in b)
+                    x0, y0, x1, y1 = (round(float(v)) for v in b)
                     cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                    cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.putText(
+                        img, f"cls{int(c)}", (x0, max(0, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1
+                    )
             except Exception as e:
                 # annotation drawing is best-effort for verification only; keep a debug trace
                 LOGGER.debug(f"Mosaic: annotation drawing failed while saving (best-effort): {e}")
@@ -557,8 +567,8 @@ class Mosaic(BaseMixTransform):
             # The buffer is a deque; materialising it as a list is kept intentionally, because
             # deque indexing is O(n) and random.choices indexes it once per drawn sample.
             return random.choices(list(self.dataset.buffer), k=self.n - 1)
-        else:  # select any images
-            return [random.randint(0, len(self.dataset) - 1) for _ in range(self.n - 1)]
+        # select any images
+        return [random.randint(0, len(self.dataset) - 1) for _ in range(self.n - 1)]
 
     def get_params(self, labels: dict[str, Any]) -> dict[str, Any]:
         """Compute mosaic layout parameters.
@@ -842,18 +852,17 @@ def slice_geometry(
 ) -> list[tuple[int, int, int, int]]:
     """Return the 4 ``(x0, y0, x1, y1)`` tiles of the 2x2 overlap grid for a ``w x h`` image.
 
-    Shared by the training-side ``OnlineSlice`` and the validation-side ``SliceValDataset`` so the
-    training and validation slice geometry always stays aligned. Slice size = half the image extent
-    scaled by ``(1 + overlap_ratio)`` (e.g. 4000x3000 + 0.2 -> 2400x1800 tiles).
+    Shared by the training-side ``OnlineSlice`` and the validation-side ``SliceValDataset`` so the training and
+    validation slice geometry always stays aligned. Slice size = half the image extent scaled by ``(1 + overlap_ratio)``
+    (e.g. 4000x3000 + 0.2 -> 2400x1800 tiles).
 
-    ``bias_x`` / ``bias_y`` (in [-0.5, 0.5], relative to the image extent; 0 = centered grid) shift
-    the cut seam away from the image center: the vertical seam sits at ``w/2 + bias_x * w`` and the
-    horizontal seam at ``h/2 + bias_y * h``. This is the "target-aware slicing" hook: the caller
-    (``OnlineSlice``) computes the bias from the per-image box-center distribution so the seams land
-    in the sparsest regions and fewer objects get cut in half. The tile COUNT, full-image coverage
-    and total overlap ``2*sw - w`` are unchanged; a positive bias widens the left/top tile by
-    ``bias*w`` and narrows the right/bottom tile by the same amount, so the seam moves by ``bias*w``
-    while every pixel of the image still belongs to at least one tile.
+    ``bias_x`` / ``bias_y`` (in [-0.5, 0.5], relative to the image extent; 0 = centered grid) shift the cut seam away
+    from the image center: the vertical seam sits at ``w/2 + bias_x * w`` and the horizontal seam at ``h/2 + bias_y *
+    h``. This is the "target-aware slicing" hook: the caller (``OnlineSlice``) computes the bias from the per-image
+    box-center distribution so the seams land in the sparsest regions and fewer objects get cut in half. The tile COUNT,
+    full-image coverage and total overlap ``2*sw - w`` are unchanged; a positive bias widens the left/top tile by
+    ``bias*w`` and narrows the right/bottom tile by the same amount, so the seam moves by ``bias*w`` while every pixel
+    of the image still belongs to at least one tile.
     """
     # Explicit ValueError rather than assert: this validates USER configuration, and assert statements
     # are stripped entirely under ``python -O``, which would silently disable the guard.
@@ -867,8 +876,8 @@ def slice_geometry(
     sh = min(h, max(1, int((1 + overlap_ratio) * h / 2)))
     # Seam delta in pixels. The seam moves by exactly `delta` while both tiles keep a positive width
     # and the image stays fully covered: tile1 = [0, sw+dx], tile2 = [w-sw+dx, w].
-    dx = max(sw - w, min(w - sw, int(round(bias_x * w))))
-    dy = max(sh - h, min(h - sh, int(round(bias_y * h))))
+    dx = max(sw - w, min(w - sw, round(bias_x * w)))
+    dy = max(sh - h, min(h - sh, round(bias_y * h)))
     tw1, tw2 = sw + dx, sw - dx
     th1, th2 = sh + dy, sh - dy
     return [
@@ -889,21 +898,19 @@ def compute_slice_bias(
 ) -> tuple[float, float]:
     """Target-aware seam bias for ``slice_geometry``.
 
-    Projects the box centers (from pixel ``xyxy`` boxes) onto the x/y axes and places each seam at the
-    candidate position (uniformly sampled inside ``[margin, 1-margin]``) that has the fewest box
-    centers within its window (window = median box width/height, floored at 5% of the extent). Returns
-    ``(bias_x, bias_y)`` in [-0.5, 0.5] relative positions, so the caller passes them straight to
-    ``slice_geometry``. ``jitter`` adds a uniform random perturbation each call (per-epoch variation
-    without re-computing anything) so the same image does not get the identical seams every epoch.
-    Empty boxes -> (0, 0) (centered grid, unchanged behavior).
+    Projects the box centers (from pixel ``xyxy`` boxes) onto the x/y axes and places each seam at the candidate
+    position (uniformly sampled inside ``[margin, 1-margin]``) that has the fewest box centers within its window (window
+    = median box width/height, floored at 5% of the extent). Returns ``(bias_x, bias_y)`` in [-0.5, 0.5] relative
+    positions, so the caller passes them straight to ``slice_geometry``. ``jitter`` adds a uniform random perturbation
+    each call (per-epoch variation without re-computing anything) so the same image does not get the identical seams
+    every epoch. Empty boxes -> (0, 0) (centered grid, unchanged behavior).
 
     Args:
-        jitter_rng (random.Random | None): Source of the ``jitter`` draw. ``None`` (default) uses the
-            GLOBAL ``random`` stream, which makes the bias vary on every call. Callers that need the
-            grid to be a stable property of ``(image, epoch)`` -- required so all 4 tiles of one
-            original in ``slice_all_tiles`` mode share ONE grid (otherwise the 2x2 union no longer
-            covers the image and the per-tile seam decisions contradict each other) -- must pass a
-            deterministic RNG derived from ``(epoch, image index)`` instead.
+        jitter_rng (random.Random | None): Source of the ``jitter`` draw. ``None`` (default) uses the GLOBAL ``random``
+            stream, which makes the bias vary on every call. Callers that need the grid to be a stable property of
+            ``(image, epoch)`` -- required so all 4 tiles of one original in ``slice_all_tiles`` mode share ONE grid
+            (otherwise the 2x2 union no longer covers the image and the per-tile seam decisions contradict each other)
+            -- must pass a deterministic RNG derived from ``(epoch, image index)`` instead.
     """
     if xyxy is None or len(xyxy) == 0:
         return 0.0, 0.0
@@ -934,23 +941,21 @@ def compute_slice_bias(
 class OnlineSlice(BaseTransform):
     """Online SAHI-style 2x2 overlap slicing on the ORIGINAL-resolution image.
 
-    Ports the core algorithms of the offline SAHI equal-division slicing tool into an online
-    per-sample transform: 2x2 equal division with overlap, the dual area filter, and background
-    (empty-tile) retention. It runs in the dataset loading step on the raw (original-resolution)
-    image — before the training resize — so the tile size is computed from the ORIGINAL size:
-    e.g. with ``overlap_ratio=0.2`` an original 4000x3000 image yields 2400x1800 tiles. The sampled
-    tile is then resized to the training size by the normal loader, which genuinely enlarges small
-    objects (SAHI semantics). With probability ``p`` the original image is divided into a 2x2 grid of
-    overlapping tiles (tile size = (1 + ``overlap_ratio``) * img / 2), one tile is sampled, and the
-    instances intersecting it are kept after the dual area filter.
+    Ports the core algorithms of the offline SAHI equal-division slicing tool into an online per-sample transform: 2x2
+    equal division with overlap, the dual area filter, and background (empty-tile) retention. It runs in the dataset
+    loading step on the raw (original-resolution) image — before the training resize — so the tile size is computed from
+    the ORIGINAL size: e.g. with ``overlap_ratio=0.2`` an original 4000x3000 image yields 2400x1800 tiles. The sampled
+    tile is then resized to the training size by the normal loader, which genuinely enlarges small objects (SAHI
+    semantics). With probability ``p`` the original image is divided into a 2x2 grid of overlapping tiles (tile size =
+    (1 + ``overlap_ratio``) * img / 2), one tile is sampled, and the instances intersecting it are kept after the dual
+    area filter.
 
-    When the sampled tile has no kept instances (a background tile), it is emitted as an empty-label
-    background sample only while the emitted background count stays below ``emitted positive count *
-    neg_ratio`` (the offline slicing tool's ratio rule); otherwise the original image is kept unchanged.
-    ``neg_ratio < 0`` keeps every background tile.
+    When the sampled tile has no kept instances (a background tile), it is emitted as an empty-label background sample
+    only while the emitted background count stays below ``emitted positive count * neg_ratio`` (the offline slicing
+    tool's ratio rule); otherwise the original image is kept unchanged. ``neg_ratio < 0`` keeps every background tile.
 
-    Sliced images can optionally be saved to ``save_dir`` (up to ``save_max`` images, annotated with
-    boxes when ``save_annotated``) for visual inspection of the online slicing result.
+    Sliced images can optionally be saved to ``save_dir`` (up to ``save_max`` images, annotated with boxes when
+    ``save_annotated``) for visual inspection of the online slicing result.
 
     Attributes:
         p (float): Probability of applying the slicing.
@@ -998,35 +1003,34 @@ class OnlineSlice(BaseTransform):
             min_area_ratio (float): Dual-filter threshold relative to the tile area.
             min_retain_ratio (float): Dual-filter threshold relative to the original box area.
             neg_ratio (float): Background (empty-tile) retention ratio relative to emitted positive tiles:
-                ``background_count < positive_count * neg_ratio`` gates emitting an empty tile;
-                ``neg_ratio < 0`` keeps every background tile.
+                ``background_count < positive_count * neg_ratio`` gates emitting an empty tile; ``neg_ratio < 0`` keeps
+                every background tile.
             save_dir (str | Path): Directory to save sliced images (empty disables saving).
             save_max (int): Maximum number of sliced images to save (0 = unlimited).
             save_annotated (bool): Draw annotation boxes/classes on saved images.
-            exist_ok (bool): Allow saving into an already-existing ``save_dir``; when False, raise an error
-                if the directory already exists to avoid overwriting previous sliced outputs.
-            center_constraint (bool): When True, assign each box only to the tile containing its center
-                (unique ownership), preventing a box from being split/repeated across tiles. ``min_center_ratio``
-                still allows a box to also appear in an adjacent tile when it retains enough of its area there.
-            min_center_ratio (float): In [0, 1]. With ``center_constraint=True``, a box whose center is outside
-                a tile is kept in that tile only if its retained area ratio there is >= this value (compat for
-                large objects). 1.0 = strictly unique (center-only).
-            full_box_only (bool): Keep a box in a tile ONLY when the whole box lies fully inside that tile;
-                a box that is cut by a tile boundary is filtered out (never kept as a partial/sliver box).
-                This is the "keep every target unless the slice cut it" behavior. When True it takes precedence
-                over ``center_constraint`` (which would otherwise drop targets from non-owning tiles), so
-                every fully-contained target is preserved in every tile that fully contains it (duplicates in
-                the overlap region are intentional).
-            center_bias (bool): Target-aware seam shifting. When True, each sliced image computes the 2x2
-                seam position from its own box-center distribution (projection onto each axis, seam placed at
-                the sparsest candidate inside ``[bias_margin, 1-bias_margin]``), so fewer boxes get cut in
-                half by a seam. Tile size/overlap/count are unchanged (only the seam moves). False = fixed
-                centered grid (fully backward compatible).
+            exist_ok (bool): Allow saving into an already-existing ``save_dir``; when False, raise an error if the
+                directory already exists to avoid overwriting previous sliced outputs.
+            center_constraint (bool): When True, assign each box only to the tile containing its center (unique
+                ownership), preventing a box from being split/repeated across tiles. ``min_center_ratio`` still allows a
+                box to also appear in an adjacent tile when it retains enough of its area there.
+            min_center_ratio (float): In [0, 1]. With ``center_constraint=True``, a box whose center is outside a tile
+                is kept in that tile only if its retained area ratio there is >= this value (compat for large objects).
+                1.0 = strictly unique (center-only).
+            full_box_only (bool): Keep a box in a tile ONLY when the whole box lies fully inside that tile; a box that
+                is cut by a tile boundary is filtered out (never kept as a partial/sliver box). This is the "keep every
+                target unless the slice cut it" behavior. When True it takes precedence over ``center_constraint``
+                (which would otherwise drop targets from non-owning tiles), so every fully-contained target is preserved
+                in every tile that fully contains it (duplicates in the overlap region are intentional).
+            center_bias (bool): Target-aware seam shifting. When True, each sliced image computes the 2x2 seam position
+                from its own box-center distribution (projection onto each axis, seam placed at the sparsest candidate
+                inside ``[bias_margin, 1-bias_margin]``), so fewer boxes get cut in half by a seam. Tile
+                size/overlap/count are unchanged (only the seam moves). False = fixed centered grid (fully
+                backward compatible).
             bias_margin (float): In (0, 0.5]. Seam search window edge: the seam position is restricted to
                 ``[bias_margin, 1-bias_margin]`` of each axis so tiles never become too small.
-            bias_jitter (float): Uniform seam perturbation (relative to the image extent) applied once per
-                ``(epoch, image)``, so the same image does not get identical seams every epoch while all
-                4 tiles of that image keep sharing one grid. 0 disables.
+            bias_jitter (float): Uniform seam perturbation (relative to the image extent) applied once per ``(epoch,
+                image)``, so the same image does not get identical seams every epoch while all 4 tiles of that image
+                keep sharing one grid. 0 disables.
         """
         # Explicit ValueError rather than assert: every one of these is a user-supplied hyperparameter
         # from default.yaml, and ``python -O`` strips asserts -- the invalid value would then be
@@ -1112,8 +1116,7 @@ class OnlineSlice(BaseTransform):
             return True
         return self._bg_count < self._pos_count * self.neg_ratio
 
-    def _save_tile(self, tile: np.ndarray, boxes_px: np.ndarray, cls: np.ndarray, tag: str,
-                   src: Any = None) -> None:
+    def _save_tile(self, tile: np.ndarray, boxes_px: np.ndarray, cls: np.ndarray, tag: str, src: Any = None) -> None:
         """Save a sliced image (optionally with annotations), limited by ``save_max`` and deduplicated by ``src``."""
         if self.save_dir is None or (self.save_max > 0 and self._saved >= self.save_max):
             return
@@ -1134,7 +1137,7 @@ class OnlineSlice(BaseTransform):
                     "-- drawing only the aligned prefix."
                 )
             for b, c in zip(boxes_px, cls):
-                x0, y0, x1, y1 = (int(round(float(v))) for v in b)
+                x0, y0, x1, y1 = (round(float(v)) for v in b)
                 cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
                 cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         # _ensure_dir: mkdir once per process instead of a syscall per saved tile per worker.
@@ -1160,9 +1163,7 @@ class OnlineSlice(BaseTransform):
         """
         bx, by = 0.0, 0.0
         if self.center_bias:
-            bx, by = compute_slice_bias(
-                w, h, xyxy, self.bias_margin, self.bias_jitter, jitter_rng=self._grid_rng(key)
-            )
+            bx, by = compute_slice_bias(w, h, xyxy, self.bias_margin, self.bias_jitter, jitter_rng=self._grid_rng(key))
         return slice_geometry(w, h, self.overlap_ratio, bx, by), bx, by
 
     def _geometry(self, img: np.ndarray, label: dict[str, Any], key: Any = None) -> list:
@@ -1272,14 +1273,25 @@ class OnlineSlice(BaseTransform):
             new_label["keypoints"] = np.empty((0, 0, 3), dtype=np.float32)
         return new_label
 
-    def _emit(self, img: np.ndarray, label: dict[str, Any], x0: int, y0: int, x1: int, y1: int, idx: np.ndarray,
-              local: np.ndarray, src: Any = None, count: bool = True) -> tuple[np.ndarray, dict[str, Any]]:
+    def _emit(
+        self,
+        img: np.ndarray,
+        label: dict[str, Any],
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+        idx: np.ndarray,
+        local: np.ndarray,
+        src: Any = None,
+        count: bool = True,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
         """Build the (sub_img, updated label) for a selected tile; handles background and save.
 
         Args:
-            count (bool): Whether to update the positive/background counters and save the tile. Auxiliary
-                "mix" samples (mosaic/cutmix/mixup companions) pass ``count=False`` so they do not inflate
-                the neg_ratio quota or duplicate saves.
+            count (bool): Whether to update the positive/background counters and save the tile. Auxiliary "mix" samples
+                (mosaic/cutmix/mixup companions) pass ``count=False`` so they do not inflate the neg_ratio quota or
+                duplicate saves.
         """
         h, w = img.shape[:2]
         tw, th = x1 - x0, y1 - y0
@@ -1324,7 +1336,7 @@ class OnlineSlice(BaseTransform):
         else:
             new_label["segments"] = []
         # keypoints (normalized x, y + visibility) -> sub-image normalized
-        kpts = label.get("keypoints", None)
+        kpts = label.get("keypoints")
         if kpts is not None:
             k = np.asarray(kpts, dtype=np.float64)[idx].copy()
             k[..., 0] = (k[..., 0] * w - x0) / tw
@@ -1334,8 +1346,9 @@ class OnlineSlice(BaseTransform):
             self._save_tile(sub, local, cls, f"pos{os.getpid()}", src)
         return sub, new_label
 
-    def __call__(self, img: np.ndarray, label: dict[str, Any], src: Any = None,
-                 count: bool = True, key: Any = None) -> tuple[np.ndarray, dict[str, Any]]:
+    def __call__(
+        self, img: np.ndarray, label: dict[str, Any], src: Any = None, count: bool = True, key: Any = None
+    ) -> tuple[np.ndarray, dict[str, Any]]:
         """Slice the ORIGINAL-resolution image and return a RANDOMLY sampled tile (mode A).
 
         The label dict uses the raw dataset format: ``bboxes`` (N, 4) in ``bbox_format``/``normalized``,
@@ -1343,12 +1356,12 @@ class OnlineSlice(BaseTransform):
         returned sub-image keeps its original resolution; downstream training resize enlarges small targets.
 
         Args:
-            src (Any): Optional unique key (e.g. ``(img_index, k)`` or ``img_index``) used to save each
-                tile only once across epochs / mosaic mix visits.
+            src (Any): Optional unique key (e.g. ``(img_index, k)`` or ``img_index``) used to save each tile only once
+                across epochs / mosaic mix visits.
             count (bool): Whether to update counters/save (False for auxiliary mix samples).
             key (Any): Original image index. Pins the seam jitter to ``(epoch, key)`` so the grid is a
-                stable property of the image within an epoch (``src`` cannot be reused for this: it also
-                carries the tile index ``k`` in ``slice_all_tiles`` mode and keys the save-once set).
+            stable property of the image within an epoch (``src`` cannot be reused for this: it also carries the tile
+                index ``k`` in ``slice_all_tiles`` mode and keys the save-once set).
         """
         if random.uniform(0, 1) > self.p:
             return img, label
@@ -1359,19 +1372,20 @@ class OnlineSlice(BaseTransform):
         x0, y0, x1, y1, idx, local = random.choice(tile_results)
         return self._emit(img, label, x0, y0, x1, y1, idx, local, src, count)
 
-    def slice_at(self, img: np.ndarray, label: dict[str, Any], k: int,
-                 src: Any = None, count: bool = True, key: Any = None) -> tuple[np.ndarray, dict[str, Any]]:
+    def slice_at(
+        self, img: np.ndarray, label: dict[str, Any], k: int, src: Any = None, count: bool = True, key: Any = None
+    ) -> tuple[np.ndarray, dict[str, Any]]:
         """Return the ``k``-th (0..3) tile so all 4 tiles participate in training (mode B / emit_all).
 
         Background-quota-exceeded tiles fall back to the ORIGINAL image (Plan A), never to an empty
         tile, so every sample in the 4N pool carries either a sliced tile or the full original.
 
         Args:
-            src (Any): Optional unique key (e.g. ``(img_index, k)`` or ``img_index``) used to save each
-                tile only once across epochs / mosaic mix visits.
+            src (Any): Optional unique key (e.g. ``(img_index, k)`` or ``img_index``) used to save each tile only once
+                across epochs / mosaic mix visits.
             count (bool): Whether to update counters/save (False for auxiliary mix samples).
-            key (Any): Original image index -- the SAME value for k=0..3 of one image. It is what makes
-                the 4 tiles share one grid; do NOT pass ``(img_index, k)`` here.
+            key (Any): Original image index -- the SAME value for k=0..3 of one image. It is what makes the 4 tiles
+                share one grid; do NOT pass ``(img_index, k)`` here.
         """
         if random.uniform(0, 1) > self.p:
             return img, label
@@ -1955,7 +1969,7 @@ class RandomPerspective(BaseTransform):
         mask = labels["semantic_mask"]
         M = params["M"]
         size = params["size"]
-        if (size[0] != mask.shape[1] or size[1] != mask.shape[0]) or (M != np.eye(3)).any():
+        if (size[0] != mask.shape[1] or size[1] != mask.shape[0]) or (np.eye(3) != M).any():
             if self.perspective:
                 mask = cv2.warpPerspective(mask, M, dsize=size, flags=cv2.INTER_NEAREST, borderValue=255)
             else:
@@ -1975,7 +1989,7 @@ class RandomPerspective(BaseTransform):
 
         M = params["M"]
         size = params["size"]
-        if (size[0] != depth.shape[1] or size[1] != depth.shape[0]) or (M != np.eye(3)).any():
+        if (size[0] != depth.shape[1] or size[1] != depth.shape[0]) or (np.eye(3) != M).any():
             if self.perspective:
                 depth = cv2.warpPerspective(depth, M, dsize=size, flags=cv2.INTER_NEAREST, borderValue=0)
             else:
@@ -2544,8 +2558,7 @@ class CopyPaste(BaseMixTransform):
             params = self.get_params(labels)
             labels = self.apply_image(labels, params)
             labels = self.apply_instances(labels, params)
-            labels = self.apply_semantic(labels, params)
-            return labels
+            return self.apply_semantic(labels, params)
         return super().__call__(labels)
 
     def get_params(self, labels: dict[str, Any]) -> dict[str, Any]:
@@ -3079,8 +3092,7 @@ class Format(BaseTransform):
             img = img[..., None]
         img = img.transpose(2, 0, 1)
         img = np.ascontiguousarray(img[::-1] if random.uniform(0, 1) > self.bgr and img.shape[0] == 3 else img)
-        img = torch.from_numpy(img)
-        return img
+        return torch.from_numpy(img)
 
     def _format_segments(
         self, instances: Instances, cls: np.ndarray, w: int, h: int
@@ -3394,25 +3406,24 @@ _MISSING = object()
 def _hyp_get(hyp: Any, key: str, default: Any = _MISSING) -> Any:
     """Read one project hyperparameter, falling back to its ``default.yaml`` value.
 
-    ``v8_transforms`` mirrors ~67 project keys (slicing / compose / ratio / blur / weather / occlusion /
-    save caps) from ``hyp`` onto the dataset. Those reads used to be spelled ``getattr(hyp, "<key>")``
-    with no default, which is exactly equivalent to ``hyp.<key>`` -- Ruff flags all 60 of them as B009,
-    "not any safer than normal property access" -- and aborts the augmentation build with an
-    ``AttributeError`` whenever ``hyp`` was not freshly derived from the current ``DEFAULT_CFG``: a
-    third-party ``IterableSimpleNamespace``, a hand-built ``dict``, or the ``train_args`` restored from
-    an older ``args.yaml`` / checkpoint that predates the key. Falling back the same way
-    ``base._ONLINE_DEFAULTS`` already does for its per-call reads keeps one behaviour for the pipeline.
+    ``v8_transforms`` mirrors ~67 project keys (slicing / compose / ratio / blur / weather / occlusion / save caps) from
+    ``hyp`` onto the dataset. Those reads used to be spelled ``getattr(hyp, "<key>")`` with no default, which is exactly
+    equivalent to ``hyp.<key>`` -- Ruff flags all 60 of them as B009, "not any safer than normal property access" -- and
+    aborts the augmentation build with an ``AttributeError`` whenever ``hyp`` was not freshly derived from the current
+    ``DEFAULT_CFG``: a third-party ``IterableSimpleNamespace``, a hand-built ``dict``, or the ``train_args`` restored
+    from an older ``args.yaml`` / checkpoint that predates the key. Falling back the same way ``base._ONLINE_DEFAULTS``
+    already does for its per-call reads keeps one behavior for the pipeline.
 
-    Resolution order: attribute on ``hyp`` -> ``default`` when given -> ``DEFAULT_CFG_DICT[key]``. A key
-    in neither place is a developer error (it is missing from ``ultralytics/cfg/default.yaml``), so it
-    raises a ``ValueError`` naming the key instead of silently picking a built-in literal -- which makes
-    the "register every new key in default.yaml" convention self-enforcing at build time.
+    Resolution order: attribute on ``hyp`` -> ``default`` when given -> ``DEFAULT_CFG_DICT[key]``. A key in neither
+    place is a developer error (it is missing from ``ultralytics/cfg/default.yaml``), so it raises a ``ValueError``
+    naming the key instead of silently picking a built-in literal -- which makes the "register every new key in
+    default.yaml" convention self-enforcing at build time.
 
-    不要改回 `getattr(hyp, "<key>", <字面量>)`: 默认值只能有一个真源 (default.yaml), 两处各写一遍
-    迟早漂移; 新增 cfg 键却忘了登记 default.yaml 时, 这里会立刻报错而不是静默用字面量兜底。
+    不要改回 `getattr(hyp, "<key>", <字面量>)`: 默认值只能有一个真源 (default.yaml), 两处各写一遍 迟早漂移; 新增 cfg 键却忘了登记 default.yaml 时,
+    这里会立刻报错而不是静默用字面量兜底。
 
-    Deliberately NOT used for the upstream YOLO keys (``hyp.mosaic``, ``hyp.mixup``, ...): a ``hyp``
-    missing those is genuinely broken and upstream raises on them too.
+    Deliberately NOT used for the upstream YOLO keys (``hyp.mosaic``, ``hyp.mixup``, ...): a ``hyp`` missing those is
+    genuinely broken and upstream raises on them too.
     """
     if default is _MISSING:
         try:
@@ -3510,7 +3521,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     # ---- 在线切片 (slice_prob 独立开关) ----
     slice_enabled = online_aug_on and _hyp_get(hyp, "slice_prob") > 0.0
     if slice_enabled:
-        # tile cap honours slice_save_max_tile override (falls back to slice_save_max when None).
+        # tile cap honors slice_save_max_tile override (falls back to slice_save_max when None).
         # tile is the ONLY branch whose cap lives on the OnlineSlice instance itself (see
         # OnlineSlice._save_tile), so the override must be applied here at construction time --
         # unlike blur/ratio/compose whose caps base.py reads per-call from `self`.
@@ -3598,16 +3609,12 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     _w = [t.strip() for t in dataset.weather_types.split(",") if t.strip()]
     _bad = sorted(set(_w) - _WEATHER_TYPES)
     if _bad:
-        raise ValueError(
-            f"weather_types contains unknown type(s) {_bad}; valid types: {sorted(_WEATHER_TYPES)}."
-        )
+        raise ValueError(f"weather_types contains unknown type(s) {_bad}; valid types: {sorted(_WEATHER_TYPES)}.")
     dataset.weather_types = ",".join(_w) if _w else "haze"
     _o = [t.strip() for t in dataset.occlusion_types.split(",") if t.strip()]
     _bad = sorted(set(_o) - _OCCLUSION_TYPES)
     if _bad:
-        raise ValueError(
-            f"occlusion_types contains unknown type(s) {_bad}; valid types: {sorted(_OCCLUSION_TYPES)}."
-        )
+        raise ValueError(f"occlusion_types contains unknown type(s) {_bad}; valid types: {sorted(_OCCLUSION_TYPES)}.")
     dataset.occlusion_types = ",".join(_o) if _o else "rect"
     # per-branch save cap overrides (slice_save_max_{blur,ratio,compose,weather,occlusion}).
     # base.py's _save_cap() reads these from `self`; if not set here it falls back to slice_save_max.
