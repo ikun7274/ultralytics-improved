@@ -48,7 +48,7 @@ PERSONALITIES = {  # mode-selection weights only; mutation kernel and classifier
     "train": {"train": 0.7, "val": 0.075, "predict": 0.075, "track": 0.075, "export": 0.075},
     "export": {"train": 0.075, "val": 0.075, "predict": 0.075, "track": 0.075, "export": 0.7},
     "predict-val": {"train": 0.05, "val": 0.35, "predict": 0.35, "track": 0.2, "export": 0.05},
-    "chaos": {m: 0.2 for m in MODES},
+    "chaos": dict.fromkeys(MODES, 0.2),
 }
 STRATEGY_WEIGHTS = [
     ("invalid", 0.3),
@@ -748,7 +748,7 @@ def cmd_fuzz(args):
     corpus = build_corpus(uni)
 
     deadline = time.time() + args.budget_minutes * 60
-    counters = {k: 0 for k in ("pass", "expected", "env-skip", "flake", "timeout", "crash", "bug-candidate")}
+    counters = dict.fromkeys(("pass", "expected", "env-skip", "flake", "timeout", "crash", "bug-candidate"), 0)
     findings, seen, canary_results, hang_confirms, n = {}, set(), [], 0, 0
 
     def execute(trial, canary=False):

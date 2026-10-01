@@ -305,10 +305,7 @@ class SequenceGeometryEncoder(nn.Module):
             proj = self.boxes_pool_project(sampled)
             proj = proj.view(bs, n_boxes, self.d_model).transpose(0, 1)
 
-            if boxes_embed is None:
-                boxes_embed = proj
-            else:
-                boxes_embed = boxes_embed + proj
+            boxes_embed = proj if boxes_embed is None else boxes_embed + proj
 
         if self.boxes_pos_enc_project is not None:
             cx, cy, w, h = boxes.unbind(-1)
@@ -316,10 +313,7 @@ class SequenceGeometryEncoder(nn.Module):
             enc = enc.view(boxes.shape[0], boxes.shape[1], enc.shape[-1])
 
             proj = self.boxes_pos_enc_project(enc.to(img_feats.dtype))
-            if boxes_embed is None:
-                boxes_embed = proj
-            else:
-                boxes_embed = boxes_embed + proj
+            boxes_embed = proj if boxes_embed is None else boxes_embed + proj
 
         # Add label embeddings
         type_embed = self.label_embed(boxes_labels.long())
