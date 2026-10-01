@@ -160,8 +160,7 @@ def get_window_obj(anno: dict[str, Any], windows: np.ndarray, iof_thr: float = 0
         iofs = bbox_iof(label[:, 1:], windows)
         # Unnormalized and misaligned coordinates
         return [(label[iofs[:, i] >= iof_thr]) for i in range(len(windows))]  # window_anns
-    else:
-        return [np.zeros((0, 9), dtype=np.float32) for _ in range(len(windows))]  # window_anns
+    return [np.zeros((0, 9), dtype=np.float32) for _ in range(len(windows))]  # window_anns
 
 
 def crop_and_save(

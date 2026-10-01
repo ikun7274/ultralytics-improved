@@ -108,7 +108,7 @@ class SegmentationHead(nn.Module):
             else:
                 pixel_embed = self.pixel_decoder(backbone_visual_feats)
         else:
-            backbone_feats = [x for x in backbone_feats]
+            backbone_feats = list(backbone_feats)
             pixel_embed = self.pixel_decoder(backbone_feats)
             if pixel_embed.shape[0] == 1:
                 # For batch_size=1 training, we can avoid the indexing to save memory
