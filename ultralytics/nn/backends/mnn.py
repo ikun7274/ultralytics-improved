@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -40,10 +41,8 @@ class MNNBackend(BaseBackend):
         # Load metadata from bizCode
         info = self.net.get_info()
         if "bizCode" in info:
-            try:
+            with contextlib.suppress(json.JSONDecodeError):
                 self.apply_metadata(json.loads(info["bizCode"]))
-            except json.JSONDecodeError:
-                pass
 
     def forward(self, im: torch.Tensor) -> list:
         """Run inference using the MNN runtime.

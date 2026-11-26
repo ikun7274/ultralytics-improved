@@ -1,7 +1,6 @@
-import os
-import sys
 import argparse
 import shutil
+import sys
 from pathlib import Path
 
 # 共享的路径安全护栏（同目录 _safe_io.py）：直接运行 `python pytools/<脚本>.py` 时
@@ -9,11 +8,11 @@ from pathlib import Path
 _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-from _safe_io import safe_rmtree, validate_io_dirs  # noqa: E402
+import math
 
+from _safe_io import safe_rmtree, validate_io_dirs  # noqa: E402
 from PIL import Image
 from tqdm import tqdm
-import math
 
 # Pillow >= 10 removed ``Image.LANCZOS`` (use ``Image.Resampling.LANCZOS``); keep a fallback
 # so this script still runs against older Pillow too.
@@ -26,7 +25,7 @@ def parse_yolo_label(txt_path):
     anns = []
     if not Path(txt_path).exists():
         return anns
-    with open(txt_path, 'r', encoding="utf-8") as f:
+    with open(txt_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -44,7 +43,7 @@ def parse_yolo_label(txt_path):
 
 
 def write_yolo_label(txt_path, anns):
-    with open(txt_path, 'w', encoding="utf-8") as f:
+    with open(txt_path, "w", encoding="utf-8") as f:
         for cls_id, xc, yc, w, h in anns:
             f.write(f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
 
@@ -55,7 +54,7 @@ REL_TOL = 0.02
 
 
 def compute_padding(w, h, target_ratio, auto):
-    """计算 padding 参数。返回 (new_w, new_h, pad_left, pad_top) 或 None(无需转换)。
+    """计算 padding 参数。返回 (new_w, new_h, pad_left, pad_top) 或 None(无需转换)。.
 
     - ratio < target (偏瘦高): 高度不变, 左右对称加宽
     - ratio > target (偏宽扁): 宽度不变, 上下对称加高
@@ -78,20 +77,20 @@ def compute_padding(w, h, target_ratio, auto):
             return None  # 已接近目标比例, 无需转换
 
     if ratio < target:  # 左右加宽
-        new_w = max(1, int(round(h * target)))
+        new_w = max(1, round(h * target))
         new_h = h
         pad_left = (new_w - w) // 2
         pad_top = 0
     else:  # 上下加高
         new_w = w
-        new_h = max(1, int(round(w / target)))
+        new_h = max(1, round(w / target))
         pad_left = 0
         pad_top = (new_h - h) // 2
     return new_w, new_h, pad_left, pad_top
 
 
 def remap_labels(anns, w, h, new_w, new_h, pad_left, pad_top):
-    """加黑边后重映射归一化坐标, 边界 clamp, 丢弃无效框。"""
+    """加黑边后重映射归一化坐标, 边界 clamp, 丢弃无效框。."""
     new_anns = []
     for cls_id, xc, yc, w_norm, h_norm in anns:
         # 原图绝对坐标
@@ -117,9 +116,10 @@ def remap_labels(anns, w, h, new_w, new_h, pad_left, pad_top):
     return new_anns
 
 
-def process_image(img_path, label_path, out_img_dir, out_label_dir,
-                  target_ratio="auto", pad_color="black", max_side=0, stats=None):
-    img = Image.open(img_path).convert('RGB')
+def process_image(
+    img_path, label_path, out_img_dir, out_label_dir, target_ratio="auto", pad_color="black", max_side=0, stats=None
+):
+    img = Image.open(img_path).convert("RGB")
     w, h = img.size
 
     pad = compute_padding(w, h, target_ratio, auto=(target_ratio == "auto"))
@@ -127,7 +127,7 @@ def process_image(img_path, label_path, out_img_dir, out_label_dir,
         # 无需比例转换: 直接复制, 但仍受 max_side 限制 (等比缩放, 归一化标签不变)
         if max_side > 0 and max(w, h) > max_side:
             scale = max_side / max(w, h)
-            nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+            nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
             img.resize((nw, nh), _LANCZOS).save(out_img_dir / img_path.name)
         else:
             shutil.copy(img_path, out_img_dir / img_path.name)
@@ -138,7 +138,7 @@ def process_image(img_path, label_path, out_img_dir, out_label_dir,
         return
 
     new_w, new_h, pad_left, pad_top = pad
-    new_img = Image.new('RGB', (new_w, new_h), color=PAD_COLORS[pad_color])
+    new_img = Image.new("RGB", (new_w, new_h), color=PAD_COLORS[pad_color])
     new_img.paste(img, (pad_left, pad_top))
 
     # 可选 max_side 等比缩放, 同时按相同比例缩放 pad_left/pad_top,
@@ -146,10 +146,10 @@ def process_image(img_path, label_path, out_img_dir, out_label_dir,
     # 标签坐标会系统性偏移.
     if max_side > 0 and max(new_w, new_h) > max_side:
         scale = max_side / max(new_w, new_h)
-        new_w = max(1, int(round(new_w * scale)))
-        new_h = max(1, int(round(new_h * scale)))
-        pad_left = int(round(pad_left * scale))
-        pad_top = int(round(pad_top * scale))
+        new_w = max(1, round(new_w * scale))
+        new_h = max(1, round(new_h * scale))
+        pad_left = round(pad_left * scale)
+        pad_top = round(pad_top * scale)
         new_img = new_img.resize((new_w, new_h), _LANCZOS)
 
     new_img.save(out_img_dir / img_path.name)
@@ -167,19 +167,34 @@ def main():
     parser = argparse.ArgumentParser(
         description="统一图片宽高比(加黑边)并同步转换YOLO标签: auto双向(4:3<->16:9)或指定目标比例统一所有图"
     )
-    parser.add_argument("--input_dir", type=str, required=True,
-                        help="输入目录（必传），应包含 images/ 和 labels/ 子目录 (例: D:/datasets/base_0_0)")
-    parser.add_argument("--output_dir", type=str, required=True,
-                        help="输出目录（必传），将自动创建 images/ 和 labels/ (例: D:/datasets/base_0_1)")
-    parser.add_argument("--target_ratio", type=str, default="auto",
-                        choices=["auto", "4:3", "16:9"],
-                        help="目标比例: auto=仅4:3<->16:9双向(其他复制); 4:3/16:9=所有图统一到该比例")
-    parser.add_argument("--pad_color", type=str, default="gray", choices=list(PAD_COLORS.keys()),
-                        help="黑边颜色: black/gray/white")
-    parser.add_argument("--max_side", type=int, default=0,
-                        help="输出图片最大边长(px), 0=不缩放")
-    parser.add_argument("--overwrite", action="store_true",
-                        help="覆盖已存在的输出目录（默认关闭：输出目录已存在时报错退出，避免误删数据）")
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        required=True,
+        help="输入目录（必传），应包含 images/ 和 labels/ 子目录 (例: D:/datasets/base_0_0)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="输出目录（必传），将自动创建 images/ 和 labels/ (例: D:/datasets/base_0_1)",
+    )
+    parser.add_argument(
+        "--target_ratio",
+        type=str,
+        default="auto",
+        choices=["auto", "4:3", "16:9"],
+        help="目标比例: auto=仅4:3<->16:9双向(其他复制); 4:3/16:9=所有图统一到该比例",
+    )
+    parser.add_argument(
+        "--pad_color", type=str, default="gray", choices=list(PAD_COLORS.keys()), help="黑边颜色: black/gray/white"
+    )
+    parser.add_argument("--max_side", type=int, default=0, help="输出图片最大边长(px), 0=不缩放")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="覆盖已存在的输出目录（默认关闭：输出目录已存在时报错退出，避免误删数据）",
+    )
     args = parser.parse_args()
 
     # 目录校验：必传 + 拒绝 cwd/系统关键路径 + 输入≠输出，全部在删除动作之前完成
@@ -201,29 +216,40 @@ def main():
     out_img_dir.mkdir(parents=True, exist_ok=True)
     out_label_dir.mkdir(parents=True, exist_ok=True)
 
-    img_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     img_files = [f for f in img_dir.iterdir() if f.suffix.lower() in img_exts]
     if not img_files:
         print("未找到任何图片")
         return
 
     stats = {"converted": 0, "copied": 0, "failed": 0}
-    print(f"找到 {len(img_files)} 张图片, target_ratio={args.target_ratio}, pad_color={args.pad_color}, "
-          f"max_side={args.max_side if args.max_side > 0 else '不限'}, 开始处理...")
+    print(
+        f"找到 {len(img_files)} 张图片, target_ratio={args.target_ratio}, pad_color={args.pad_color}, "
+        f"max_side={args.max_side if args.max_side > 0 else '不限'}, 开始处理..."
+    )
     for img_path in tqdm(img_files, desc="处理进度"):
-        label_path = label_dir / (img_path.stem + '.txt') if label_dir.exists() else None
+        label_path = label_dir / (img_path.stem + ".txt") if label_dir.exists() else None
         try:
-            process_image(img_path, label_path, out_img_dir, out_label_dir,
-                          target_ratio=args.target_ratio, pad_color=args.pad_color,
-                          max_side=args.max_side, stats=stats)
+            process_image(
+                img_path,
+                label_path,
+                out_img_dir,
+                out_label_dir,
+                target_ratio=args.target_ratio,
+                pad_color=args.pad_color,
+                max_side=args.max_side,
+                stats=stats,
+            )
         except Exception as e:
             stats["failed"] += 1
             print(f"处理 {img_path.name} 失败: {e}")
 
     print(f"\n全部处理完成! 结果保存在: {output_path}")
-    print(f"  - images/ : 转换后的图片")
-    print(f"  - labels/ : 对应的标签")
-    print(f"  统计: 共 {len(img_files)} 张 | 转换 {stats['converted']} | 复制 {stats['copied']} | 失败 {stats['failed']}")
+    print("  - images/ : 转换后的图片")
+    print("  - labels/ : 对应的标签")
+    print(
+        f"  统计: 共 {len(img_files)} 张 | 转换 {stats['converted']} | 复制 {stats['copied']} | 失败 {stats['failed']}"
+    )
 
 
 if __name__ == "__main__":

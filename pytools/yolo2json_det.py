@@ -1,24 +1,19 @@
-import os
-import json
 import glob
+import json
+import os
+
 from PIL import Image
 
-def yolo_to_xanylabeling(
-    yolo_txt_dir: str,
-    image_dir: str,
-    output_dir: str,
-    class_names: list,
-    version: str = "4.5.3"
-):
-    """
-    批量将 YOLO 检测框 txt 转换为 X-AnyLabeling JSON 格式。
+
+def yolo_to_xanylabeling(yolo_txt_dir: str, image_dir: str, output_dir: str, class_names: list, version: str = "4.5.3"):
+    """批量将 YOLO 检测框 txt 转换为 X-AnyLabeling JSON 格式。.
 
     Args:
         yolo_txt_dir: YOLO txt 标注文件夹路径
-        image_dir:    对应图片文件夹路径（用于读取图片宽高）
-        output_dir:   输出 JSON 文件夹路径
-        class_names:  类别名列表，索引对应 YOLO txt 中的 class_id
-        version:      X-AnyLabeling 版本号，默认 4.5.3
+        image_dir: 对应图片文件夹路径（用于读取图片宽高）
+        output_dir: 输出 JSON 文件夹路径
+        class_names: 类别名列表，索引对应 YOLO txt 中的 class_id
+        version: X-AnyLabeling 版本号，默认 4.5.3
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -52,7 +47,7 @@ def yolo_to_xanylabeling(
 
         # 解析 YOLO txt
         shapes = []
-        with open(txt_path, "r", encoding="utf-8") as f:
+        with open(txt_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -64,8 +59,8 @@ def yolo_to_xanylabeling(
                 class_id = int(parts[0])
                 x_center = float(parts[1])
                 y_center = float(parts[2])
-                width    = float(parts[3])
-                height   = float(parts[4])
+                width = float(parts[3])
+                height = float(parts[4])
 
                 # 归一化 → 像素坐标
                 x1 = (x_center - width / 2) * img_w
@@ -84,19 +79,14 @@ def yolo_to_xanylabeling(
                 shape = {
                     "label": label,
                     "score": None,
-                    "points": [
-                        [x1, y1],
-                        [x2, y1],
-                        [x2, y2],
-                        [x1, y2]
-                    ],
+                    "points": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
                     "group_id": None,
                     "description": "",
                     "difficult": False,
                     "shape_type": "rectangle",
                     "flags": {},
                     "attributes": {},
-                    "kie_linking": []
+                    "kie_linking": [],
                 }
                 shapes.append(shape)
 
@@ -109,7 +99,7 @@ def yolo_to_xanylabeling(
             "imageData": None,
             "imageHeight": img_h,
             "imageWidth": img_w,
-            "description": ""
+            "description": "",
         }
 
         # 写出 JSON（与图片同名）
@@ -133,20 +123,15 @@ if __name__ == "__main__":
     YOLO_TXT_DIR = ""
 
     # 2. 对应图片文件夹（用于读取宽高; 必传; 例: D:/datasets/base_0_3/images）
-    IMAGE_DIR    = ""
+    IMAGE_DIR = ""
 
     # 3. 输出 JSON 文件夹 (必传; 例: D:/datasets/base_0_3/coco_json)
-    OUTPUT_DIR   = ""
+    OUTPUT_DIR = ""
 
     # 4. 类别名列表（索引 = YOLO txt 中的 class_id）
     #    例如 classes.txt 内容每行一个类别，可直接读取：
     #    with open("classes.txt", "r") as f:
     #        CLASS_NAMES = [l.strip() for l in f if l.strip()]
-    CLASS_NAMES =   ['human']
+    CLASS_NAMES = ["human"]
 
-    yolo_to_xanylabeling(
-        yolo_txt_dir=YOLO_TXT_DIR,
-        image_dir=IMAGE_DIR,
-        output_dir=OUTPUT_DIR,
-        class_names=CLASS_NAMES
-    )
+    yolo_to_xanylabeling(yolo_txt_dir=YOLO_TXT_DIR, image_dir=IMAGE_DIR, output_dir=OUTPUT_DIR, class_names=CLASS_NAMES)

@@ -50,10 +50,7 @@ def _interp_plot(plot, n=101):
     x_new = np.linspace(x[0], x[-1], n)
 
     # Interpolate y values (handle both 1D and 2D arrays)
-    if y.ndim == 1:
-        y_new = np.interp(x_new, x, y)
-    else:
-        y_new = np.array([np.interp(x_new, x, yi) for yi in y])
+    y_new = np.interp(x_new, x, y) if y.ndim == 1 else np.array([np.interp(x_new, x, yi) for yi in y])
 
     # Also interpolate ap if present (for PR curves)
     result = {**plot, "x": x_new.tolist(), "y": y_new.tolist()}

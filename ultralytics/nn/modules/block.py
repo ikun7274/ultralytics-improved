@@ -136,8 +136,7 @@ class HGStem(nn.Module):
         x1 = self.pool(x)
         x = torch.cat([x1, x2], dim=1)
         x = self.stem3(x)
-        x = self.stem4(x)
-        return x
+        return self.stem4(x)
 
 
 class HGBlock(nn.Module):
@@ -1332,8 +1331,7 @@ class Attention(nn.Module):
         else:
             attn = ((q * self.scale).transpose(-2, -1) @ k).softmax(dim=-1)
             x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
-        x = self.proj(x)
-        return x
+        return self.proj(x)
 
 
 class PSABlock(nn.Module):
@@ -1382,8 +1380,7 @@ class PSABlock(nn.Module):
             (torch.Tensor): Output tensor after attention and feed-forward processing.
         """
         x = x + self.attn(x) if self.add else self.attn(x)
-        x = x + self.ffn(x) if self.add else self.ffn(x)
-        return x
+        return x + self.ffn(x) if self.add else self.ffn(x)
 
 
 class PSA(nn.Module):

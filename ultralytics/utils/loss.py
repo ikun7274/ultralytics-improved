@@ -43,12 +43,11 @@ class VarifocalLoss(nn.Module):
         """Compute varifocal loss between predictions and ground truth."""
         weight = self.alpha * pred_score.sigmoid().pow(self.gamma) * (1 - label) + gt_score * label
         with autocast(enabled=False, device=pred_score.device.type):
-            loss = (
+            return (
                 (F.binary_cross_entropy_with_logits(pred_score.float(), gt_score.float(), reduction="none") * weight)
                 .mean(1)
                 .sum()
             )
-        return loss
 
 
 class FocalLoss(nn.Module):
@@ -285,10 +284,9 @@ class MultiChannelDiceLoss(nn.Module):
 
         if self.reduction == "mean":
             return dice_loss.mean()
-        elif self.reduction == "sum":
+        if self.reduction == "sum":
             return dice_loss.sum()
-        else:
-            return dice_loss
+        return dice_loss
 
 
 class BCEDiceLoss(nn.Module):
@@ -761,11 +759,9 @@ class v8PoseLoss(v8DetectionLoss):
         target_gt_idx_expanded = target_gt_idx.unsqueeze(-1).unsqueeze(-1)
 
         # Use target_gt_idx_expanded to select keypoints from batched_keypoints
-        selected_keypoints = batched_keypoints.gather(
+        return batched_keypoints.gather(
             1, target_gt_idx_expanded.expand(-1, -1, keypoints.shape[1], keypoints.shape[2])
         )
-
-        return selected_keypoints
 
     def calculate_keypoints_loss(
         self,
@@ -855,7 +851,7 @@ class PoseLoss26(v8PoseLoss):
 
         pred_kpts = pred_kpts.view(batch_size, -1, *self.kpt_shape)  # (b, h*w, 17, 3)
 
-        if self.rle_loss and preds.get("kpts_sigma", None) is not None:
+        if self.rle_loss and preds.get("kpts_sigma") is not None:
             pred_sigma = preds["kpts_sigma"].permute(0, 2, 1).contiguous()
             pred_sigma = pred_sigma.view(batch_size, -1, self.kpt_shape[0], 2)  # (b, h*w, 17, 2)
             pred_kpts = torch.cat([pred_kpts, pred_sigma], dim=-1)  # (b, h*w, 17, 5)

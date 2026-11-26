@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
 """Mock end-to-end validation for val_slice_* (validation-side SAHI eval).
 Needs a working torch+ultralytics env (conda env 'langchain' / 'computevision').
 Asserts: SliceValDataset layout, remap round-trip, class-wise NMS, and mAP=1.0
 with perfect sub-tile predictions. Run from repo root:
-    python pytools/_mock_val_slice.py
+    python pytools/_mock_val_slice.py.
 """
+
 import os
 import sys
 import tempfile
@@ -18,8 +18,8 @@ ROOT = Path(r"C:\Users\Administrator\Desktop\ultralytics-improved")
 os.environ["YOLO_OFFLINE"] = "1"
 sys.path.insert(0, str(ROOT))
 
-from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.base import SliceValDataset
+from ultralytics.data.dataset import YOLODataset
 from ultralytics.models.yolo.detect import DetectionValidator
 
 PASS = []
@@ -52,9 +52,21 @@ def make_mini_dataset(tmp: Path, n_imgs=2, imgsz=640):
         (lbl_dir / f"v{i}.txt").write_text("\n".join(lines) + "\n")
     data = {"path": str(tmp), "nc": 2, "names": ["a", "b"]}
     return YOLODataset(
-        img_path=str(img_dir), imgsz=imgsz, batch_size=2, augment=False,
-        hyp={}, rect=False, cache=False, single_cls=False, stride=32,
-        pad=0.5, prefix="val: ", task="detect", classes=None, data=data, fraction=1.0,
+        img_path=str(img_dir),
+        imgsz=imgsz,
+        batch_size=2,
+        augment=False,
+        hyp={},
+        rect=False,
+        cache=False,
+        single_cls=False,
+        stride=32,
+        pad=0.5,
+        prefix="val: ",
+        task="detect",
+        classes=None,
+        data=data,
+        fraction=1.0,
     )
 
 
@@ -66,11 +78,24 @@ def test_slice_val_dataset():
         sv = SliceValDataset(ds, overlap_ratio=0.2, all_tiles=True, ratio=1.0)
         check("len=4N", len(sv) == 8, f"len={len(sv)}")
         sample = sv[0]
-        for key in ("img", "cls", "bboxes", "batch_idx", "ori_shape", "resized_shape", "ratio_pad", "im_file", "val_slice_meta"):
+        for key in (
+            "img",
+            "cls",
+            "bboxes",
+            "batch_idx",
+            "ori_shape",
+            "resized_shape",
+            "ratio_pad",
+            "im_file",
+            "val_slice_meta",
+        ):
             check(f"sample has {key}", key in sample, str(list(sample.keys())))
         check("img is tensor", isinstance(sample["img"], torch.Tensor) and sample["img"].ndim == 3)
         meta = sample["val_slice_meta"]
-        check("meta fields", all(k in meta for k in ("orig_idx", "k", "offset", "tile_shape", "orig_shape", "n_tiles", "sliced")))
+        check(
+            "meta fields",
+            all(k in meta for k in ("orig_idx", "k", "offset", "tile_shape", "orig_shape", "n_tiles", "sliced")),
+        )
         check("meta sliced+n_tiles=4", meta["sliced"] is True and meta["n_tiles"] == 4)
         sv2 = SliceValDataset(ds, overlap_ratio=0.2, all_tiles=True, ratio=0.5)
         check("ratio=0.5 len=5", len(sv2) == 5, f"len={len(sv2)}")
@@ -82,11 +107,27 @@ def test_slice_val_dataset():
 
 def test_remap_and_fusion():
     print("== Remap + NMS fusion + GT pixels ==")
-    args = dict(val_slice_enable=True, val_slice_overlap_ratio=0.2, val_slice_all_tiles=True,
-                val_slice_ratio=1.0, val_slice_nms_iou=0.5, conf=0.001, iou=0.7, imgsz=640, task="detect")
+    args = {
+        "val_slice_enable": True,
+        "val_slice_overlap_ratio": 0.2,
+        "val_slice_all_tiles": True,
+        "val_slice_ratio": 1.0,
+        "val_slice_nms_iou": 0.5,
+        "conf": 0.001,
+        "iou": 0.7,
+        "imgsz": 640,
+        "task": "detect",
+    }
     v = DetectionValidator(args=args)
-    meta = {"orig_idx": 0, "k": 0, "offset": (0, 0), "tile_shape": (180, 240),
-            "orig_shape": (300, 400), "n_tiles": 4, "sliced": True}
+    meta = {
+        "orig_idx": 0,
+        "k": 0,
+        "offset": (0, 0),
+        "tile_shape": (180, 240),
+        "orig_shape": (300, 400),
+        "n_tiles": 4,
+        "sliced": True,
+    }
     pred_imgsz = torch.tensor([[300.0, 330.0, 400.0, 430.0]])  # canvas box of original (100,100)-(200,200) in tile0
     out = v._remap_boxes_imgsz_to_orig(pred_imgsz, meta, 640)
     expect = torch.tensor([[100.0, 100.0, 200.0, 200.0]])
@@ -108,9 +149,22 @@ def test_end_to_end_fusion():
         tmp = Path(td)
         ds = make_mini_dataset(tmp, n_imgs=2)
         sv = SliceValDataset(ds, overlap_ratio=0.2, all_tiles=True, ratio=1.0)
-        args = dict(val_slice_enable=True, val_slice_overlap_ratio=0.2, val_slice_all_tiles=True,
-                    val_slice_ratio=1.0, val_slice_nms_iou=0.5, conf=0.001, iou=0.7, imgsz=640, task="detect",
-                    single_cls=False, plots=False, save_json=False, save_txt=False, visualize=False)
+        args = {
+            "val_slice_enable": True,
+            "val_slice_overlap_ratio": 0.2,
+            "val_slice_all_tiles": True,
+            "val_slice_ratio": 1.0,
+            "val_slice_nms_iou": 0.5,
+            "conf": 0.001,
+            "iou": 0.7,
+            "imgsz": 640,
+            "task": "detect",
+            "single_cls": False,
+            "plots": False,
+            "save_json": False,
+            "save_txt": False,
+            "visualize": False,
+        }
         v = DetectionValidator(args=args)
         v._slice_base_labels = sv.base.labels
         v._slice_acc = {}
@@ -118,7 +172,7 @@ def test_end_to_end_fusion():
         v.metrics = DetectionValidator(args=args).metrics
         samples = [sv[i] for i in range(len(sv))]
         batch = {}
-        for k in samples[0].keys():
+        for k in samples[0]:
             vals = [s[k] for s in samples]
             if k == "img":
                 batch[k] = torch.stack(vals)
@@ -136,12 +190,26 @@ def test_end_to_end_fusion():
             cls_ids = batch["cls"][batch["batch_idx"] == si].squeeze(-1)
             n = len(cls_ids)
             if n == 0:
-                preds.append({"bboxes": torch.empty((0, 4)), "conf": torch.empty(0), "cls": torch.empty(0), "extra": torch.empty((0, 0))})
+                preds.append(
+                    {
+                        "bboxes": torch.empty((0, 4)),
+                        "conf": torch.empty(0),
+                        "cls": torch.empty(0),
+                        "extra": torch.empty((0, 0)),
+                    }
+                )
                 continue
             bboxes_xywh = batch["bboxes"][batch["batch_idx"] == si]
-            cx, cy, bw, bh = bboxes_xywh[:, 0] * 640, bboxes_xywh[:, 1] * 640, bboxes_xywh[:, 2] * 640, bboxes_xywh[:, 3] * 640
+            cx, cy, bw, bh = (
+                bboxes_xywh[:, 0] * 640,
+                bboxes_xywh[:, 1] * 640,
+                bboxes_xywh[:, 2] * 640,
+                bboxes_xywh[:, 3] * 640,
+            )
             xyxy = torch.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], 1)
-            preds.append({"bboxes": xyxy, "conf": torch.full((n,), 0.9), "cls": cls_ids.float(), "extra": torch.empty((n, 0))})
+            preds.append(
+                {"bboxes": xyxy, "conf": torch.full((n,), 0.9), "cls": cls_ids.float(), "extra": torch.empty((n, 0))}
+            )
         v.update_metrics(preds, batch)
         check("slice_acc drained", len(v._slice_acc) == 0, str(v._slice_acc.keys()))
         check("seen == n_imgs", v.seen == 2, f"seen={v.seen}")

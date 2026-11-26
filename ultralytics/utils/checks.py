@@ -294,9 +294,7 @@ def check_imgsz(imgsz, stride=32, min_dim=1, max_dim=2, floor=0):
         LOGGER.warning(f"imgsz={imgsz} must be multiple of max stride {stride}, updating to {sz}")
 
     # Add missing dimensions if necessary
-    sz = [sz[0], sz[0]] if min_dim == 2 and len(sz) == 1 else sz[0] if min_dim == 1 and len(sz) == 1 else sz
-
-    return sz
+    return [sz[0], sz[0]] if min_dim == 2 and len(sz) == 1 else sz[0] if min_dim == 1 and len(sz) == 1 else sz
 
 
 @functools.lru_cache
@@ -346,7 +344,7 @@ def check_version(
     if not current:  # if current is '' or None
         LOGGER.warning(f"invalid check_version({current}, {required}) requested, please check values.")
         return True
-    elif not current[0].isdigit():  # current is package name rather than version string, i.e. current='ultralytics'
+    if not current[0].isdigit():  # current is package name rather than version string, i.e. current='ultralytics'
         try:
             name = current  # assigned package name to 'name' arg
             current = metadata.version(current)  # get version string from package name
@@ -471,6 +469,7 @@ def check_font(font="Arial.ttf"):
     if downloads.is_url(url, check=True):
         downloads.safe_download(url=url, file=file)
         return file
+    return None
 
 
 def check_python(minimum: str = "3.8.0", hard: bool = True, verbose: bool = False) -> bool:
@@ -785,7 +784,7 @@ def check_file(file, suffix="", download=True, download_dir=".", hard=True):
         or file.lower().startswith("grpc://")
     ):  # file exists or gRPC Triton images
         return file
-    elif download and file.lower().startswith("ul://"):  # Ultralytics Platform URI
+    if download and file.lower().startswith("ul://"):  # Ultralytics Platform URI
         url = resolve_platform_uri(file, hard=hard)  # Convert to signed HTTPS URL
         if url is None:
             return []  # Not found, soft fail (consistent with file search behavior)
@@ -803,7 +802,7 @@ def check_file(file, suffix="", download=True, download_dir=".", hard=True):
             local_file.parent.mkdir(parents=True, exist_ok=True)
             downloads.safe_download(url=url, file=local_file, unzip=False)
         return str(local_file)
-    elif download and file.lower().startswith(REMOTE_FILE_PREFIXES):  # download
+    if download and file.lower().startswith(REMOTE_FILE_PREFIXES):  # download
         if file.startswith("gs://"):
             file = "https://storage.googleapis.com/" + file[5:]  # convert gs:// to public HTTPS URL
         url = file  # warning: Pathlib turns :// -> :/
@@ -813,13 +812,13 @@ def check_file(file, suffix="", download=True, download_dir=".", hard=True):
         else:
             downloads.safe_download(url=url, file=file, unzip=False)
         return str(file)
-    else:  # search
-        files = glob.glob(str(ROOT / "**" / file), recursive=True) or glob.glob(str(ROOT.parent / file))  # find file
-        if not files and hard:
-            raise FileNotFoundError(f"'{file}' does not exist")
-        elif len(files) > 1 and hard:
-            raise FileNotFoundError(f"Multiple files match '{file}', specify exact path: {files}")
-        return files[0] if len(files) else []  # return file
+    # search
+    files = glob.glob(str(ROOT / "**" / file), recursive=True) or glob.glob(str(ROOT.parent / file))  # find file
+    if not files and hard:
+        raise FileNotFoundError(f"'{file}' does not exist")
+    if len(files) > 1 and hard:
+        raise FileNotFoundError(f"Multiple files match '{file}', specify exact path: {files}")
+    return files[0] if len(files) else []  # return file
 
 
 def check_yaml(file, suffix=(".yaml", ".yml"), hard=True):
@@ -997,7 +996,7 @@ def check_amp(model):
     prefix = colorstr("AMP: ")
     if device.type in {"cpu", "mps"}:
         return False  # AMP only used on accelerator devices
-    elif device.type == "cuda":
+    if device.type == "cuda":
         # GPUs that have issues with AMP
         pattern = re.compile(
             r"(nvidia|geforce|quadro|tesla).*?(1660|1650|1630|t400|t550|t600|t1000|t1200|t2000|k40m)", re.IGNORECASE
@@ -1112,20 +1111,19 @@ def cuda_device_count() -> int:
     if IS_JETSON:
         # NVIDIA Jetson does not fully support nvidia-smi and therefore use PyTorch instead
         return torch.cuda.device_count()
-    else:
-        try:
-            # Run the nvidia-smi command and capture its output
-            output = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=count", "--format=csv,noheader,nounits"], encoding="utf-8"
-            )
+    try:
+        # Run the nvidia-smi command and capture its output
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=count", "--format=csv,noheader,nounits"], encoding="utf-8"
+        )
 
-            # Take the first line and strip any leading/trailing white space
-            first_line = output.strip().split("\n", 1)[0]
+        # Take the first line and strip any leading/trailing white space
+        first_line = output.strip().split("\n", 1)[0]
 
-            return int(first_line)
-        except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-            # If the command fails, nvidia-smi is not found, or output is not an integer, assume no GPUs are available
-            return 0
+        return int(first_line)
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        # If the command fails, nvidia-smi is not found, or output is not an integer, assume no GPUs are available
+        return 0
 
 
 def cuda_is_available() -> bool:

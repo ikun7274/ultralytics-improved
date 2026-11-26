@@ -114,6 +114,7 @@ class YOLOEVPDetectPredictor(DetectionPredictor):
         for _, im0s, _ in self.dataset:
             im = self.preprocess(im0s)
             return self.model(im, vpe=self.visuals, return_vpe=True)
+        return None
 
 
 class YOLOEVPSegPredictor(YOLOEVPDetectPredictor, SegmentationPredictor):

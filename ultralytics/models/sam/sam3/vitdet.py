@@ -207,9 +207,7 @@ class Attention(nn.Module):
         else:
             x = x.view(B, self.num_heads, L, -1).permute(0, 2, 1, 3).reshape(B, L, -1)
 
-        x = self.proj(x)
-
-        return x
+        return self.proj(x)
 
 
 class Block(nn.Module):
@@ -305,9 +303,7 @@ class Block(nn.Module):
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
 
         x = shortcut + self.dropout(self.drop_path(x))
-        x = x + self.dropout(self.drop_path(self.ls2(self.mlp(self.norm2(x)))))
-
-        return x
+        return x + self.dropout(self.drop_path(self.ls2(self.mlp(self.norm2(x)))))
 
 
 class ViT(nn.Module):

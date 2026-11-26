@@ -125,8 +125,7 @@ class CLIP(TextModel):
             torch.Size([2, 512])
         """
         txt_feats = self.model.encode_text(texts).to(dtype)
-        txt_feats = txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True)
-        return txt_feats
+        return txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True)
 
     @smart_inference_mode()
     def encode_image(self, image: Image.Image | torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -156,8 +155,7 @@ class CLIP(TextModel):
         if isinstance(image, Image.Image):
             image = self.image_preprocess(image).unsqueeze(0).to(self.device)
         img_feats = self.model.encode_image(image).to(dtype)
-        img_feats = img_feats / img_feats.norm(p=2, dim=-1, keepdim=True)
-        return img_feats
+        return img_feats / img_feats.norm(p=2, dim=-1, keepdim=True)
 
 
 class MobileCLIP(TextModel):
@@ -350,9 +348,8 @@ def build_text_model(variant: str, device: torch.device = None) -> TextModel:
     base, size = variant.split(":")
     if base == "clip":
         return CLIP(size, device)
-    elif base == "mobileclip":
+    if base == "mobileclip":
         return MobileCLIPTS(device)
-    elif base == "mobileclip2":
+    if base == "mobileclip2":
         return MobileCLIPTS(device, weight="mobileclip2_b.ts")
-    else:
-        raise ValueError(f"Unrecognized base model '{base}'. Supported models are 'clip', 'mobileclip', 'mobileclip2'.")
+    raise ValueError(f"Unrecognized base model '{base}'. Supported models are 'clip', 'mobileclip', 'mobileclip2'.")

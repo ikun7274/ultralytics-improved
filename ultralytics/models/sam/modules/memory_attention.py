@@ -111,8 +111,7 @@ class MemoryAttentionLayer(nn.Module):
         tgt2 = self.norm1(tgt)
         q = k = tgt2 + query_pos if self.pos_enc_at_attn else tgt2
         tgt2 = self.self_attn(q, k, v=tgt2)
-        tgt = tgt + self.dropout1(tgt2)
-        return tgt
+        return tgt + self.dropout1(tgt2)
 
     def _forward_ca(
         self,
@@ -136,8 +135,7 @@ class MemoryAttentionLayer(nn.Module):
             v=memory,
             **kwds,
         )
-        tgt = tgt + self.dropout2(tgt2)
-        return tgt
+        return tgt + self.dropout2(tgt2)
 
     def forward(
         self,
@@ -164,8 +162,7 @@ class MemoryAttentionLayer(nn.Module):
         # MLP
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout3(tgt2)
-        return tgt
+        return tgt + self.dropout3(tgt2)
 
 
 class MemoryAttention(nn.Module):

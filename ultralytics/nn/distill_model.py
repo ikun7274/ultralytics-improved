@@ -267,8 +267,7 @@ class DistillationModel(nn.Module):
         student_feat = student_feat.view(n, c, -1)
         teacher_feat = teacher_feat.view(n, c, -1)
         mse = F.mse_loss(student_feat, teacher_feat, reduction="none")
-        weighted_mse = (mse * teacher_score).sum() / (teacher_score.sum() * c + 1e-9)
-        return weighted_mse
+        return (mse * teacher_score).sum() / (teacher_score.sum() * c + 1e-9)
 
     @property
     def criterion(self):

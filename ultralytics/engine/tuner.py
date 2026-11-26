@@ -175,6 +175,7 @@ class Tuner:
                     f"{self.prefix}MongoDB connection failed (attempt {attempt + 1}), retrying in {wait_time}s..."
                 )
                 time.sleep(wait_time)
+        return None
 
     def _init_mongodb(self, mongodb_uri="", mongodb_db="", mongodb_collection=""):
         """Initialize MongoDB connection for distributed tuning.
@@ -431,8 +432,7 @@ class Tuner:
                         return hyp
                 raise RuntimeError(f"{self.prefix}Unable to generate a unique hyperparameter mutation")
             raise RuntimeError(f"{self.prefix}Hyperparameter search space is exhausted")
-        else:
-            hyp = {k: getattr(self.args, k) for k in self.space}
+        hyp = {k: getattr(self.args, k) for k in self.space}
 
         return self._constrain(hyp)
 

@@ -310,7 +310,7 @@ def calibrate_checkpoint(
     ckpt = torch_load(ckpt_path, map_location="cpu")
     saved = ckpt.get("ema") or ckpt.get("model")
     if saved is None or _depth_head(saved) is None:
-        return
+        return None
     work = deepcopy(saved).float()
     res = fit_calibration_selective(work, dataloader, device, max_depth=max_depth)
     if res is None:

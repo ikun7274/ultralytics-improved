@@ -1,5 +1,5 @@
 """
-扫描指定目录下的图片(不递归子目录), 打乱顺序后按 7:2:1 划分, 写入 train.txt、val.txt、test.txt。
+扫描指定目录下的图片(不递归子目录), 打乱顺序后按 7:2:1 划分, 写入 train.txt、val.txt、test.txt。.
 
 三个列表文件保存在「图片目录的上一级」目录中(与图片文件夹同级)。
 
@@ -18,15 +18,11 @@ from pathlib import Path
 
 DEFAULT_SHUFFLE_SEED = 42
 
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
 
 
 def list_images(folder: Path) -> list[Path]:
-    return sorted(
-        p
-        for p in folder.iterdir()
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-    )
+    return sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
 
 
 def split_counts(n: int, r_train: int, r_val: int, r_test: int) -> tuple[int, int, int]:
@@ -39,36 +35,36 @@ def split_counts(n: int, r_train: int, r_val: int, r_test: int) -> tuple[int, in
 
 def write_list(paths: list[Path], out_file: Path) -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    out_file.write_text(''.join(p.name + '\n' for p in paths), encoding='utf-8')
+    out_file.write_text("".join(p.name + "\n" for p in paths), encoding="utf-8")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description='打乱图片顺序, 按 7:2:1 写入 train.txt / val.txt / test.txt(仅文件名, 保存在图片目录上一级)'
+        description="打乱图片顺序, 按 7:2:1 写入 train.txt / val.txt / test.txt(仅文件名, 保存在图片目录上一级)"
     )
     parser.add_argument(
-        '--img_dir',
+        "--img_dir",
         type=str,
         default=r"C:\Users\ASUS\Desktop\Datasets\水面漂浮物\base_4_0\images",
-        help='存放图片的目录(列表文件将写入该目录的上一级)',
+        help="存放图片的目录(列表文件将写入该目录的上一级)",
     )
     parser.add_argument(
-        '--seed',
+        "--seed",
         type=int,
         default=DEFAULT_SHUFFLE_SEED,
-        help=f'随机种子(默认 {DEFAULT_SHUFFLE_SEED}, 相同种子下划分顺序一致)',
+        help=f"随机种子(默认 {DEFAULT_SHUFFLE_SEED}, 相同种子下划分顺序一致)",
     )
     args = parser.parse_args()
 
     img_dir = Path(args.img_dir).resolve()
     if not img_dir.is_dir():
-        print(f'错误: 目录不存在或不是文件夹: {img_dir}')
+        print(f"错误: 目录不存在或不是文件夹: {img_dir}")
         return 1
 
     parent = img_dir.parent.resolve()
     paths = list_images(img_dir)
     if not paths:
-        print(f'未找到图片: {img_dir}(扩展名 {sorted(IMAGE_EXTENSIONS)})')
+        print(f"未找到图片: {img_dir}(扩展名 {sorted(IMAGE_EXTENSIONS)})")
         return 0
 
     rng = random.Random(args.seed)
@@ -81,19 +77,19 @@ def main() -> int:
     test_paths = paths[nt + nv :]
 
     for name, subset in (
-        ('all.txt', all_paths),
-        ('train.txt', train_paths),
-        ('val.txt', val_paths),
-        ('test.txt', test_paths),
+        ("all.txt", all_paths),
+        ("train.txt", train_paths),
+        ("val.txt", val_paths),
+        ("test.txt", test_paths),
     ):
         write_list(subset, parent / name)
 
-    print(f'上级目录: {parent}')
-    print(f'图片目录: {img_dir}(共 {len(paths)} 张, seed={args.seed})')
-    print(f'train: {len(train_paths)}, val: {len(val_paths)}, test: {len(test_paths)}, all: {len(all_paths)}')
-    print(f'已写入: {parent / "train.txt"}, {parent / "val.txt"}, {parent / "test.txt"}, {parent / "all.txt"}')
+    print(f"上级目录: {parent}")
+    print(f"图片目录: {img_dir}(共 {len(paths)} 张, seed={args.seed})")
+    print(f"train: {len(train_paths)}, val: {len(val_paths)}, test: {len(test_paths)}, all: {len(all_paths)}")
+    print(f"已写入: {parent / 'train.txt'}, {parent / 'val.txt'}, {parent / 'test.txt'}, {parent / 'all.txt'}")
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())

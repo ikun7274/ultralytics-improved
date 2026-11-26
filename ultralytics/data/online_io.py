@@ -21,9 +21,9 @@ _MKDIR_DONE: set[str] = set()
 def _ensure_dir(path) -> None:
     """Create ``path`` (with parents) once per process; later calls are a no-op.
 
-    The save branches used to call ``mkdir(parents=True, exist_ok=True)`` before *every* write, i.e. once
-    per sample per worker -- a pointless syscall storm on spinning disks, and a lock convoy on network
-    storage when 8 workers race on the same directory.
+    The save branches used to call ``mkdir(parents=True, exist_ok=True)`` before *every* write, i.e. once per sample per
+    worker -- a pointless syscall storm on spinning disks, and a lock convoy on network storage when 8 workers race on
+    the same directory.
     """
     key = str(path)
     if key in _MKDIR_DONE:
@@ -35,8 +35,8 @@ def _ensure_dir(path) -> None:
 def _forget_dir(path) -> None:
     """Drop ``path`` from the per-process "already created" set so the next write retries ``mkdir``.
 
-    Without this the cache never expires: if the directory is removed mid-run (cleanup script, flaky
-    network share) every later write kept failing against a path nobody re-created.
+    Without this the cache never expires: if the directory is removed mid-run (cleanup script, flaky network share)
+    every later write kept failing against a path nobody re-created.
     """
     _MKDIR_DONE.discard(str(path))
 
@@ -44,8 +44,8 @@ def _forget_dir(path) -> None:
 def _imwrite(path, img) -> bool:
     """Write an image using Ultralytics' unicode-safe ``imwrite`` and warn when it fails.
 
-    OpenCV's own ``cv2.imwrite`` silently fails on non-ASCII paths -- verified in this very project, where
-    it *returned True* while the file never appeared on disk. Never ignore the return value.
+    OpenCV's own ``cv2.imwrite`` silently fails on non-ASCII paths -- verified in this very project, where it *returned
+    True* while the file never appeared on disk. Never ignore the return value.
     """
     ok = bool(imwrite(str(path), img))
     if not ok:
@@ -58,10 +58,10 @@ def _imwrite(path, img) -> bool:
 def _save_cap(dataset, branch: str) -> int:
     """Return the per-branch save cap.
 
-    Each branch (tile/ratio/blur/compose/weather/occlusion) would otherwise share the single legacy
-    ``slice_save_max`` budget, so enabling one branch's saving would silently cap the others to the
-    same total. ``slice_save_max_<branch>`` -- when set -- overrides the global cap; a missing or
-    ``None`` attribute falls back to ``slice_save_max``. ``0`` means unlimited in either case.
+    Each branch (tile/ratio/blur/compose/weather/occlusion) would otherwise share the single legacy ``slice_save_max``
+    budget, so enabling one branch's saving would silently cap the others to the same total. ``slice_save_max_<branch>``
+    -- when set -- overrides the global cap; a missing or ``None`` attribute falls back to ``slice_save_max``. ``0``
+    means unlimited in either case.
 
     Args:
         dataset: dataset instance to read the cap attributes from.

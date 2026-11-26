@@ -91,7 +91,7 @@ class SemanticSegmentationTrainer(DetectionTrainer):
             shape = labels[idx].get("shape")
             try:
                 mask = dataset.load_mask(idx, image_shape=tuple(shape) if shape is not None else None)
-            except Exception:  # noqa: S112
+            except Exception:
                 continue
             if include_class is not None:
                 mask[~np.isin(mask, include_class)] = 255

@@ -727,7 +727,9 @@ class BaseTrainer:
 
     def _dual_weights_on(self) -> bool:
         """True when the second (whole-image) best/last checkpoint pair should be saved."""
-        return bool(getattr(self.args, "val_slice_dual_metric", False)) and bool(getattr(self.args, "val_slice_enable", False))
+        return bool(getattr(self.args, "val_slice_dual_metric", False)) and bool(
+            getattr(self.args, "val_slice_enable", False)
+        )
 
     def _build_ckpt_payload(self) -> dict:
         """Build the expensive, metric-independent part of a checkpoint ONCE per epoch.
@@ -772,8 +774,9 @@ class BaseTrainer:
             "docs": "https://docs.ultralytics.com",
         }
 
-    def _dump_ckpt(self, payload: dict, metrics: dict | None, fitness: float | None,
-                   best_fitness: float | None = None) -> bytes:
+    def _dump_ckpt(
+        self, payload: dict, metrics: dict | None, fitness: float | None, best_fitness: float | None = None
+    ) -> bytes:
         """Serialize ``payload`` with one metric set. Never mutates ``payload``.
 
         Because ``torch.save`` only reads its input, the whole-image pair reuses the main payload
@@ -866,7 +869,7 @@ class BaseTrainer:
             (dict | None): Checkpoint to resume training from, or None if no checkpoint is loaded.
         """
         if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
-            return
+            return None
 
         cfg, weights = self.model, None
         ckpt = None
@@ -977,7 +980,7 @@ class BaseTrainer:
                 if self.best_fitness_whole is None or self.best_fitness_whole < fitness_whole:
                     self.best_fitness_whole = fitness_whole
                 self.fitness_whole = fitness_whole
-                self.whole_metrics = {k: v for k, v in metrics_whole.items()}
+                self.whole_metrics = dict(metrics_whole.items())
                 for k, v in self.whole_metrics.items():
                     metrics[f"whole_{k}"] = v
         return metrics, fitness
@@ -1263,8 +1266,8 @@ class BaseTrainer:
                     args["epochs"] = extend_epochs
                     args["patience"] = self.args.patience
                 else:
-                    setattr(args, "epochs", extend_epochs)
-                    setattr(args, "patience", self.args.patience)
+                    args.epochs = extend_epochs
+                    args.patience = self.args.patience
             # 更新训练目标轮数并重建 LR schedule(用新总轮数)
             self.epochs = self.args.epochs = extend_epochs
             self._setup_scheduler()
