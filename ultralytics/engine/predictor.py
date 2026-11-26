@@ -237,8 +237,7 @@ class BasePredictor:
         self.stream = stream
         if stream:
             return self.stream_inference(source, model, *args, **kwargs)
-        else:
-            return list(self.stream_inference(source, model, *args, **kwargs))  # merge list of Results into one
+        return list(self.stream_inference(source, model, *args, **kwargs))  # merge list of Results into one
 
     def predict_cli(self, source=None, model=None):
         """Method used for Command Line Interface (CLI) prediction.

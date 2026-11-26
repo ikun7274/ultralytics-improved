@@ -442,8 +442,7 @@ class RepConv(nn.Module):
         """
         if kernel1x1 is None:
             return 0
-        else:
-            return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
+        return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
 
     def _fuse_bn_tensor(self, branch):
         """Fuse batch normalization with convolution weights.

@@ -341,7 +341,7 @@ def test_analytics_graph_not_supported():
     try:
         analytics = solutions.Analytics(analytics_type="test")  # 'test' is unsupported
         analytics.process(im0=np.zeros((640, 480, 3), dtype=np.uint8), frame_number=0)
-        assert False, "Expected ValueError for unsupported chart type"
+        raise AssertionError("Expected ValueError for unsupported chart type")
     except ValueError as e:
         assert "Unsupported analytics_type" in str(e), f"Expected 'Unsupported analytics_type' in error, got: {e}"
 
@@ -359,7 +359,7 @@ def test_config_update_method_with_invalid_argument():
     obj = solutions.config.SolutionConfig()
     try:
         obj.update(invalid_key=123)
-        assert False, "Expected ValueError for invalid update argument"
+        raise AssertionError("Expected ValueError for invalid update argument")
     except ValueError as e:
         assert "is not a valid solution argument" in str(e), f"Expected validation error message, got: {e}"
 

@@ -1699,7 +1699,7 @@ class _SafeLoad:
         import torch.nn.modules as torch_nn
 
         import ultralytics.nn.modules as ul_nn
-        from ultralytics.nn import tasks as ul_tasks  # noqa: PLW0406
+        from ultralytics.nn import tasks as ul_tasks
 
         allow = []
 
@@ -1709,7 +1709,7 @@ class _SafeLoad:
                 for info in pkgutil.iter_modules(pkg.__path__, f"{pkg.__name__}."):
                     try:
                         mods.append(importlib.import_module(info.name))
-                    except Exception:  # noqa: S112  # optional/oddball submodule — skip
+                    except Exception:  # optional/oddball submodule — skip
                         continue
             for mod in mods:
                 for name, klass in inspect.getmembers(mod, inspect.isclass):
@@ -1860,13 +1860,13 @@ def torch_safe_load(weight, safe_only=None):
                     f"run a command with an official Ultralytics model, i.e. 'yolo predict model=yolo26n.pt'"
                 )
             ) from e
-        elif e.name == "numpy._core":
+        if e.name == "numpy._core":
             raise ModuleNotFoundError(
                 emojis(
                     f"ERROR ❌️ {weight} requires numpy>=1.26.1, however numpy=={__import__('numpy').__version__} is installed."
                 )
             ) from e
-        elif e.name and e.name.startswith("ultralytics."):
+        if e.name and e.name.startswith("ultralytics."):
             raise ModuleNotFoundError(
                 emojis(
                     f"ERROR ❌️ {weight} requires missing Ultralytics module '{e.name}'. "
@@ -2224,6 +2224,7 @@ def guess_model_task(model):
             return "obb"
         if "depth" in m:
             return "depth"
+        return None
 
     # Guess from model cfg
     if isinstance(model, dict):
@@ -2240,17 +2241,17 @@ def guess_model_task(model):
         for m in model.modules():
             if isinstance(m, SemanticSegment):
                 return "semantic"
-            elif isinstance(m, (Segment, YOLOESegment)):
+            if isinstance(m, (Segment, YOLOESegment)):
                 return "segment"
-            elif isinstance(m, Classify):
+            if isinstance(m, Classify):
                 return "classify"
-            elif isinstance(m, Pose):
+            if isinstance(m, Pose):
                 return "pose"
-            elif isinstance(m, OBB):
+            if isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, Depth):
+            if isinstance(m, Depth):
                 return "depth"
-            elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
+            if isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
                 return "detect"
 
     if isinstance(model, (str, Path)):
@@ -2263,17 +2264,17 @@ def guess_model_task(model):
         model = Path(model)
         if "-sem" in model.stem or "semantic" in model.parts:
             return "semantic"
-        elif "-seg" in model.stem or "segment" in model.parts:
+        if "-seg" in model.stem or "segment" in model.parts:
             return "segment"
-        elif "-cls" in model.stem or "classify" in model.parts:
+        if "-cls" in model.stem or "classify" in model.parts:
             return "classify"
-        elif "-pose" in model.stem or "pose" in model.parts:
+        if "-pose" in model.stem or "pose" in model.parts:
             return "pose"
-        elif "-obb" in model.stem or "obb" in model.parts:
+        if "-obb" in model.stem or "obb" in model.parts:
             return "obb"
-        elif "-depth" in model.stem or "depth" in model.parts:
+        if "-depth" in model.stem or "depth" in model.parts:
             return "depth"
-        elif "detect" in model.parts:
+        if "detect" in model.parts:
             return "detect"
 
     # Unable to determine task from model

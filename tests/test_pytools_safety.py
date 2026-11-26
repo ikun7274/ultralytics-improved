@@ -1,7 +1,8 @@
-"""pytools 删除护栏的回归测试（对应复审报告 S-1）。
+"""pytools 删除护栏的回归测试（对应复审报告 S-1）。.
 
 核心断言：站在「数据集根目录」里不带参数运行这两个脚本，**不能**删掉这个目录。
 """
+
 from __future__ import annotations
 
 import os
@@ -23,7 +24,7 @@ SENTINEL = "keep_me.txt"
 
 
 def _make_fake_dataset(root: Path, n: int = 2) -> Path:
-    """造一个最小的 YOLO 数据集：images/ + labels/ + 一个哨兵文件。"""
+    """造一个最小的 YOLO 数据集：images/ + labels/ + 一个哨兵文件。."""
     from PIL import Image
 
     (root / "images").mkdir(parents=True, exist_ok=True)
@@ -57,7 +58,7 @@ def _assert_dataset_intact(ds: Path) -> None:
 
 
 def test_safe_rmtree_refuses_cwd(tmp_path, monkeypatch):
-    """空串 / '.' 都退化成 cwd，必须被拒绝且不产生任何删除。"""
+    """空串 / '.' 都退化成 cwd，必须被拒绝且不产生任何删除。."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / SENTINEL).write_text("x", encoding="utf-8")
     for candidate in ("", ".", "./"):
@@ -75,7 +76,7 @@ def test_safe_rmtree_refuses_cwd_ancestor_and_repo_root(tmp_path, monkeypatch):
 
 
 def test_safe_rmtree_still_deletes_normal_subdir(tmp_path):
-    """正常子目录必须仍可删除，否则脚本就没法用了（护栏不能过头）。"""
+    """正常子目录必须仍可删除，否则脚本就没法用了（护栏不能过头）。."""
     target = tmp_path / "out"
     (target / "images").mkdir(parents=True)
     (target / "images" / "a.jpg").write_bytes(b"x")
@@ -108,7 +109,7 @@ def test_validate_io_dirs_rejects_same_and_cwd(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("script", [COMPOSE, RESIZE])
 def test_no_arg_run_in_dataset_root_keeps_cwd(tmp_path, script):
-    """S-1 原始触发路径：cd 到数据集根目录、不带参数运行 → 目录必须完好。"""
+    """S-1 原始触发路径：cd 到数据集根目录、不带参数运行 → 目录必须完好。."""
     ds = _make_fake_dataset(tmp_path / "base_0_0")
     proc = _run(script, ds)
     assert proc.returncode != 0, f"{script.name} 竟然成功退出了"
@@ -118,7 +119,7 @@ def test_no_arg_run_in_dataset_root_keeps_cwd(tmp_path, script):
 
 @pytest.mark.parametrize("script", [COMPOSE, RESIZE])
 def test_output_dir_pointing_at_cwd_is_refused(tmp_path, script):
-    """显式 --output_dir . 也必须被挡下（防止 "存在即删除" 删掉 cwd）。"""
+    """显式 --output_dir . 也必须被挡下（防止 "存在即删除" 删掉 cwd）。."""
     ds = _make_fake_dataset(tmp_path / "base_0_0")
     proc = _run(script, ds, "--input_dir", str(ds), "--output_dir", ".")
     assert proc.returncode != 0

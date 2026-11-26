@@ -710,6 +710,7 @@ class Results(SimpleClass, DataExportMixin):
             return f"depth {float(d.min()):.2f}-{float(d.max()):.2f}m, " if len(d) else "depth (no valid pixels), "
         if self.semantic_mask is not None:
             return ""
+        return None
 
     def save_txt(self, txt_file: str | Path, save_conf: bool = False) -> str:
         """Save detection results to a text file.

@@ -801,8 +801,8 @@ class Model(torch.nn.Module):
         Returns:
             (ultralytics.utils.metrics.DetMetrics | dict | None): Training metrics if available and training is
                 successful; otherwise, None. The specific metrics type depends on the task. When `data` is a list or
-                tuple of datasets, the base model is fine-tuned on each in series and a {dataset: metrics} dict is
-                returned.
+                tuple of datasets, the base model is fine-tuned on each in series and a {dataset: metrics} dict
+                is returned.
 
         Examples:
             >>> model = YOLO("yolo26n.pt")
@@ -916,12 +916,11 @@ class Model(torch.nn.Module):
             from ultralytics.utils.tuner import run_ray_tune
 
             return run_ray_tune(self, *args, iterations=iterations, **kwargs)
-        else:
-            from .tuner import Tuner
+        from .tuner import Tuner
 
-            custom = {}  # method defaults
-            args = {**self.overrides, **custom, **kwargs, "mode": "train"}  # highest priority args on the right
-            return Tuner(args=args, _callbacks=self.callbacks)(iterations=iterations)
+        custom = {}  # method defaults
+        args = {**self.overrides, **custom, **kwargs, "mode": "train"}  # highest priority args on the right
+        return Tuner(args=args, _callbacks=self.callbacks)(iterations=iterations)
 
     def _apply(self, fn) -> Model:
         """Apply a function to model parameters, buffers, and tensors.

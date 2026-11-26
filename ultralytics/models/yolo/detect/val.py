@@ -66,10 +66,14 @@ class DetectionValidator(BaseValidator):
         # pass and the whole-image reference pass, so a value captured here goes stale; every decision reads
         # _val_slice_active() instead (single source of truth).
         self.val_slice_overlap_ratio = float(
-            args.get("val_slice_overlap_ratio", 0.2) if isinstance(args, dict) else getattr(args, "val_slice_overlap_ratio", 0.2)
+            args.get("val_slice_overlap_ratio", 0.2)
+            if isinstance(args, dict)
+            else getattr(args, "val_slice_overlap_ratio", 0.2)
         )
         self.val_slice_all_tiles = bool(
-            args.get("val_slice_all_tiles", False) if isinstance(args, dict) else getattr(args, "val_slice_all_tiles", False)
+            args.get("val_slice_all_tiles", False)
+            if isinstance(args, dict)
+            else getattr(args, "val_slice_all_tiles", False)
         )
         self.val_slice_ratio = float(
             args.get("val_slice_ratio", 1.0) if isinstance(args, dict) else getattr(args, "val_slice_ratio", 1.0)
@@ -359,9 +363,7 @@ class DetectionValidator(BaseValidator):
                 }
             if pred["cls"].shape[0]:
                 boxes = self._remap_boxes_imgsz_to_orig(pred["bboxes"], meta, imgsz)
-                acc["preds"].append(
-                    {"bboxes": boxes, "conf": pred["conf"], "cls": pred["cls"], "extra": pred["extra"]}
-                )
+                acc["preds"].append({"bboxes": boxes, "conf": pred["conf"], "cls": pred["cls"], "extra": pred["extra"]})
             acc["done"] += 1
             if acc["done"] >= acc["n_tiles"]:
                 self._finalize_sliced_orig(oi, acc)
@@ -517,7 +519,9 @@ class DetectionValidator(BaseValidator):
                     self.gdict[key] = [x for _, gdict, _ in gathered_json for x in gdict[key]]
             self.metrics.stats = merged_stats
             self._gather_image_metrics(self.metrics.box)
-            if not self._val_slice_active():  # sliced validation already counts ORIGINAL images in _finalize_sliced_orig
+            if (
+                not self._val_slice_active()
+            ):  # sliced validation already counts ORIGINAL images in _finalize_sliced_orig
                 self.seen = len(self.dataloader.dataset)  # total image count from dataset
         elif RANK > 0:
             dist.gather_object(self.metrics.stats, None, dst=0)

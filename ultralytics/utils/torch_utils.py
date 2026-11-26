@@ -98,8 +98,7 @@ def smart_inference_mode(mode=True):
             return torch.no_grad()(fn)
         if TORCH_1_9 and torch.is_inference_mode_enabled():
             return fn  # already in inference_mode, act as a pass-through
-        else:
-            return (torch.inference_mode if TORCH_1_10 else torch.no_grad)()(fn)
+        return (torch.inference_mode if TORCH_1_10 else torch.no_grad)()(fn)
 
     return decorate
 
@@ -147,8 +146,7 @@ def autocast(enabled: bool | torch.dtype, device: str = "cuda"):
         if device == "mps" and not TORCH_2_5:  # MPS autocast added in torch 2.5.0, errors on older versions
             device, enabled = "cpu", False
         return torch.amp.autocast(device, enabled=enabled, **kwargs)
-    else:
-        return torch.cuda.amp.autocast(enabled)
+    return torch.cuda.amp.autocast(enabled)
 
 
 @functools.lru_cache
@@ -239,8 +237,8 @@ def select_device(device="", newline=False, verbose=True):
 
     Args:
         device (str | torch.device, optional): Device string or torch.device object. Options include 'cpu', 'cuda', '0',
-            '0,1,2,3', 'mps', 'npu:0', 'npu:0,1', 'xpu:0', 'xpu:0,1', or '-1' for auto-select. Defaults to auto-selecting
-            the first available GPU, or CPU if no GPU is available.
+            '0,1,2,3', 'mps', 'npu:0', 'npu:0,1', 'xpu:0', 'xpu:0,1', or '-1' for auto-select. Defaults to
+            auto-selecting the first available GPU, or CPU if no GPU is available.
         newline (bool, optional): If True, adds a newline at the end of the log string.
         verbose (bool, optional): If True, logs the device information.
 
@@ -454,7 +452,7 @@ def model_info(model, detailed=False, verbose=True, imgsz=640):
             - flops (float): GFLOPs.
     """
     if not verbose:
-        return
+        return None
     n_p = get_num_params(model)  # number of parameters
     n_g = get_num_gradients(model)  # number of gradients
     layers = __import__("collections").OrderedDict((n, m) for n, m in model.named_modules() if len(m._modules) == 0)
@@ -628,8 +626,7 @@ def copy_attr(a, b, include=(), exclude=()):
     for k, v in b.__dict__.items():
         if (len(include) and k not in include) or k.startswith("_") or k in exclude:
             continue
-        else:
-            setattr(a, k, v)
+        setattr(a, k, v)
 
 
 def intersect_dicts(da, db, exclude=()):

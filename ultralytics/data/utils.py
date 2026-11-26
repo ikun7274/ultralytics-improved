@@ -657,7 +657,7 @@ def check_det_dataset(dataset: str, autodownload: bool = True, split: str = "") 
                 LOGGER.info(f"Running {s} ...")
                 subprocess.run(s.split(), check=True)
             else:  # python script
-                exec(s, {"yaml": data})  # noqa: S102
+                exec(s, {"yaml": data})
             dt = f"({round(time.time() - t, 1)}s)"
             s = f"success ✅ {dt}, saved to {colorstr('bold', DATASETS_DIR)}" if r in {0, None} else f"failure {dt} ❌"
             LOGGER.info(f"Dataset download {s}\n")
@@ -757,8 +757,7 @@ def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
             if nf == 0:
                 if k == "train":
                     raise FileNotFoundError(f"{dataset} '{k}:' no training images found")
-                else:
-                    LOGGER.warning(f"{prefix} found {nf} images in {nd} classes (no images found)")
+                LOGGER.warning(f"{prefix} found {nf} images in {nd} classes (no images found)")
             elif nd != nc and not ndjson_names.is_file():
                 LOGGER.error(f"{prefix} found {nf} images in {nd} classes (requires {nc} classes, not {nd})")
             else:

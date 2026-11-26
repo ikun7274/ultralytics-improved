@@ -242,10 +242,9 @@ class DataExportMixin:
             def _to_str_simple(v):
                 if v is None:
                     return ""
-                elif isinstance(v, (dict, list, tuple, set)):
+                if isinstance(v, (dict, list, tuple, set)):
                     return repr(v)
-                else:
-                    return str(v)
+                return str(v)
 
             df_str = df.select(
                 [pl.col(c).map_elements(_to_str_simple, return_dtype=pl.String).alias(c) for c in df.columns]
@@ -947,6 +946,7 @@ def get_ubuntu_version():
                 return re.search(r'VERSION_ID="(\d+\.\d+)"', f.read())[1]
         except (FileNotFoundError, AttributeError):
             return None
+    return None
 
 
 def get_user_config_dir(sub_dir="Ultralytics"):
@@ -1161,6 +1161,7 @@ class Retry(contextlib.ContextDecorator):
                     if self._attempts >= self.times:
                         raise
                     time.sleep(self.delay * (2**self._attempts))  # exponential backoff delay
+            return None
 
         return wrapped_func
 
@@ -1196,8 +1197,7 @@ def threaded(func):
             thread = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=False)
             thread.start()
             return thread
-        else:
-            return func(*args, **kwargs)
+        return func(*args, **kwargs)
 
     return wrapper
 

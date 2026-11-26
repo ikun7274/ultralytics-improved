@@ -44,8 +44,7 @@ class DotProductScoring(torch.nn.Module):
         # num_valid has shape (bs, 1)
         num_valid = torch.clamp(torch.sum(is_valid, dim=0), min=1.0)
         # mean pool over all the valid tokens -- pooled_prompt has shape (bs, proj_dim)
-        pooled_prompt = (prompt * is_valid).sum(dim=0) / num_valid
-        return pooled_prompt
+        return (prompt * is_valid).sum(dim=0) / num_valid
 
     def forward(self, hs, prompt, prompt_mask):
         """Compute dot-product scores between hs and prompt."""
@@ -134,8 +133,7 @@ def get_valid_ratio(mask):
     valid_W = torch.sum(~mask[:, 0, :], 1)
     valid_ratio_h = valid_H.float() / H
     valid_ratio_w = valid_W.float() / W
-    valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
-    return valid_ratio
+    return torch.stack([valid_ratio_w, valid_ratio_h], -1)
 
 
 def gen_sineembed_for_position(pos_tensor: torch.Tensor, num_feats: int = 256):

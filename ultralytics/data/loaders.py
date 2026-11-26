@@ -412,8 +412,7 @@ class LoadImagesAndVideos:
             if self.count >= self.nf:  # end of file list
                 if imgs:
                     return paths, imgs, info  # return last partial batch
-                else:
-                    raise StopIteration
+                raise StopIteration
 
             path = self.files[self.count]
             if self.video_flag[self.count]:
@@ -740,6 +739,7 @@ def get_best_youtube_url(url: str, method: str = "pytube") -> str | None:
             good_size = (f.get("width") or 0) >= 1920 or (f.get("height") or 0) >= 1080
             if good_size and f["vcodec"] != "none" and f["acodec"] == "none" and f["ext"] == "mp4":
                 return f.get("url")
+    return None
 
 
 # Define constants

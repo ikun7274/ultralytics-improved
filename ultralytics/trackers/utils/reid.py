@@ -144,7 +144,7 @@ def build_encoder(with_reid: bool, model: str | None, device: str | torch.device
 
         def _auto_encoder(feats, _dets):
             if isinstance(feats, np.ndarray):
-                return [f for f in feats]
+                return list(feats)
             return [f.cpu().numpy() for f in feats]
 
         return _auto_encoder

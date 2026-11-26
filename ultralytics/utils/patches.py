@@ -44,12 +44,11 @@ def imread(filename: str | Path, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | 
             # Handle multi-frame TIFFs and color images
             return frames[0] if len(frames) == 1 and frames[0].ndim == 3 else np.stack(frames, axis=2)
         return None
-    else:
-        im = cv2.imdecode(file_bytes, flags)
-        # Fallback for formats OpenCV imdecode may not support (AVIF, HEIC, HEIF)
-        if im is None and filename.lower().endswith(PIL_FALLBACK_SUFFIXES):
-            im = _imread_pil(filename, flags)
-        return im[..., None] if im is not None and im.ndim == 2 else im  # Always ensure 3 dimensions
+    im = cv2.imdecode(file_bytes, flags)
+    # Fallback for formats OpenCV imdecode may not support (AVIF, HEIC, HEIF)
+    if im is None and filename.lower().endswith(PIL_FALLBACK_SUFFIXES):
+        im = _imread_pil(filename, flags)
+    return im[..., None] if im is not None and im.ndim == 2 else im  # Always ensure 3 dimensions
 
 
 # PIL patches ---------------------------------------------------------------------------------------------------------
@@ -223,6 +222,7 @@ def torch_save(*args, **kwargs):
             if i == 3:
                 raise
             time.sleep((2**i) / 2)  # Exponential backoff: 0.5s, 1.0s, 2.0s
+    return None
 
 
 @contextmanager
